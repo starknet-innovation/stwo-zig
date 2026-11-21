@@ -1194,3 +1194,79 @@ provider remain experimental proof paths. The timed arms preserve the
 stated query and grinding settings. Qualification for a supported profile
 still requires independent review of the composed transcript, soundness
 budget, and circuit authority.
+
+### Parent opening and scheduling comparisons
+
+These arms reuse the same native files as their control and prove new
+recursive artifacts. The tail includes fresh verification of the accepted
+block. It excludes the additional circuit inspection.
+
+| Retained block and recursive profile | Wraps / folds | Recursion s | Fresh receive s | Tail s | Recursion peak GiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OP 121,003,241, composed serial control | 5 / 2 | 68.81 | 10.13 | 78.95 | 30.59 |
+| OP 121,003,241, two CPU pools and compact coefficients | 5 / 2 | 103.97 | 10.40 | 114.37 | 37.76 |
+| Ethereum 24,628,607, composed serial control | 11 / 4 | 161.05 | 19.86 | 180.92 | 38.57 |
+| Ethereum 24,628,607, paired cap equality records | 11 / 4 | 167.13 | 20.65 | 187.78 | 38.53 |
+| Ethereum 24,628,607, BLAKE3 leaves and regrouped workers | 9 / 3 | 165.82 | 19.25 | 185.07 | 31.05 |
+
+The two CPU pools shared the same total worker budget. Compact storage
+increased re-expansion inside the prover. All eight recursive proofs and
+the authenticated tree matched the serial OP artifacts exactly. The two
+pool configuration is a regression on this sample.
+
+The cap equality circuit exploits the two constrained U16 limbs in each
+digest word. It encodes two digest words in three base-field coordinates,
+leaving the fourth coordinate for the bounded cap index. The kernel of
+the payload map is spanned by (1, 65536, 2, 131072) modulo M31. An
+exhaustive check over the 65,535 positive possibilities for the first
+coordinate found no nonzero kernel vector whose four centered limbs fit
+the difference range. Negation covers negative differences. The first
+Ethereum three-child fold dropped from 4,194,669 to 4,145,441 raw field
+rows, crossed from 2²³ to 2²² padded field rows, and proved in 6.42 s
+versus 10.08 s. The complete retained run did not improve.
+
+The BLAKE3 arm also uses paired equality for shallow source caps,
+groups adjacent CPU workers, and separates SHA from the ADD and DOUBLE
+group. Circuit hashing agrees with the independent native compression
+and standard streaming BLAKE3 at empty, partial, exact block and
+multi-chunk boundaries in Debug and ReleaseFast. A word-to-byte length
+truncation in the initial trial was caught by the first Ethereum fold,
+then reproduced and fixed in the bounded hash tests. The complete
+receiver accepted the exact block output and rejected a stale packed
+MAIN root and reordered children. The BLAKE3 arm used 7.52 GiB less
+recursion RSS, while the INTER commitment stage took 77.20 s summed
+across its nodes. The complete tail retained the serial composed control
+as the faster result.
+
+### Three-child parent folds and bounded native transforms
+
+The next complete run uses paired cap equality records for both the
+outer folds and the packed CPU leaves. A three-child fold stays within
+2²² padded field and Blake rows on every measured OP and Ethereum parent,
+including the two-child Ethereum root. Splitting SHA from ADD and DOUBLE
+keeps the largest service leaf within its measured memory bound. The
+native producer writes packed coefficients directly into each bounded
+commitment wave and regenerates them for sparse openings.
+
+| Block and provision | Native s | Recursion s | Fresh receive s | Total s | Wraps / folds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OP 121,135,704, previous fastest complete control | 63.53 | 102.34 | 13.41 | 179.29 | 6 / 3 |
+| OP 121,135,704, bounded transforms and three-child folds | 64.87 | 79.06 | 12.37 | 156.30 | 7 / 3 |
+| Ethereum 24,628,607, bounded transforms and three-child folds | 97.21 | 137.49 | 22.81 | 257.51 | 12 / 6 |
+
+Both new runs regenerated the full native bundle. Every native binary
+artifact matched its preceding packed configuration. Fresh receivers
+accepted the exact output and rejected a changed manifest-bound MAIN
+root and reordered fold children. The OP result improved by 12.8% over
+the earlier best configuration. Ethereum improved 14.6% against the
+301.54 s control and 6.0% against the first composed packed run.
+Ethereum peaked at 20.95 GiB in native production, 30.69 GiB in recursion
+and 7.40 GiB in the independent receiver.
+
+A live authority handoff on the same large OP request with the same
+parked MAIN produced byte-identical native artifacts and passed fresh
+verification in 171.56 s overall. The combined producer took 157.82 s
+at 27.56 GiB peak and the receiver took 13.74 s. The split producer
+remains the faster measured route. A fully resident MAIN trial failed
+admission at a requested 14.23 GB against the 8 GiB retention limit.
+That trial emitted no qualified timing.
