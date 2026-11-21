@@ -1088,3 +1088,40 @@ cap from the shared packet authority and resumed those nodes.
 Resume and fresh receipt took 42.52 s and 21.79 s. This is a
 correctness result with reused artifacts. A fresh matched timing is
 still needed. The research route has its own protocol domain.
+
+### Keyed Merkle parents and guest inversion
+
+The retained-native comparison for OP Mainnet block 121,003,241 uses the
+same authenticated six native inputs and recursion topology in both arms.
+The research profile uses keyed seven-round BLAKE3 for recursive Merkle
+internal nodes and prefixed Blake2s for leaves. The circuit and native
+receiver apply the same internal-node function. The parent moved from
+4,944,880 to 4,018,072 Blake G gates, crossing the 2²²-row padding boundary.
+Field rows stayed within 2²².
+
+| OP 121,003,241, retained native inputs | Wrap s | Fold s | Recursive wall s | Fresh receive s | Measured tail s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Compact openings and depth-six caps | 60.06 | 41.94 | 110.30 | 12.06 | 122.37 |
+| Same opens with keyed Merkle parents | 59.19 | 27.66 | 95.27 | 10.99 | 106.27 |
+
+Both fresh processes accepted the expected block output. The keyed
+receiver rejected a reordered tree. This changes the recursive protocol
+and requires an independent security review before adoption. Native
+production was reused and is excluded from both times.
+
+The Kona safegcd trial uses RustCrypto's precomputed 62-bit inversion on
+public secp256k1 field and scalar values. Five real native replays matched
+the pinned guest's output and service counts. The change crossed the
+configured 1,048,575-step CPU shard boundary on OP Mainnet block
+121,049,889.
+
+| OP 121,049,889 | Retirements | CPU / truth proofs | Wraps / folds | Native s | Recursion s | Fresh receive s | Total s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Pinned guest | 4,219,144 | 5 / 4 | 7 / 3 | 19.40 | 116.91 | 11.21 | 147.52 |
+| Safegcd guest | 4,154,934 | 4 / 4 | 6 / 3 | 18.40 | 99.61 | 10.04 | 128.05 |
+
+Both arms independently produced complete blocks and passed the fresh
+receiver with the same 43-byte output. The 13.2% wall reduction is one
+matched run at this shard size. Savings from crossing a shard boundary
+depend on the configured capacity and the block's retirement count. The
+keyed-node and guest trials were measured separately.
