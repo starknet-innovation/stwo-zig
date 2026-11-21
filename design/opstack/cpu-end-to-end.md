@@ -1270,3 +1270,59 @@ at 27.56 GiB peak and the receiver took 13.74 s. The split producer
 remains the faster measured route. A fully resident MAIN trial failed
 admission at a requested 14.23 GB against the 8 GiB retention limit.
 That trial emitted no qualified timing.
+
+## One FRI suffix for two packed CPU workers
+
+The two workers retain their separate AIR samples, local lookup commitments,
+stage-one roots and authenticated MAIN and INTER openings. Their common
+channel binds both ordered statements, the manifest, the layout identities
+and the post-sample transcript states before combining two equal-degree
+quotients. The circuit checks the two public frames and authenticates both
+sources at the shared queries. It then verifies one FRI suffix and emits the
+ordered pair digest. The fold continues to check the complete roster and
+the receiver independently establishes global relation closure.
+
+The following cold runs use the pinned D2 native parameters and the same
+keyed b2/q108/P20 outer study profile. Total excludes the circuit census
+and negative controls. OP is block 121,135,704 and Ethereum is block
+24,628,607. Each cell is one measured run on the M5 Max.
+
+| Block and configuration | Native s | Recursion s | Fresh receiver s | Total s | Wraps / folds |
+|---|---:|---:|---:|---:|---:|
+| OP, packed workers and split SHA | 64.87 | 79.06 | 12.37 | 156.30 | 7 / 3 |
+| OP, shared pair alongside ordinary native proofs | 62.08 | 66.41 | 12.00 | 140.50 | 5 / 2 |
+| OP, shared pair replaces ordinary suffixes | 60.52 | 62.75 | 11.37 | **134.65** | 5 / 2 |
+| Ethereum, packed-lookup control | 86.21 | 193.24 | 22.08 | 301.54 | 14 / 5 |
+| Ethereum, packed workers and split SHA | 97.21 | 137.49 | 22.81 | 257.51 | 12 / 6 |
+| Ethereum, shared pair alongside ordinary native proofs | 96.95 | 128.71 | 19.54 | 245.21 | 10 / 5 |
+| Ethereum, shared pair replaces ordinary suffixes | 98.60 | 111.35 | 17.82 | **227.76** | 10 / 5 |
+
+The shared-pair arm with ordinary native proofs leaves every original
+native binary byte-identical. The replacement arm encodes the shared suffix
+in both member records for transport and removes the original two FRI
+computations. Both members still verify their AIR and claim bindings against
+independently derived authority. The receiver checks the same public output
+and trace-only outer graphs. The sidecar arm rejects swapped members. The
+compact pair census rejects swapped sources and a changed opening under the
+unchanged source root. Complete reception rejected changed packed MAIN with
+a repaired checksum and reordered fold children on both chains.
+
+The packed quotient evaluates independent rows with the existing M31 and
+OM31 SIMD lanes. Median CPU-worker quotient time across this block run was
+3.31 s versus 4.82 s for OP and 2.99 s versus 4.90 s for Ethereum. The full
+native stage still includes the remaining transforms, commitments, GKR,
+services and scheduling.
+
+Batching FRI terminal equality at the depth-four source frontier drops the
+three-truth Ethereum graph from 8,428,316 to 8,361,608 raw field rows. Its
+padded field domain is now 2²³. Peak native, recursive and receiver RSS was
+13.94, 30.82 and 7.42 GiB on OP and 20.98, 30.79 and 7.59 GiB on Ethereum.
+
+These runs use separately pinned research executables. The native receiver
+for the ordinary protocol rejects a member whose FRI uses the shared
+transcript. The benchmark settings continue to express a 128-bit target
+under the existing assumptions. Production admission of the shared profile
+requires correlated-agreement analysis at the selected rate, a composed
+failure budget, and a scheduler that admits both members together. The
+prototype sources and full guarded receipts are in the operator evidence
+directory under `recursion-next/packed-width8-native`.
