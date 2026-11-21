@@ -1037,3 +1037,54 @@ These measurements cover L2 execution. An SP1 replacement also needs anchored
 L1 derivation, chain-specific data availability, adjacent range aggregation,
 and a practical settlement verifier. Track the performance work and acceptance
 criteria in [issue 491](https://github.com/starknet-innovation/stwo-zig/issues/491).
+
+### Full-block control and direct arithmetic integration
+
+A fresh Ethereum 24,628,607 run exercised the shared degree-domain
+quotient and packed OM31 lookup arithmetic on the pinned 26,894,777
+retirement input. It produced seven CPU and seven truth proofs. The
+current Keccak planner used 19,418, 1,212 and 9,368 calls in three
+spans. The earlier 368.16 s run used two Keccak spans, so the comparison
+includes a roster change. The fresh receiver accepted the same 43-byte
+output and independently rebuilt both native and recursive authority.
+
+| Complete CPU request | Native s | Recursion s | Fresh receive s | Total s | Wraps / folds |
+|---|---:|---:|---:|---:|---:|
+| Ethereum 24,628,607, current control | 86.21 | 193.24 | 22.08 | 301.54 | 14 / 5 |
+| OP 121,003,241, earlier matched control | 44.74 | 92.57 | 11.45 | 148.79 | 6 / 3 |
+| OP 121,003,241, direct arithmetic research route | 43.72 | 83.55 | 10.98 | 138.26 | 5 / 2 |
+
+OP timings are single-observation comparisons on the same Mac with
+variable background load. The direct route preserves the retirement
+count, call count, block output and ordered execution coverage. It
+changes the native manifest and recursive proof bytes. Its guarded
+proving and reception used peaks of 16.50, 31.57 and 7.26 GiB. The
+root fold occupied 3,492,409 raw field rows and 3,809,840 Blake G rows,
+both within a 2²² domain.
+
+The native stage-one owner commits the ordered arithmetic records and
+their bounded quotient/carry witness before the manifest draws Wire35.
+Each of the 34 calls remains a member of its original admitted span.
+The receiver recomputes the committed records and global sum from
+the packets. The root circuit proves the exact same arithmetic
+predicate and binds both that commitment and the Wire35 claim. The
+6,540-byte packet payload replaces the arithmetic PCS proof and its
+separate wrap. Reordering the root's children failed artifact admission.
+With the packet checksum correctly recomputed, altering the prior
+result failed the physical manifest root check and altering the output
+failed the native arithmetic check.
+
+Precomputing powers of the per-certificate challenge reduced the
+34-call standalone certificate from 163,163 to 115,560 raw field rows
+and from 2¹⁸ to 2¹⁷ padded field rows. All 22,000 Blake G rows stayed
+the same. A fresh receiver accepted the physical proof and rejected a
+changed claim. The single-observation standalone production and receipt
+times were 5.65 s and 0.36 s. The complete OP measurement above used
+the prior circuit. The wider Ethereum trial bound 319 calls. It accepted the retained
+native bundle and a freshly completed root with 11 wraps and four
+folds. The initial attempt hit a separate 64-call circuit cap after
+producing the other recursive nodes. The corrected build took its
+cap from the shared packet authority and resumed those nodes.
+Resume and fresh receipt took 42.52 s and 21.79 s. This is a
+correctness result with reused artifacts. A fresh matched timing is
+still needed. The research route has its own protocol domain.
