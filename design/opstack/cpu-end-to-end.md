@@ -1125,3 +1125,33 @@ receiver with the same 43-byte output. The 13.2% wall reduction is one
 matched run at this shard size. Savings from crossing a shard boundary
 depend on the configured capacity and the block's retirement count. The
 keyed-node and guest trials were measured separately.
+
+### Physical width-eight CPU worker
+
+On OP Mainnet block 121,003,241, the first CPU worker packs 3,379 logical
+MAIN columns into 487 physical columns and 1,880 INTER columns into 255.
+The native receiver derives the ordered groups and exact masks from the
+admitted CPU layout. The packed MAIN root enters the manifest and local GKR
+scope. The circuit verifies both queried signs, using the original logical
+samples for AIR evaluation and a degree-bounded packed DEEP quotient for FRI.
+
+The single-commitment producer transfers the physical Merkle tree into the
+existing PCS owner before retained storage can park it. It retains logical
+coefficients for composition and uses a separate packed column view for
+openings. Native production took 49.44 s and peaked at 17.69 GiB. The
+earlier two-commitment prototype took 53.39 s and peaked at 19.67 GiB. All ten
+native binary artifacts matched byte for byte.
+
+| Pack and opening circuit, worker zero | Blake padded rows | Field padded rows |
+| --- | ---: | ---: |
+| Width eight, full paths | 4,194,304 | 4,194,304 |
+| Width eight, sparse caps | 2,097,152 | 8,388,608 |
+| Sparse caps and shared mask geometry | 2,097,152 | 4,194,304 |
+
+Cold production, recursion and fresh verification took 157.63 s on the
+one-packed-worker trial, including 96.52 s for eight wraps and three folds
+and 11.68 s in the fresh receiver. It accepted the expected block output,
+rejected a changed packed MAIN with a recomputed artifact checksum, and
+rejected reordered fold children. This run uses the ordinary ungrouped
+outer schedule. The 148.79 s earlier control uses six wraps and three
+folds, so it does not isolate the contribution of source packing.
