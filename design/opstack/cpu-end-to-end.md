@@ -1155,3 +1155,42 @@ rejected a changed packed MAIN with a recomputed artifact checksum, and
 rejected reordered fold children. This run uses the ordinary ungrouped
 outer schedule. The 148.79 s earlier control uses six wraps and three
 folds, so it does not isolate the contribution of source packing.
+
+### Composed source packing and grouped recursion
+
+The composed trial packs MAIN and INTER on every CPU worker. It combines
+sparse authenticated openings with shared mask geometry, keyed recursive
+Merkle nodes, and an arithmetic service verified directly inside the root.
+Both chains use the same packing, recursive prover, and fresh receiver.
+
+| Complete block and configuration | Native s | Recursion s | Fresh receive s | Total s | Wraps / folds |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OP 121,003,241, grouped control | 44.74 | 92.57 | 11.45 | 148.79 | 6 / 3 |
+| OP 121,003,241, composed with serial quotient | 58.74 | 69.92 | 10.11 | 138.77 | 5 / 2 |
+| OP 121,003,241, composed with pooled quotient | 48.48 | 68.81 | 10.13 | 127.42 | 5 / 2 |
+| Ethereum 24,628,607, packed lookup control | 86.21 | 193.24 | 22.08 | 301.54 | 14 / 5 |
+| Ethereum 24,628,607, composed with pooled quotient and retained MAIN retirement | 92.97 | 161.05 | 19.86 | 273.88 | 11 / 4 |
+
+These are single complete-block runs with independent receivers, excluding
+the additional circuit census. The two composed OP runs produced identical
+native and recursive artifacts. Pooling the packed coefficient quotient
+saved 10.27 s in native production. The composed OP result is 14.4% below
+its earlier same-input grouped control.
+
+Keeping all reconstructed packed polynomials resident across the stage-one
+barrier exceeded the 24 GiB native guard on Ethereum. Retiring 6.87 GiB of
+reconstructible MAIN coefficients kept peak native RSS at 22.31 GiB,
+with the existing native scheduling budget. The worker retains the physical
+Merkle commitment, restores the logical coefficients, and reconstructs
+packed columns for openings. The first completed composed Ethereum run
+cut total wall time by 9.2%. Recursion took 32.19 s less, while native
+production took 6.75 s more. Recursion peaked at 38.57 GiB and the fresh
+receiver at 9.63 GiB. The fresh receiver accepted the expected 43-byte
+output and rejected a changed packed MAIN opening bundle with an updated
+artifact checksum and reordered fold children.
+
+The packed quotient, keyed nodes, grouped plan, and direct arithmetic
+provider remain experimental proof paths. The timed arms preserve the
+stated query and grinding settings. Qualification for a supported profile
+still requires independent review of the composed transcript, soundness
+budget, and circuit authority.
