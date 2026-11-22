@@ -12,7 +12,7 @@ hashes, gate lists and proofs.
 
 | Property | Value |
 | --- | --- |
-| Version | `0.1.0` |
+| Version | `0.2.0` |
 | Layer | `frontend` |
 | Owner | `circuit-frontend` |
 | Public Zig module | `stwo_circuit_frontend` |

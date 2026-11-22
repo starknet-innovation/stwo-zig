@@ -298,6 +298,12 @@ pub fn classKey(children: []const Child) ![32]u8 {
     for (children) |child| {
         _ = try child.effectiveIdentity();
         const key = child.authority;
+        if (key.pp.mixed_arithmetic) {
+            h.update("qm31/mixed-arithmetic/v1\x00");
+            var schedule: [8]u8 = undefined;
+            std.mem.writeInt(u64, &schedule, key.bound.plan_hash, .little);
+            h.update(&schedule);
+        }
         if (child.hybrid) |extra| {
             h.update(extra.key.profile.domainName());
             for (extra.key.artifacts) |artifact| h.update(&artifact.program.identity);

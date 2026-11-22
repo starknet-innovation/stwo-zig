@@ -1611,6 +1611,35 @@ shared FRI experiments below are a different proof layout.
 The device path retains its current profile. The same arithmetic cut can
 reduce device trace size when the resident prover admits the new circuit.
 
+### Adaptive fused arithmetic
+
+The explicit CPU profile fuses a product with its unique add or subtract
+consumer when the largest padded domain falls. The eight fixed columns
+carry signed modes, four wire addresses and the destination use count.
+MAIN grows from twelve to sixteen columns in the fused role. INTER keeps
+its two paired OM31 batches. Public and multiply-read products retain
+their own authenticated wires.
+
+| Block | Recursion and fresh receive, prior | Mixed | Mixed nodes | Peak RSS, prior → mixed |
+|---|---:|---:|---:|---:|
+| OP 121,135,704 | 127.42 s | 115.05 s | 4 of 11 | 31.39 → 31.70 GiB |
+| Ethereum 24,628,607 | 272.62 s | 217.90 s | 6 of 19 | 31.77 → 32.48 GiB |
+
+These runs reuse the same retained native proof files and start a fresh
+recursive receiver for each block. They use plain native openings and
+fixed arity four. Each selected node halves its arithmetic padding.
+The independent circuit proof fixture crosses from 1,024 to 512
+arithmetic rows with the same expected output.
+
+The subsequent cold runs took 176.57 s on OP and 315.76 s on Ethereum
+through fresh root verification, compared with 183.38 s and 373.74 s
+under direct products alone. The receiver refused a changed root proof,
+reordered fold children and a different outer profile on both blocks.
+The mixed profile uses full CPU reception. Portable key derivation and
+assignment schedule inspection require an ordinary profile.
+
+#### Other recursion and native domain trials
+
 | Physical trial | Measured result | Decision |
 |---|---|---|
 | OP tiled GKR and paired loads | 116.77 s complete. Local GKR sums to 24.56 s versus 22.45 s in the live-handoff control | Keep the original GKR kernel |

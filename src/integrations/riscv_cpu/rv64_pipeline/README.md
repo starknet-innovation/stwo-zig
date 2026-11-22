@@ -4,7 +4,7 @@ Public module `stwo_riscv_rv64_pipeline`.
 
 | Fact | Value |
 |---|---|
-| Version | `0.2.0` |
+| Version | `0.3.0` |
 | Layer | `integration` |
 | Owner | `riscv-cpu-integration` |
 | Focused CI host | Linux |

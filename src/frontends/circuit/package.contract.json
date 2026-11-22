@@ -1,7 +1,7 @@
 {
   "schema": "stwo-zig-package-contract-v2",
   "package": "stwo_circuit_frontend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "layer": "frontend",
   "owner": "circuit-frontend",
   "public_modules": {
@@ -51,7 +51,7 @@
   },
   "budget": {
     "code_files": 116,
-    "code_lines": 22595,
+    "code_lines": 22618,
     "generated_code_files": 0,
     "generated_code_lines": 0,
     "script_files": 0,

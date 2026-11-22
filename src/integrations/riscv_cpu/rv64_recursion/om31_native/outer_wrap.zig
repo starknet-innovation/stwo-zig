@@ -357,7 +357,12 @@ pub fn wrapGraphOrLoadWithFactory(a: std.mem.Allocator, ctx: *C.Context, digest:
     if (ctx.trace_only and encoded == null and (factory == null or factory.?.prepare_from_circuit == null)) return error.TraceOnlySourceRequired;
     if (!ctx.trace_only and !try ctx.isCircuitValid()) return error.CurrentOm31LeafRejects;
     var timer = try std.time.Timer.start();
-    try circuit.common.finalize.padToTargets(C.Q, ctx, try paddingTargets(ctx));
+    const targets = try paddingTargets(ctx);
+    const mixed_enabled = @import("stwo_circuit_cpu_integration").om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1;
+    if (mixed_enabled and (factory != null or shape() != .exact)) return error.MixedArithmeticRequiresExactHost;
+    var mixed = if (mixed_enabled) try Outer.selectMixed(a, &ctx.circuit, targets) else null;
+    defer if (mixed) |*plan| plan.deinit(a);
+    try circuit.common.finalize.padToTargets(C.Q, ctx, if (mixed) |*plan| try plan.paddingTargets(targets) else targets);
     const finalize_ns = timer.read();
     // Fold v2 producer only: class-keyed immutable PP reuse (device precommit).
     const class: ?[32]u8 = if (ctx.trace_only and encoded == null and factory != null and factory.?.precommit_fixed != null) Device.class_hint else null;
@@ -367,7 +372,7 @@ pub fn wrapGraphOrLoadWithFactory(a: std.mem.Allocator, ctx: *C.Context, digest:
     const pp: *PP = if (cached_pp) |shared| shared.pp else blk: {
         const owned = try a.create(PP);
         errdefer a.destroy(owned);
-        owned.* = try PP.fromBuilderCircuit(a, &ctx.circuit);
+        owned.* = if (mixed) |*plan| try Outer.prepareMixed(a, &ctx.circuit, plan) else try PP.fromBuilderCircuit(a, &ctx.circuit);
         break :blk owned;
     };
     errdefer if (!pp_borrowed) {
@@ -392,6 +397,7 @@ pub fn wrapGraphOrLoadWithFactory(a: std.mem.Allocator, ctx: *C.Context, digest:
     defer if (precommitted) |fixed| fixed.release(fixed.context);
     authority.* = if (precommitted) |fixed| try Outer.Authority.initForDeviceProver(a, pp, fixed.tree.root) else try Outer.Authority.init(a, pp);
     errdefer authority.deinit();
+    if (mixed_enabled) std.log.info("MIXED_OUTER ordinal={d} selected={} raw={d} padded_log={d} ordinary_padded={d}", .{ ordinal, mixed != null, if (mixed) |plan| plan.original_rows else ctx.circuit.nQm31OpsRows(), authority.logs.get(.qm31_ops), targets.qm31_ops });
     const preprocess_ns = timer.lap();
     const columns_ns = columns_end_ns - finalize_ns;
     const authority_ns = preprocess_ns - columns_end_ns;

@@ -93,6 +93,8 @@ pub const ParallelOptions = struct {
 /// Selected native leaf capture plus assignment census only. This neither
 /// verifies the other PCS proofs nor proves/accepts a recursive execution root.
 pub fn inspectLeafSchedule(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: ?*const FixedSet, ordinal: usize) !ScheduleInspection {
+    if (@import("stwo_circuit_cpu_integration").om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1)
+        return error.MixedArithmeticScheduleInspectionUnsupported;
     var timer = try std.time.Timer.start();
     var inventory = try Execution.Inventory.initWithAuthority(a, setups, truths, bundle.requests, expected, config, fixed);
     defer inventory.deinit();
@@ -238,7 +240,10 @@ pub fn verifyExisting(a: std.mem.Allocator, setups: []const *const R.CpuSetup, t
     return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, true, null, null, true);
 }
 pub fn directProducts() bool {
-    return @import("stwo_circuit_cpu_integration").om31.protocol.active() == .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1;
+    return switch (@import("stwo_circuit_cpu_integration").om31.protocol.active()) {
+        .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1, .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1 => true,
+        else => false,
+    };
 }
 
 pub fn validateLanes(options: ParallelOptions) !void {

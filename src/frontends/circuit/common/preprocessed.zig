@@ -349,6 +349,7 @@ pub const Column = struct {
 /// `PreprocessedCircuit`: the ordered preprocessed columns plus the
 /// parameters derived from the circuit's structure.
 pub const PreprocessedCircuit = struct {
+    mixed_arithmetic: bool = false,
     columns: [N_PREPROCESSED_COLUMNS]Column,
     /// First permutation row of the qm31_ops component.
     first_permutation_row: usize,
@@ -362,6 +363,15 @@ pub const PreprocessedCircuit = struct {
 
     /// `PreprocessedCircuit::from_finalized_circuit`.
     pub fn fromCircuit(allocator: std.mem.Allocator, circuit: CircuitView) (Error || std.mem.Allocator.Error)!PreprocessedCircuit {
+        return fromCircuitWithArithmetic(allocator, circuit, null);
+    }
+
+    pub const ArithmeticBlock = struct {
+        columns: [QM31_OPS_COLUMN_IDS.len][]const M31,
+        first_permutation_row: usize,
+    };
+
+    pub fn fromCircuitWithArithmetic(allocator: std.mem.Allocator, circuit: CircuitView, mixed: ?ArithmeticBlock) (Error || std.mem.Allocator.Error)!PreprocessedCircuit {
         if (circuit.output.len == 0) return error.MissingOutputGate;
         try circuit.validate();
         const multiplicities = try circuit.computeUses(allocator);
@@ -392,48 +402,60 @@ pub const PreprocessedCircuit = struct {
         var first_permutation_row: usize = 0;
         {
             const binary_rows = circuit.add.len + circuit.sub.len + circuit.mul.len + circuit.pointwise_mul.len;
-            const cols = try builder.block(&QM31_OPS_COLUMN_IDS, binary_rows + circuit.permutationRows());
-            var row: usize = 0;
-            inline for (.{ circuit.add, circuit.sub, circuit.mul, circuit.pointwise_mul }, 0..) |gates, op_code| {
-                const Fill = struct {
-                    cols: @TypeOf(cols),
-                    gates: []const BinaryGate,
-                    mults: []const u32,
-                    offset: usize,
-                    fn fillRange(self: @This(), begin: usize, end: usize) Error!void {
-                        for (self.gates[begin..end], begin + self.offset..) |gate, index| {
-                            try putFlags(self.cols, index, op_code);
-                            try put(self.cols[4], index, gate.in0);
-                            try put(self.cols[5], index, gate.in1);
-                            try put(self.cols[6], index, gate.out);
-                            try put(self.cols[7], index, self.mults[gate.out]);
-                        }
-                    }
-                };
-                try fillRows(gates.len, Fill{ .cols = cols, .gates = gates, .mults = multiplicities, .offset = row });
-                row += gates.len;
-            }
-            first_permutation_row = row;
-            // `fill_permutation_columns`: each pair writes the input to the
-            // gate's fresh wire and reads the output back from it.
-            var permutation_address: usize = circuit.n_vars;
-            for (0..circuit.nPermutations()) |gate| {
-                const begin, const end = circuit.permutationRange(gate);
-                for (circuit.permutation_inputs[begin..end], circuit.permutation_outputs[begin..end]) |input, output| {
-                    try putFlags(cols, row, 0);
-                    try put(cols[4], row, 0);
-                    try put(cols[5], row, input);
-                    try put(cols[6], row, permutation_address);
-                    try put(cols[7], row, 1);
-                    row += 1;
-                    try putFlags(cols, row, 0);
-                    try put(cols[4], row, 0);
-                    try put(cols[5], row, permutation_address);
-                    try put(cols[6], row, output);
-                    try put(cols[7], row, multiplicities[output]);
-                    row += 1;
+            if (mixed) |replacement| {
+                const n = replacement.columns[0].len;
+                if (replacement.first_permutation_row > n or n - replacement.first_permutation_row != circuit.permutationRows())
+                    return error.VariableOutOfRange;
+                const cols = try builder.block(&QM31_OPS_COLUMN_IDS, n);
+                for (cols, replacement.columns) |col, source| {
+                    if (source.len != n) return error.VariableOutOfRange;
+                    @memcpy(col, source);
                 }
-                permutation_address += 1;
+                first_permutation_row = replacement.first_permutation_row;
+            } else {
+                const cols = try builder.block(&QM31_OPS_COLUMN_IDS, binary_rows + circuit.permutationRows());
+                var row: usize = 0;
+                inline for (.{ circuit.add, circuit.sub, circuit.mul, circuit.pointwise_mul }, 0..) |gates, op_code| {
+                    const Fill = struct {
+                        cols: @TypeOf(cols),
+                        gates: []const BinaryGate,
+                        mults: []const u32,
+                        offset: usize,
+                        fn fillRange(self: @This(), begin: usize, end: usize) Error!void {
+                            for (self.gates[begin..end], begin + self.offset..) |gate, index| {
+                                try putFlags(self.cols, index, op_code);
+                                try put(self.cols[4], index, gate.in0);
+                                try put(self.cols[5], index, gate.in1);
+                                try put(self.cols[6], index, gate.out);
+                                try put(self.cols[7], index, self.mults[gate.out]);
+                            }
+                        }
+                    };
+                    try fillRows(gates.len, Fill{ .cols = cols, .gates = gates, .mults = multiplicities, .offset = row });
+                    row += gates.len;
+                }
+                first_permutation_row = row;
+                // `fill_permutation_columns`: each pair writes the input to the
+                // gate's fresh wire and reads the output back from it.
+                var permutation_address: usize = circuit.n_vars;
+                for (0..circuit.nPermutations()) |gate| {
+                    const begin, const end = circuit.permutationRange(gate);
+                    for (circuit.permutation_inputs[begin..end], circuit.permutation_outputs[begin..end]) |input, output| {
+                        try putFlags(cols, row, 0);
+                        try put(cols[4], row, 0);
+                        try put(cols[5], row, input);
+                        try put(cols[6], row, permutation_address);
+                        try put(cols[7], row, 1);
+                        row += 1;
+                        try putFlags(cols, row, 0);
+                        try put(cols[4], row, 0);
+                        try put(cols[5], row, permutation_address);
+                        try put(cols[6], row, output);
+                        try put(cols[7], row, multiplicities[output]);
+                        row += 1;
+                    }
+                    permutation_address += 1;
+                }
             }
         }
         // TripleXor.
@@ -534,6 +556,7 @@ pub const PreprocessedCircuit = struct {
         return .{
             .columns = columns,
             .first_permutation_row = first_permutation_row,
+            .mixed_arithmetic = mixed != null,
             .n_outputs = circuit.output.len - 1,
         };
     }
