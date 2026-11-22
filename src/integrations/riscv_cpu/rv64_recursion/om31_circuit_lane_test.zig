@@ -5,6 +5,43 @@ const F = lane.Lane;
 const O = lane.O;
 const M = core.fields.m31.M31;
 const a = std.testing.allocator;
+fn multiplicationGraph(direct: bool, wrong_output: bool) !struct { rows: usize, valid: bool } {
+    const products = lane.ProductScope.init(direct);
+    defer products.deinit();
+    var ctx = try lane.Context.init(a, 0);
+    defer ctx.deinit();
+    lane.begin(&ctx);
+    var bound = true;
+    defer if (bound) lane.finish() catch {};
+    var rng = core.channel.raw_mod_m31.Om31Channel.init();
+    const x = rng.drawSecureFelt();
+    const y = rng.drawSecureFelt();
+    const lhs = try F.guess(&ctx, x);
+    const rhs = try F.guess(&ctx, y);
+    const before = ctx.gate_counts.qm31_ops;
+    const result = lhs.mul(rhs);
+    const rows = ctx.gate_counts.qm31_ops - before;
+    const expected = x.mul(y);
+    try std.testing.expect(result.value().eql(expected));
+    const declared = F.fromOm31(if (wrong_output) expected.add(O.basis()) else expected);
+    try ctx.eq(result.c0.v, declared.c0.v);
+    try ctx.eq(result.c1.v, declared.c1.v);
+    bound = false;
+    try lane.finish();
+    try ctx.finalize(false);
+    return .{ .rows = rows, .valid = try ctx.isCircuitValid() };
+}
+
+test "OM31 CPU cross products use seven rows and constrain the complete result" {
+    const reference = try multiplicationGraph(false, false);
+    const direct = try multiplicationGraph(true, false);
+    const mutant = try multiplicationGraph(true, true);
+    try std.testing.expect(reference.valid and direct.valid and !mutant.valid);
+    try std.testing.expectEqual(@as(usize, 9), reference.rows);
+    try std.testing.expectEqual(@as(usize, 7), direct.rows);
+    try std.testing.expectEqual(direct.rows, mutant.rows);
+}
+
 test "OM31 wire tower arithmetic matches native with all eight guessed coordinates" {
     var ctx = try lane.Context.init(a, 0);
     defer ctx.deinit();

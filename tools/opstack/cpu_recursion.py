@@ -6,9 +6,10 @@ from pathlib import Path
 
 from opstack.recursive_transition import OUTER_DOMAINS, admit_receipt
 
-DEFAULT_OUTER = "m6_outer_diet_k3_r1_b2_q108_p20_fold4_v1"
+DEFAULT_OUTER = "cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1"
 FOLD_ARITIES = {
-    DEFAULT_OUTER: 3,
+    "m6_outer_diet_k3_r1_b2_q108_p20_fold4_v1": 3,
+    DEFAULT_OUTER: 4,
     "m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1": 4,
     "m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1": 4,
 }

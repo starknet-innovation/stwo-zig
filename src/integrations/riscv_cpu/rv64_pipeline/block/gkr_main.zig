@@ -1,17 +1,11 @@
 //! Experimental OM/GKR guest driver. Receiver parameters are pinned here;
 //! durable producer metadata cannot select configuration or security authority.
-const Receiver = @import("gkr_receiver.zig");
-const Worker = @import("stwo_riscv_cpu_integration").rv64_gkr_worker_protocol;
-const since = @import("gkr_request_execution.zig").since;
 const std = @import("std");
 const engine = @import("stwo_prover_engine");
 pub const EarlyCPU = @import("early_cpu0.zig");
 pub const EarlySegments = @import("early_segments.zig");
 pub const Recycler = @import("stwo_riscv_cpu_integration").rv64_large_block_recycler.LargeBlockRecycler;
 const ReceiverBudget = @import("receiver_budget.zig");
-/// Producer-owned trusted setup acceleration; forbidden to fresh receivers.
-/// block_to_inputs phase report (observation only; never proof authority).
-/// Every *_at_ns is nanoseconds since gkr_main entry on the monotonic clock.
 pub const candidateLabel = @import("gkr_resources.zig").candidateLabel;
 const selectProfile = @import("gkr_resources.zig").selectProfile;
 pub fn main() !void {
@@ -79,8 +73,11 @@ fn admitCpuRecursionArgs(args: []const [:0]const u8) !CpuOuterProtocol.Profile {
         !(std.mem.eql(u8, args[3], "recurse-candidate") or std.mem.eql(u8, args[3], "verify-recursion-candidate")) or
         !std.mem.eql(u8, args[8], "--outer-profile") or !std.mem.eql(u8, args[10], "--fold-arity"))
         return error.InvalidCpuRecursionArguments;
-    const profile = CpuOuterProtocol.Profile.m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1;
-    if (!std.mem.eql(u8, args[9], profile.name())) return error.UnsupportedCpuRecursionProfile;
+    const profile = CpuOuterProtocol.Profile.parse(args[9]) catch return error.UnsupportedCpuRecursionProfile;
+    switch (profile) {
+        .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1 => {},
+        else => return error.UnsupportedCpuRecursionProfile,
+    }
     if (!std.mem.eql(u8, args[11], "4")) return error.Om31ProfileFoldArityMismatch;
     return profile;
 }
@@ -198,6 +195,9 @@ test "CPU recursion command requires a complete execution and admitted outer pro
         @tagName(profile),            "--fold-arity",       "4",
     };
     try std.testing.expectEqual(profile, try admitCpuRecursionArgs(&args));
+    args[9] = @tagName(CpuOuterProtocol.Profile.cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1);
+    try std.testing.expectEqual(CpuOuterProtocol.Profile.cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1, try admitCpuRecursionArgs(&args));
+    args[9] = @tagName(profile);
     args[3] = "verify-prefix-candidate";
     try std.testing.expectError(error.InvalidCpuRecursionArguments, admitCpuRecursionArgs(&args));
     args[3] = "recurse-candidate";

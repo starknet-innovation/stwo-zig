@@ -58,6 +58,9 @@ pub const Profile = enum {
     /// Explicit M7 family: original MAIN/FIXED plus source-bound cyclic-Eq
     /// LogUp-GKR, 128 INTER columns, k4/cap3. Distinct wire and child verifier.
     m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1,
+    /// CPU recursion uses the seven-row tower product and keeps the k4/cap3
+    /// commitment and FRI geometry. Separate identity for the new topology.
+    cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1,
 
     pub fn parse(text: []const u8) !Profile {
         inline for (@typeInfo(Profile).@"enum".fields) |field| {
@@ -79,12 +82,13 @@ pub const Profile = enum {
             .m5_outer_canonical_m3_b4_q51_p26_fold4_v1 => "stwo/circuit/native-om31/m5-canonical-m3-b4-q51-p26-fold4/lens-v1",
             .m6_outer_diet_k3_r1_b2_q108_p20_fold4_v1 => "stwo/circuit/native-om31/m6-diet-k3-q108-p20-fold4/lens-v1",
             .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1 => "stwo/circuit/native-om31/m6-diet-k4-cap3-q108-p20-fold4/lens-v1",
+            .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1 => "stwo/circuit/native-om31/cpu-direct-products-k4-cap3-q108-p20-fold4/lens-v1",
             .m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1 => "stwo/circuit/native-om31/m7-outer-gkr-k4-cap3-q108-p20-fold4/lens-v1",
         };
     }
     pub fn config(self: Profile) PcsConfig {
         const log_blowup: u32, const queries: usize, const pow: u32 = switch (self) {
-            .r1_b2_q108_p20_fold4, .m5_outer_canonical_r1_b2_q108_p20_fold4_v1, .m6_outer_diet_k3_r1_b2_q108_p20_fold4_v1, .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1 => .{ 1, 108, 20 },
+            .r1_b2_q108_p20_fold4, .m5_outer_canonical_r1_b2_q108_p20_fold4_v1, .m6_outer_diet_k3_r1_b2_q108_p20_fold4_v1, .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1, .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1 => .{ 1, 108, 20 },
             .m3_b4_q51_p26_fold4, .m5_outer_canonical_m3_b4_q51_p26_fold4_v1 => .{ 2, 51, 26 },
             .m3_b8_q34_p26_fold4 => .{ 3, 34, 26 },
         };
@@ -104,7 +108,7 @@ pub const Profile = enum {
     pub fn requiredFoldArity(self: Profile) ?usize {
         return switch (self) {
             .m6_outer_diet_k3_r1_b2_q108_p20_fold4_v1 => 3,
-            .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1 => 4,
+            .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1, .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1 => 4,
             else => null,
         };
     }
@@ -112,7 +116,7 @@ pub const Profile = enum {
     /// (0 = full authentication paths, every pre-M6 profile).
     pub fn foldMerkleCapLog(self: Profile) u32 {
         return switch (self) {
-            .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1 => 3,
+            .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1, .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1 => 3,
             else => 0,
         };
     }
@@ -124,12 +128,8 @@ pub const Profile = enum {
 };
 pub const DEFAULT_PROFILE: Profile = .r1_b2_q108_p20_fold4;
 pub const PROFILE_ENV = "STWO_RV64_OUTER_PROFILE";
-/// Historical r1 domain string. This is NOT the active outer profile: every
-/// identity, wire header, transcript, class key and report must use
-/// `domainName()` (adversarial review, canon-vk: a `pub const domain` kept the
-/// old name and silently meant r1 under every other profile, so a consumer
-/// built against it, e.g. a VK-table header, would label a canonical/m3 table
-/// as r1). Renamed so such callers fail to compile instead.
+/// Historical r1 domain string. Use `domainName()` for identities, transcripts,
+/// wire headers, class keys and reports under the active profile.
 pub const r1_domain = Profile.r1_b2_q108_p20_fold4.domainName();
 const unset: u8 = 0xff;
 var selected = std.atomic.Value(u8).init(unset);

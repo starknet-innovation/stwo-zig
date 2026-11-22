@@ -9,6 +9,23 @@ pub const O = core.fields.om31.OM31;
 pub const Context = q.Context;
 pub const begin = q.begin;
 pub const finish = q.finish;
+threadlocal var direct_products: bool = false;
+
+/// Select lowering for the lifetime of an admitted recursion graph. The
+/// arithmetic lane itself has no dependency on the proof profile owner.
+pub const ProductScope = struct {
+    previous: bool,
+
+    pub fn init(direct: bool) ProductScope {
+        const previous = direct_products;
+        direct_products = direct;
+        return .{ .previous = previous };
+    }
+
+    pub fn deinit(self: ProductScope) void {
+        direct_products = self.previous;
+    }
+};
 pub const check = q.check;
 const Ops = struct {
     pub fn mulByU(x: q.Lane) q.Lane {
@@ -77,6 +94,12 @@ pub const Lane = struct {
         return wrap(arithmetic(x).sub(arithmetic(y)));
     }
     pub fn mul(x: Lane, y: Lane) Lane {
+        // Circuit additions cost rows too. The direct tower equation uses
+        // fewer rows for an unconstrained pair of QM31 coordinate wires.
+        if (direct_products) return .{
+            .c0 = x.c0.mul(y.c0).add(Ops.mulByU(x.c1.mul(y.c1))),
+            .c1 = x.c0.mul(y.c1).add(x.c1.mul(y.c0)),
+        };
         return wrap(arithmetic(x).mul(arithmetic(y)));
     }
     pub fn square(x: Lane) Lane {
