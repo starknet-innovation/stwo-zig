@@ -344,6 +344,8 @@ pub fn buildFoldTraceOnly(a: std.mem.Allocator, children: []const Child) !Graph 
     return buildFoldMode(a, children, true);
 }
 fn buildFoldMode(a: std.mem.Allocator, children: []const Child, trace_only: bool) !Graph {
+    const products = C.productScope();
+    defer products.deinit();
     const version_word = try versionWord(children.len);
     var ctx = if (trace_only) try C.Context.initTraceOnly(a, 8) else try C.Context.init(a, 8);
     errdefer ctx.deinit();

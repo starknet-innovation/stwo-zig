@@ -16,12 +16,10 @@ const KeccakLeaf = @import("keccak_leaf.zig");
 const Graph = @import("leaf_graph.zig");
 const Outer = @import("outer_wrap.zig");
 const Bridge = @import("../om31_outer.zig");
-const FoldTape = @import("fold_tape.zig");
 const Prove = @import("stwo_circuit_cpu_integration").om31.prove;
 const Wire = @import("stwo_circuit_cpu_integration").om31.wire;
 const SharedBudget = @import("stwo_prover_engine").host_budget_allocator.SharedHostBudget;
 const Dag = @import("ready_dag.zig");
-const Pools = @import("stwo_prover_engine").work_pool;
 const ownership_owner = @import("execution_wrap_ownership.zig");
 pub const FoldClasses = ownership_owner.FoldClasses;
 const Pending = ownership_owner.Pending;
@@ -93,7 +91,7 @@ pub const ParallelOptions = struct {
 /// Selected native leaf capture plus assignment census only. This neither
 /// verifies the other PCS proofs nor proves/accepts a recursive execution root.
 pub fn inspectLeafSchedule(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: ?*const FixedSet, ordinal: usize) !ScheduleInspection {
-    if (@import("stwo_circuit_cpu_integration").om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1)
+    if (mixedArithmetic())
         return error.MixedArithmeticScheduleInspectionUnsupported;
     var timer = try std.time.Timer.start();
     var inventory = try Execution.Inventory.initWithAuthority(a, setups, truths, bundle.requests, expected, config, fixed);
@@ -104,8 +102,6 @@ pub fn inspectLeafSchedule(a: std.mem.Allocator, setups: []const *const R.CpuSet
     var manifest = try stages.verifyAndSeal(a, inventory.execution_identity, inventory.workers);
     defer manifest.deinit(a);
     const admission_ns = timer.lap();
-    const products = @import("../om31_circuit_lane.zig").ProductScope.init(directProducts());
-    defer products.deinit();
     const worker = inventory.workers[ordinal];
     var graph = if (ordinal < setups.len) try Graph.cpuTraceOnly(a, .{ .setup = setups[ordinal], .request = bundle.requests[ordinal], .expected = worker, .first = inventory.first_ids[ordinal], .manifest = &manifest, .index = ordinal, .stage = &stages.stages[ordinal], .config = config, .encoded = &bundle.cpus[ordinal], .fixed = if (fixed) |authority| authority.at(ordinal) else null }) else try Graph.truthTraceOnly(a, .{ .truth = truths[ordinal - setups.len], .expected = worker, .manifest = &manifest, .config = config, .encoded = &bundle.truths[ordinal - setups.len], .fixed = if (fixed) |authority| authority.at(ordinal) else null });
     defer graph.deinit();
@@ -239,15 +235,12 @@ pub fn verifyExisting(a: std.mem.Allocator, setups: []const *const R.CpuSetup, t
     try @import("publication.zig").requireExisting(dir, try Dag.Plan.initArity(setups.len + truths.len, try foldArity()));
     return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, true, null, null, true);
 }
-pub fn directProducts() bool {
-    return switch (@import("stwo_circuit_cpu_integration").om31.protocol.active()) {
-        .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1, .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1 => true,
-        else => false,
-    };
+fn mixedArithmetic() bool {
+    return @import("stwo_circuit_cpu_integration").om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1;
 }
 
 pub fn validateLanes(options: ParallelOptions) !void {
-    if (directProducts()) return error.CpuRecursionProfileRequiresCpu;
+    if (mixedArithmetic()) return error.CpuRecursionProfileRequiresCpu;
     if (options.lanes.len == 0 or options.lanes.len > 4) return error.InvalidRecursionAdmission;
     var identities: [4]Dag.LaneIdentity = undefined;
     for (options.lanes, 0..) |lane, i| {
@@ -257,7 +250,7 @@ pub fn validateLanes(options: ParallelOptions) !void {
     try Dag.validateLanes(identities[0..options.lanes.len], options.pool_worker_budget, options.max_pending_authorities);
 }
 fn runImpl(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: ?*const FixedSet, dir: std.fs.Dir, allow_resume: bool, factory: ?Outer.Device.Factory, parallel: ?ParallelOptions, existing_only: bool) !Report {
-    if (directProducts() and (factory != null or parallel != null)) return error.CpuRecursionProfileRequiresCpu;
+    if (mixedArithmetic() and (factory != null or parallel != null)) return error.CpuRecursionProfileRequiresCpu;
     var timer = try std.time.Timer.start();
     var inventory = try Execution.Inventory.initWithAuthority(a, setups, truths, bundle.requests, expected, config, fixed);
     defer inventory.deinit();

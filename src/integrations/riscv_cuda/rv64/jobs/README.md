@@ -32,7 +32,19 @@ Large compiles and proof gates run in the corresponding frozen pod source
 snapshot. Transport must preserve the canonical source identity; do not select
 another laptop worktree to build a different component. The gate owns its GPU
 lock. The regression command covers the complete basket unless a diagnostic
-subset is explicitly selected; subset evidence is not a basket pass.
+subset is explicitly selected. Start a lease with the same subset at preflight
+and execution so missing files fail before any service starts.
+
+```sh
+python3 scripts/rv64_m8_bench15.py check --assets "$ASSETS" --blocks 24628607
+python3 scripts/rv64_m8_bench15.py run --assets "$ASSETS" --out "$RESULTS" \
+  --arms gpu-native --gpus 1 --blocks 24628607 --rounds 1 --profile none
+```
+
+Choose the hardware, pinned preset and capacity explicitly for a capacity
+study. Omit `--blocks` and keep the full comparison rounds for the basket
+gate. A one-round subset produces a fresh receiver result and keeps the
+existing proof comparison to the frozen default on the development blocks.
 
 Spec: `design/riscv/rv64-m8-job-architecture.md`. The current
 [resource and development contract](../../../../../design/riscv/rv64-gpu-hygiene.md)

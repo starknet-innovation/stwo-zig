@@ -2,11 +2,13 @@ const std = @import("std");
 const core = @import("stwo_core");
 const lane = @import("om31_circuit_lane.zig");
 const F = lane.Lane;
+const Protocol = @import("stwo_circuit_cpu_integration").om31.protocol;
+const Common = @import("om31_native/common.zig");
 const O = lane.O;
 const M = core.fields.m31.M31;
 const a = std.testing.allocator;
-fn multiplicationGraph(direct: bool, wrong_output: bool) !struct { rows: usize, valid: bool } {
-    const products = lane.ProductScope.init(direct);
+fn multiplicationGraph(wrong_output: bool) !struct { rows: usize, valid: bool } {
+    const products = Common.productScope();
     defer products.deinit();
     var ctx = try lane.Context.init(a, 0);
     defer ctx.deinit();
@@ -32,10 +34,14 @@ fn multiplicationGraph(direct: bool, wrong_output: bool) !struct { rows: usize, 
     return .{ .rows = rows, .valid = try ctx.isCircuitValid() };
 }
 
-test "OM31 CPU cross products use seven rows and constrain the complete result" {
-    const reference = try multiplicationGraph(false, false);
-    const direct = try multiplicationGraph(true, false);
-    const mutant = try multiplicationGraph(true, true);
+test "OM31 recursion profile uses seven product rows and constrains the complete result" {
+    const previous = Protocol.active();
+    defer Protocol.selectForTesting(previous);
+    Protocol.selectForTesting(.m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1);
+    const reference = try multiplicationGraph(false);
+    Protocol.selectForTesting(.cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1);
+    const direct = try multiplicationGraph(false);
+    const mutant = try multiplicationGraph(true);
     try std.testing.expect(reference.valid and direct.valid and !mutant.valid);
     try std.testing.expectEqual(@as(usize, 9), reference.rows);
     try std.testing.expectEqual(@as(usize, 7), direct.rows);

@@ -146,6 +146,8 @@ fn cpuMode(a: std.mem.Allocator, input: CpuInput, trace_only: bool, factory: ?Ou
         ctx.deinit();
         a.destroy(ctx);
     }
+    const products = C.productScope();
+    defer products.deinit();
     C.lane.begin(ctx);
     errdefer C.lane.finish() catch {};
     const proof = try V.proof.guess(ctx, &values, &shape);
@@ -214,6 +216,8 @@ fn truthMode(a: std.mem.Allocator, input: TruthInput, trace_only: bool, factory:
         ctx.deinit();
         a.destroy(ctx);
     }
+    const products = C.productScope();
+    defer products.deinit();
     C.lane.begin(ctx);
     errdefer C.lane.finish() catch {};
     const main_root = native.commitment_scheme_proof.commitments.items[1];

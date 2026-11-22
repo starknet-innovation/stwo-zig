@@ -132,6 +132,7 @@ pub fn build(b: *std.Build) void {
     var native_gkr_imports = native_gkr_root.import_table.iterator();
     while (native_gkr_imports.next()) |entry| native_gkr_circuit_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     native_gkr_circuit_root.addImport("stwo_circuit_frontend", circuit_frontend);
+    native_gkr_circuit_root.addImport("stwo_circuit_cpu_integration", circuit_cpu);
     const native_gkr_circuit_tests = b.addTest(.{ .root_module = native_gkr_circuit_root, .filters = if (native_gkr_filter) |filter| &.{filter} else &.{} });
     b.step("test-native-gkr-circuit", "Test recursion-owned native GKR circuit and PCS statement adapters").dependOn(testDependency(b, native_gkr_circuit_tests, check_only, 0));
 

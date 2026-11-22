@@ -106,7 +106,6 @@ ARMS = {
                    'STWO_RV64_M8_JOBS_LIBRARY': '{addon}', 'STWO_RV64_M8_OUTER_FS_LIBRARY': '{outer_fs}',
                    'STWO_RV64_M8_JOBS_PINNED_BYTES': '2365587456'},
 }
-ASSET_NAMES = ('driver', 'receiver', 'library', 'sparse', 'observer', 'process_budget_guard', 'addon', 'outer_fs')
 # M3 found blocks with >= 40 CPU segments OOM in resident composition unless the
 # idle upper-PCS cache is released (proof-neutral; rv64-m3-20261104/SUMMARY.md).
 LARGE_SEGMENTS = 40
@@ -121,6 +120,17 @@ def basket(summary=None):
     if len(rows) != 15 or data['totals']['request_s_sum_15'] != 1843.0:
         raise RuntimeError('M3 basket summary changed: expected 15 rows summing to 1843 s')
     return rows
+
+
+def selected_blocks(blocks=None):
+    rows = basket()
+    if not blocks:
+        return rows
+    wanted = set(blocks)
+    unknown = wanted.difference(row['block'] for row in rows)
+    if unknown:
+        raise SystemExit('blocks absent from the regression basket: ' + ', '.join(map(str, sorted(unknown))))
+    return [row for row in rows if row['block'] in wanted]
 
 
 def block_environment(row):
@@ -355,7 +365,8 @@ def load_assets(path):
 
 
 def resume_identity(config):
-    return {k: config.get(k) for k in ('arms', 'rounds', 'profile', 'receivers', 'assets', 'gpus', 'device_cap_bytes', 'preset_sha256')}
+    return {k: config.get(k) for k in ('arms', 'rounds', 'profile', 'receivers', 'assets', 'blocks', 'smoke', 'gpus',
+                                      'device_cap_bytes', 'preset_sha256', 'source_commit')}
 
 
 def positive_capacity(value):
@@ -388,7 +399,7 @@ def pin(args):
 
 def check(args):
     """Inputs inventory: every file a basket request reads, with size and sha256, plus regeneration hints."""
-    rows = basket()
+    rows = selected_blocks(args.blocks)
     template = load(M3 / 'inputs/plan-template.json', {})
     jobs = {j['block']: j for j in template.get('jobs', [])}
     elf = M3 / 'inputs/guest.elf'
@@ -448,7 +459,8 @@ def check(args):
         if not shared[name]['exists']:
             missing.append(f'{name}: missing ({shared[name]["path"]})')
     result = {'schema': 'rv64-m8-bench15-check/v1', 'blocks': blocks, 'shared': shared, 'assets': assets,
-              'disk_free_bytes': free_bytes(M3), 'gpu_lock_free_now': gpu_lock_free(), 'missing': missing,
+              'disk_free_bytes': free_bytes(M3) if M3.exists() else None,
+              'gpu_lock_free_now': gpu_lock_free() if GPU_LOCK.parent.is_dir() else None, 'missing': missing,
               'status': 'READY' if not missing else 'MISSING'}
     if args.out:
         atomic(args.out, result)
@@ -690,12 +702,7 @@ class Bench:
         raise Stop(f'{block} {arm}: quiet gate refused {self.args.quiet_retries + 1} attempts (busy pod)')
 
     def run(self):
-        rows = basket()
-        if self.args.smoke:
-            rows = [r for r in rows if r['block'] == SMOKE_BLOCK]
-        elif self.args.blocks:
-            wanted = set(self.args.blocks)
-            rows = [r for r in rows if r['block'] in wanted]
+        rows = selected_blocks([SMOKE_BLOCK] if self.args.smoke else self.args.blocks)
         unknown = [a for a in self.args.tolerate_arm_failure if a not in self.args.arms]
         if unknown:
             raise SystemExit('--tolerate-arm-failure names arms not in --arms: ' + ','.join(unknown))
@@ -768,6 +775,7 @@ def main():
     p.add_argument('--out', required=True, type=Path)
     c = sub.add_parser('check', help='inputs inventory (no GPU)')
     c.add_argument('--assets', type=Path)
+    c.add_argument('--blocks', type=int, nargs='+', help='verify only these basket blocks')
     c.add_argument('--out', type=Path)
     e = sub.add_parser('estimate', help='wall-time estimate per arm [E] (no GPU)')
     e.add_argument('--arms', type=arms_type, default=list(ARMS))
@@ -804,7 +812,8 @@ def main():
     if args.mode == 'pin':
         pin(args)
     elif args.mode == 'check':
-        check(args)
+        if check(args)['status'] != 'READY':
+            raise SystemExit(1)
     elif args.mode == 'estimate':
         print(json.dumps(estimate_walls(basket(), args.arms, args.rounds, not args.no_profile), indent=1))
     elif args.mode == 'run':
