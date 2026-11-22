@@ -1593,6 +1593,33 @@
   ],
   "package_budget_changes": [
     {
+      "package": "stwo_ethereum_statement",
+      "base_commit": "1942ac7df56dffb2f0e3e80a7c86473ee461a10c",
+      "before": {
+        "code_files": 427,
+        "code_lines": 76321,
+        "generated_code_files": 0,
+        "generated_code_lines": 0,
+        "script_files": 0,
+        "api_entries": 6,
+        "dependencies": 20,
+        "rv64_registry_flags": 21,
+        "versioned_files": 430
+      },
+      "after": {
+        "code_files": 427,
+        "code_lines": 76325,
+        "generated_code_files": 0,
+        "generated_code_lines": 0,
+        "script_files": 0,
+        "api_entries": 6,
+        "dependencies": 20,
+        "rv64_registry_flags": 21,
+        "versioned_files": 430
+      },
+      "decision": "https://github.com/starknet-innovation/stwo-zig/issues/491#issuecomment-7072963593"
+    },
+    {
       "package": "stwo_riscv_rv64_pipeline",
       "base_commit": "1942ac7df56dffb2f0e3e80a7c86473ee461a10c",
       "before": {
@@ -1608,7 +1635,7 @@
       },
       "after": {
         "code_files": 56,
-        "code_lines": 9776,
+        "code_lines": 9791,
         "generated_code_files": 0,
         "generated_code_lines": 0,
         "script_files": 0,
@@ -1617,7 +1644,7 @@
         "rv64_registry_flags": 0,
         "versioned_files": 59
       },
-      "decision": "https://github.com/starknet-innovation/stwo-zig/issues/491#issuecomment-7072594195"
+      "decision": "https://github.com/starknet-innovation/stwo-zig/issues/491#issuecomment-7072963593"
     },
     {
       "package": "stwo_opstack_statement",

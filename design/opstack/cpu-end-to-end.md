@@ -1487,3 +1487,30 @@ Mantle used separate native, recursion and receiver RSS limits of 24,
 46 and 30 GiB. An earlier attempt hit the 24 GiB guard during its root
 fold. These measurements qualify the product entry point and preserve
 the fixture's proof protocol.
+
+### Independent receiver key construction
+
+The strict complete receiver now derives CPU source coefficients without
+constructing their unused original commitment. It still builds the
+candidate FIXED tree and verifies the same native and recursive proofs.
+Its cache is request-owned with no directory. Up to four builders join
+before verification. Their external stacks are reserved against the
+same receiver budget as the fixed authority.
+
+| Existing complete proof | Prior fresh receiver s | Identity-only receiver s | Native key build before / after s |
+|---|---:|---:|---:|
+| OP 120,794,432, median of two alternating reruns | 2.70 | 2.52 | 0.553 / 0.375 |
+| Mantle 103,132,217 | 3.80 | 3.59 | 0.604 / 0.361 |
+| Ethereum 24,628,607 | 18.99 | 17.74 | 2.467 / 0.616 |
+
+Each run checks the pinned 43-byte output and the complete proof roster.
+Every receiver leaves the existing proof files unchanged and refuses a
+changed root. OP's first launch of the rebuilt binary took 3.08 s even
+though key setup fell from 0.568 s to 0.381 s. The table's alternating
+reruns use distinct processes after each binary has run once. Mantle
+and Ethereum are single paired measurements.
+
+The same key derivation in the packed-research receiver also accepted the
+existing complete Ethereum proof in 13.88 s, versus 16.67 s in the
+prior combined run. That replay keeps the original proof protocol and
+is a separate measurement from the maintained receiver above.

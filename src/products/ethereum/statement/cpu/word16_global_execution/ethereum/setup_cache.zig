@@ -79,6 +79,7 @@ pub const Stats = struct {
     max_build_kind: []const u8 = "",
 };
 
+pub const BUILDER_STACK_BYTES: usize = 64 << 20;
 pub const Options = struct {
     mode: Mode,
     /// Absolute or cwd-relative directory; null keeps residency only.
@@ -269,7 +270,7 @@ pub const Cache = struct {
         var spawned: usize = 0;
         const target = @min(@min(count, max_threads), threads.len + 1);
         while (spawned + 1 < target) : (spawned += 1) {
-            threads[spawned] = std.Thread.spawn(.{ .stack_size = 64 << 20 }, Shared.work, .{&shared}) catch break;
+            threads[spawned] = std.Thread.spawn(.{ .stack_size = BUILDER_STACK_BYTES }, Shared.work, .{&shared}) catch break;
         }
         // The caller thread keeps its existing binding.
         while (!shared.failed.load(.acquire)) {
