@@ -1373,3 +1373,67 @@ The service packing and leaf-state reuse arms use pinned research runners.
 The native and outer settings keep the same target under documented
 assumptions. The packed service extension also needs a composed bound and
 maintained protocol ownership before it can select production proofs.
+
+### Width-sixteen service span
+
+A mixed layout packs the Keccak permutation and eligible interaction
+columns at their admitted heights. The large Chi table retains its original
+degree class. The Keccak source therefore keeps the original FRI degree,
+even though MAIN commits 244 columns in place of 1,925. The circuit derives
+up to five shifted positions from the bound layout and samples every
+position in transcript order. The arithmetic services carry the degree
+increase required by their packed layouts.
+
+| Complete guarded run | Native s | Recursion s | Fresh receiver s | Total s | Native / recursive peak GiB |
+|---|---:|---:|---:|---:|---:|
+| OP 121,135,704, width sixteen | 63.82 | 46.89 | 10.68 | **121.40** | 14.27 / 22.19 |
+| Ethereum 24,628,607, width sixteen | 95.24 | 93.67 | 16.98 | **205.89** | 22.42 / 30.33 |
+| Ethereum 24,628,607, all compatible adjacent CPU pairs at width eight | 98.15 | 94.99 | 17.55 | 210.68 | 16.66 / 22.49 |
+
+The four-service OP graph uses 3,902,080 Blake G gates and 5,141,608
+field operations. Its Blake domain shrinks to 2²² and its field domain
+remains 2²³. The corresponding Ethereum graph needs 4,305,360 Blake G
+gates and 5,390,968 field operations. A further 111,056 Blake G gates
+would cross the same boundary. Full width-sixteen runs improve the
+matched cold controls by 32.3% on OP and 31.7% on Ethereum. Both fresh
+processes establish complete coverage and reject a changed CPU root,
+a changed packed Keccak MAIN root with repaired transport checksum, and
+reordered fold children.
+
+The Ethereum all-pairs run reduces the number of wraps and folds to
+eight and four. The producer's two-lane pairing schedule lengthens the
+native phase. OP's all-pairs run takes 133.02 s and loses to its one-pair
+width-eight control at 127.86 s. Pairing policy should use both the
+native rendezvous time and the circuit padding in its cost.
+
+A uniform width-thirty-two Ethereum run pushes the four-service Blake
+domain to 2²² at 4,046,000 gates, but expands four CPU field domains and
+an isolated Keccak leaf. Native production takes 93.52 s, recursion 119.24 s,
+and fresh reception 18.41 s. The total of 231.17 s favors the width-sixteen
+configuration when one width is used throughout. The fresh receiver
+accepts the whole width-thirty-two proof and the same mutations fail.
+
+Keeping CPU and Keccak at width sixteen while allowing the arithmetic
+providers to use width thirty-two preserves the smaller CPU field domains.
+The four-service span then needs 4,046,000 Blake G gates on Ethereum and
+3,640,960 on OP. Its Blake domain is 2²² on both. Mixed widths are derived
+from the provider role and bound in each layout identity.
+
+| Complete mixed-width run | Native s | Recursion s | Fresh receiver s | Total s |
+|---|---:|---:|---:|---:|
+| OP 121,135,704 | 60.63 | 45.81 | 10.45 | **116.89** |
+| Ethereum 24,628,607 | 93.29 | 84.93 | 17.08 | **195.30** |
+
+The mixed runs improve the same-block cold controls by 34.8% and 35.2%.
+Both verify the pinned output and reject the modified CPU commitment,
+modified Keccak commitment with repaired transport checksum, and reordered
+fold children. Native generation now accounts for approximately half of
+each complete time.
+
+The first live CPU overlap arm starts the ordered recursive graph as soon
+as its native inputs finish. It keeps an independent six-worker pool and
+waits for the native terminal check before the root. The OP native bundle
+is byte-identical. Combined production takes 113.91 s and a fresh process
+takes 10.08 s. The 124.00 s total loses to 116.89 s with split processes.
+The smaller pool continues after the native barrier, limiting the tail.
+Peak combined RSS is 25.35 GiB.
