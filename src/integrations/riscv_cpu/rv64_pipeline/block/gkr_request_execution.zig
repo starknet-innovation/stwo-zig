@@ -297,13 +297,27 @@ pub fn runArguments(recycler: *Recycler, all_args: []const [:0]u8, stages: Resid
         var source_bounds: ?SourceBounds.Report = if (candidate) try SourceBounds.derive(a, program.log_size, loaded.cpu_declarations, loaded.truth_declarations, loaded.bundle.requests) else null;
         defer if (source_bounds) |*value| value.deinit();
         const native_keys_start_ns = timer.read();
-        var keys = try Keys.initWithSuiteAndCaches(a, &image, loaded.cpu_declarations, loaded.truth_declarations, true, Suite.experimentalFold4(), caches);
+        // The candidate FIXED tree commits the receiver's pinned source coefficients.
+        var receiver_setup: ?SetupCache.Cache = null;
+        defer if (receiver_setup) |*owner| owner.deinit();
+        const suite = Suite.experimentalFold4();
+        var keys = keys: {
+            if (!strict_recursion_verify) break :keys try Keys.initWithSuiteAndCaches(a, &image, loaded.cpu_declarations, loaded.truth_declarations, true, suite, caches);
+            const setup_workers: usize = @min(native_workers, 4);
+            var setup_stacks = try receiver_budget.?.reserveExternal((setup_workers - 1) * SetupCache.BUILDER_STACK_BYTES);
+            defer setup_stacks.deinit();
+            const options = SetupCache.Options{ .mode = .verifier, .directory = null, .identity_only_cpu = true, .max_build_threads = setup_workers, .fixed_setup_bytes = fixed_setup_bytes };
+            receiver_setup = try SetupCache.Cache.init(a, .{ .log_blowup = pcs.fri_config.log_blowup_factor }, options);
+            try receiver_setup.?.bindRequest(request.value);
+            break :keys try Keys.initResident(a, &image, loaded.cpu_declarations, loaded.truth_declarations, true, suite, caches, &receiver_setup.?);
+        };
         defer keys.deinit();
         const native_keys_ns = timer.read() - native_keys_start_ns;
         const fixed_setup_start_ns = timer.read();
-        var fixed_cache: ?FixedAuthority.Fixed.Cache = if (candidate) try FixedAuthority.Fixed.Cache.init(a, fixed_setup_bytes) else null;
+        var fixed_cache: ?FixedAuthority.Fixed.Cache = if (candidate and receiver_setup == null) try FixedAuthority.Fixed.Cache.init(a, fixed_setup_bytes) else null;
         defer if (fixed_cache) |*owner| owner.deinit();
-        var fixed_set: ?FixedSet = if (fixed_cache) |*owner| try FixedSet.init(a, owner, keys.cpus, keys.truths, pcs) else null;
+        const fixed_owner = if (receiver_setup) |*owner| &owner.fixed else if (fixed_cache) |*owner| owner else null;
+        var fixed_set: ?FixedSet = if (fixed_owner) |owner| try FixedSet.init(a, owner, keys.cpus, keys.truths, pcs) else null;
         defer if (fixed_set) |*owner| owner.deinit();
         const setup_ns = timer.read();
         const setup_breakdown = .{ .image_ns = image_load_ns, .program_ns = program_ns, .native_keys_ns = native_keys_ns, .fixed_authority_ns = setup_ns - fixed_setup_start_ns, .other_ns = native_keys_start_ns - image_load_ns - program_ns };

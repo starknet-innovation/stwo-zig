@@ -28,6 +28,8 @@ pub fn Pipeline(comptime H: type) type {
         pub const main = @import("block/gkr_main.zig").main;
         /// The same command line over an explicit argv (`argv[0]` first).
         pub const runArgv = @import("block/gkr_main.zig").runArgv;
+        /// CPU wrapping and fresh reception of a complete native execution.
+        pub const runCpuRecursionArgv = @import("block/gkr_main.zig").runCpuRecursionArgv;
     };
 }
 

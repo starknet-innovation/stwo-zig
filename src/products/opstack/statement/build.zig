@@ -62,6 +62,11 @@ pub fn build(b: *std.Build) void {
     probe_step.dependOn(&prove.step);
     const install = b.addInstallArtifact(native, .{});
     b.step("opstack-native", "Build stwo-opstack-native (native CPU production and fresh reception)").dependOn(&install.step);
+    const recursion_root = b.createModule(.{ .root_source_file = b.path("cpu/recursion_main.zig"), .target = target, .optimize = optimize });
+    recursion_root.addImport("opstack_cpu_component", cpu_component);
+    const recursion = b.addExecutable(.{ .name = "stwo-opstack-recursion", .root_module = recursion_root });
+    const install_recursion = b.addInstallArtifact(recursion, .{});
+    b.step("opstack-recursion", "Build the OP Stack CPU recursion producer and receiver").dependOn(&install_recursion.step);
     const check = b.addExecutable(.{ .name = "stwo-opstack-native-check", .root_module = native_root });
     b.step("check-opstack-native", "Compile stwo-opstack-native without installing it").dependOn(&check.step);
 }

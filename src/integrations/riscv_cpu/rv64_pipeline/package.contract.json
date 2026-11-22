@@ -1,7 +1,7 @@
 {
   "schema": "stwo-zig-package-contract-v2",
   "package": "stwo_riscv_rv64_pipeline",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "layer": "integration",
   "owner": "riscv-cpu-integration",
   "public_modules": {
@@ -29,6 +29,7 @@
       "mod.zig::api signature: hooks contract rejects incomplete hooks and admits the reference hooks"
     ],
     "invariant_tests": [
+      "block/gkr_main.zig::CPU recursion command requires a complete execution and admitted outer profile",
       "mod.zig::api invariant: guest abi view forwards the injected hooks unchanged",
       "tests/hooks_test.zig::hooks: empty service families keep the base roster",
       "tests/hooks_test.zig::hooks: non-admitted profile is rejected before any file is read"
@@ -52,7 +53,7 @@
   },
   "budget": {
     "code_files": 56,
-    "code_lines": 9726,
+    "code_lines": 9791,
     "generated_code_files": 0,
     "generated_code_lines": 0,
     "script_files": 0,

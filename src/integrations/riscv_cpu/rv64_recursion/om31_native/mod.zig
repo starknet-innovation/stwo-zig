@@ -57,12 +57,16 @@ pub fn reconstructComposition(ctx: *common.Context, samples: []const []const F, 
     try common.lane.check();
     return chunks[0];
 }
-/// Statement methods are the legacy native verifier contract over OM31 wires:
-/// mixPublic(ctx,channel), nTreesBeforeChallenges(), drawChallenges(ctx,channel),
-/// mixClaims(ctx,channel), evalComposition(ctx,point,masks,randomness,challenges).
-/// Topology/shape and public authority must be independently admitted by caller.
-pub fn verify(ctx: *common.Context, geometry: *const Shape, witness: *const Proof, statement: anytype) !Verified {
-    try witness.validate(geometry);
+const Prefix = struct {
+    channel: Channel,
+    composition_randomness: F,
+    oods_point: Point,
+    deep_randomness: F,
+};
+
+// Start from the independently admitted statement and authenticate every
+// sample before drawing the DEEP coefficient.
+fn bindSamples(ctx: *common.Context, geometry: *const Shape, witness: *const Proof, statement: anytype) !Prefix {
     var channel = try Channel.init(ctx);
     try statement.mixPublic(ctx, &channel);
     const before = statement.nTreesBeforeChallenges();
@@ -91,11 +95,11 @@ pub fn verify(ctx: *common.Context, geometry: *const Shape, witness: *const Proo
     try channel.mixFelts(ctx, sampled);
     if (ctx.record_gates) ctx.blake_sample_span = .{ .first_gg = @intCast(sampled_first_gg), .gg_count = @intCast(ctx.circuit.blake_g_gate.items.len - sampled_first_gg) };
     const alpha = try channel.draw(ctx);
-    const alphas = try fri.commit(ctx, &channel, witness);
-    try channel.raw.inner.pow(Q, ctx, geometry.pcs.pow_bits, witness.pow_nonce);
+    return .{ .channel = channel, .composition_randomness = randomness, .oods_point = point, .deep_randomness = alpha };
+}
+
+fn authenticateQueries(ctx: *common.Context, geometry: *const Shape, witness: *const Proof, prefix: Prefix, queries: fri.Queries) ![]const F {
     const lifting = geometry.liftingLogSize();
-    const drawn = try channel.raw.inner.drawQueryBits(Q, ctx, lifting, geometry.nQueries());
-    const queries = try circuit.native_verifier.fri.queriesFromBits(Q, ctx, drawn, lifting);
     const logs = try ctx.scratch().alloc([]const u32, geometry.nTrees());
     for (logs, 0..) |*out, tree| out.* = try geometry.extendedLogSizes(ctx.scratch(), tree);
     if (witness.cap_log == 0) {
@@ -105,10 +109,26 @@ pub fn verify(ctx: *common.Context, geometry: *const Shape, witness: *const Proo
         try circuit.native_verifier.merkle.decommitTreesCapped(Q, ctx, logs, lifting, witness.queried_values, witness.auth_paths, queries.unpacked, witness.commitments, witness.caps, witness.cap_log);
     }
     const plan = try shape.SamplePlan.init(ctx.scratch(), geometry);
-    const input = try deep.friInput(ctx, &plan, point, witness.sampled_values, alpha, queries.points, witness.queried_values);
+    return deep.friInput(ctx, &plan, prefix.oods_point, witness.sampled_values, prefix.deep_randomness, queries.points, witness.queried_values);
+}
+
+/// Statement methods are the legacy native verifier contract over OM31 wires:
+/// mixPublic(ctx,channel), nTreesBeforeChallenges(), drawChallenges(ctx,channel),
+/// mixClaims(ctx,channel), evalComposition(ctx,point,masks,randomness,challenges).
+/// Topology/shape and public authority must be independently admitted by caller.
+pub fn verify(ctx: *common.Context, geometry: *const Shape, witness: *const Proof, statement: anytype) !Verified {
+    try witness.validate(geometry);
+    const prefix = try bindSamples(ctx, geometry, witness, statement);
+    var channel = prefix.channel;
+    const alphas = try fri.commit(ctx, &channel, witness);
+    try channel.raw.inner.pow(Q, ctx, geometry.pcs.pow_bits, witness.pow_nonce);
+    const lifting = geometry.liftingLogSize();
+    const drawn = try channel.raw.inner.drawQueryBits(Q, ctx, lifting, geometry.nQueries());
+    const queries = try circuit.native_verifier.fri.queriesFromBits(Q, ctx, drawn, lifting);
+    const input = try authenticateQueries(ctx, geometry, witness, prefix, queries);
     try fri.decommit(ctx, witness, lifting, geometry.pcs.fri_config, input, queries, alphas);
     try common.lane.check();
-    return .{ .composition_randomness = randomness, .oods_point = point, .deep_randomness = alpha, .fri_alphas = alphas, .queries = queries, .fri_input = input, .channel = channel };
+    return .{ .composition_randomness = prefix.composition_randomness, .oods_point = prefix.oods_point, .deep_randomness = prefix.deep_randomness, .fri_alphas = alphas, .queries = queries, .fri_input = input, .channel = channel };
 }
 
 // Complete CPU statement support; these remain pending execution-wide root closure.
