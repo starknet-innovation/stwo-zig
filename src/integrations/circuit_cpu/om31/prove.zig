@@ -138,7 +138,7 @@ pub const Authority = struct {
         defer template.deinit();
         const layout = pp.layout();
         const logs = try List.circuitComponentLogSizes(&layout);
-        _ = try validateGatherMass(logs, pp.n_outputs);
+        const original_mass = try validateGatherMass(logs, pp.n_outputs);
         var bound = try Air.bind(a, &template, logs, &layout);
         errdefer bound.deinit();
         if (pp.mixed_arithmetic) {
@@ -146,7 +146,6 @@ pub const Authority = struct {
             if (P.active() != .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1)
                 return error.MixedArithmeticProfileRequired;
             const arithmetic_log = logs.get(.qm31_ops);
-            const original_mass = try validateGatherMass(logs, pp.n_outputs);
             if (original_mass + (@as(u64, 1) << @intCast(arithmetic_log)) >= core.fields.m31.Modulus)
                 return error.Om31CircuitCharacteristicBound;
             try @import("arithmetic/air.zig").bind(a, &bound, &layout);

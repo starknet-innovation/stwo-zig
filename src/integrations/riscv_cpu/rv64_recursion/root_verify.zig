@@ -84,6 +84,7 @@ pub const VerifierKey = struct {
     identity: [32]u8,
 
     pub fn fromAuthority(key: *const Prove.Authority) !VerifierKey {
+        if (key.pp.mixed_arithmetic) return error.MixedArithmeticPortableKeyUnsupported;
         var out: VerifierKey = undefined;
         for (key.layout.entries, 0..) |entry, i| {
             out.column[i] = try columnIndex(entry.id);

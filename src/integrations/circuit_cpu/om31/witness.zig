@@ -192,6 +192,7 @@ pub fn writeMixedReleasing(a: std.mem.Allocator, base: *T.BaseTrace, pp: *const 
     return writeImpl(a, base, pp, z, alpha, true, addend);
 }
 fn writeImpl(a: std.mem.Allocator, base: *T.BaseTrace, pp: *const PP.PreprocessedCircuit, z: O, alpha: O, release: bool, addend: ?*const [4]Col) !Interaction {
+    if (pp.mixed_arithmetic != (addend != null)) return error.MixedArithmeticWitnessMismatch;
     const mixed: ?Mixed = if (addend) |cols| .{ .fixed = try mixedFixed(pp), .addend = cols } else null;
     const rows = try T.RawLookupRows.init(base.columns, pp);
     const elements = Elements.init(z, alpha);

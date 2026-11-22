@@ -1631,6 +1631,15 @@ fixed arity four. Each selected node halves its arithmetic padding.
 The independent circuit proof fixture crosses from 1,024 to 512
 arithmetic rows with the same expected output.
 
+The subsequent cold runs took 176.57 s on OP and 315.76 s on Ethereum
+through fresh root verification, compared with 183.38 s and 373.74 s
+under direct products alone. The receiver refused a changed root proof,
+reordered fold children and a different outer profile on both blocks.
+The mixed profile uses full CPU reception. Portable key derivation and
+assignment schedule inspection require an ordinary profile.
+
+#### Other recursion and native domain trials
+
 | Physical trial | Measured result | Decision |
 |---|---|---|
 | OP tiled GKR and paired loads | 116.77 s complete. Local GKR sums to 24.56 s versus 22.45 s in the live-handoff control | Keep the original GKR kernel |
