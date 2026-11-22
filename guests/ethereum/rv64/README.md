@@ -75,7 +75,9 @@ execution profile, ECALL tags, packet layouts or AIR: ECDSA recovery no longer
 re-verifies the recovered key (the check is algebraically implied; see
 `vendor/ecdsa/src/recovery.rs`), and the GLV scalar multiplication runs on
 service word packets in variable time (`k256` feature `stwo-vartime`; public
-signature data only). On block 24,628,607 this executes 104,253,913 instead of
+signature data only). The fixed-generator path uses a joint signed-digit
+table for the generator and its endomorphism. The variable-point path
+continues to build its word tables from the input point. On block 24,628,607 this executes 104,253,913 instead of
 213,659,488 instructions with half the secp256k1 service calls (rounds 1–5:
 lean recovery, aligned-only memory functions in `mem/`, variable-time
 inversion, word-wise Keccak absorption, and patched `vendor/` copies of

@@ -1514,3 +1514,33 @@ The same key derivation in the packed-research receiver also accepted the
 existing complete Ethereum proof in 13.88 s, versus 16.67 s in the
 prior combined run. That replay keeps the original proof protocol and
 is a separate measurement from the maintained receiver above.
+
+### Fixed-generator windows in the Kona guest
+
+The shared Rust guest keeps its signed radix-16 GLV digits. When the input
+point is the exact canonical generator, each digit pair selects one
+affine value for that generator and its endomorphism. The variable-point
+path and authenticated secp256k1 service packets use their existing
+implementation. An independent host addition and SEC1-decoding check
+covers all 289 signed pairs. Five pinned requests agree across the host
+reference, RV64 execution and Unicorn.
+
+| OP block | Prior retirements | Fixed-generator retirements | ADD calls before / after | CPU shards before / after |
+|---|---:|---:|---:|---:|
+| 120,794,432 | 590,275 | 590,495 | 0 / 0 | 1 / 1 |
+| 121,049,889 | 4,219,144 | 4,140,569 | 1,187 / 848 | 2 / 1 |
+| 121,057,303 | 4,372,128 | 4,340,584 | 444 / 317 | 2 / 2 |
+| 121,003,241 | 12,203,836 | 12,049,485 | 2,355 / 1,685 | 3 / 3 |
+| 121,135,704 | 15,590,691 | 15,340,173 | 3,951 / 2,828 | 4 / 4 |
+
+The maintained guest's complete 121,049,889 proof takes 24.15 s native,
+21.69 s recursive and 3.93 s in a fresh receiver, for **49.77 s** total.
+The matched prior guest takes 56.95 s. Removing one CPU shard saves
+12.6% end to end. On the larger block the same guest changed neither
+the number of CPU shards nor the relevant padding. Its first complete
+run took 106.62 s, versus 103.89 s with the previous guest under the
+same execution-step ceiling. A repeat took 101.80 s with the revised
+guest and 105.52 s with the prior one. Both revised proofs verified the pinned
+terminal statement and refused the changed CPU commitment, changed
+Keccak commitment and reordered fold. The larger case does not establish
+a latency improvement from guest instructions alone.

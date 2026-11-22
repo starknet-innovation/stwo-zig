@@ -104,6 +104,16 @@ impl WordTable {
     }
 }
 
+#[cfg(feature = "stwo-vartime")]
+#[path = "mul/fixed_generator.rs"]
+mod fixed_generator;
+
+#[cfg(feature = "stwo-vartime")]
+enum WordPlan {
+    FixedGenerator { negate_first: bool, negate_second: bool },
+    Variable(WordTable, WordTable),
+}
+
 /// GLV double-and-add over service word packets. Identical digit schedule to
 /// `lincomb`, but zero digits are skipped and the accumulator stays identity
 /// (no service calls) until the first nonzero digit. Both are exact
@@ -116,10 +126,9 @@ fn lincomb_words<const N: usize>(xks: &[(ProjectivePoint, Scalar); N]) -> Projec
         Radix16Decomposition::<33>::default(),
         Radix16Decomposition::<33>::default(),
     ); N];
-    let tables: [(WordTable, WordTable); N] = core::array::from_fn(|i| {
+    let tables: [WordPlan; N] = core::array::from_fn(|i| {
         let (x, k) = &xks[i];
         let (r1, r2) = decompose_scalar(k);
-        let x_beta = x.endomorphism();
         let (r1_sign, r2_sign) = (r1.is_high(), r2.is_high());
         let (r1_c, r2_c) = (
             Scalar::conditional_select(&r1, &-r1, r1_sign),
@@ -129,7 +138,14 @@ fn lincomb_words<const N: usize>(xks: &[(ProjectivePoint, Scalar); N]) -> Projec
             Radix16Decomposition::<33>::new(&r1_c),
             Radix16Decomposition::<33>::new(&r2_c),
         );
-        (
+        if words::from_point(x) == *fixed_generator::GENERATOR_WORDS {
+            return WordPlan::FixedGenerator {
+                negate_first: bool::from(r1_sign),
+                negate_second: bool::from(r2_sign),
+            };
+        }
+        let x_beta = x.endomorphism();
+        WordPlan::Variable(
             WordTable::new(&ProjectivePoint::conditional_select(x, &-*x, r1_sign)),
             WordTable::new(&ProjectivePoint::conditional_select(
                 &x_beta, &-x_beta, r2_sign,
@@ -146,8 +162,25 @@ fn lincomb_words<const N: usize>(xks: &[(ProjectivePoint, Scalar); N]) -> Projec
             }
         }
         for component in 0..N {
-            let (table1, table2) = &tables[component];
             let (digit1, digit2) = (digits[component].0 .0[i], digits[component].1 .0[i]);
+            let (table1, table2) = match &tables[component] {
+                WordPlan::Variable(left, right) => (left, right),
+                WordPlan::FixedGenerator { negate_first, negate_second } => {
+                    if digit1 == 0 && digit2 == 0 {
+                        continue;
+                    }
+                    let first = if *negate_first { -digit1 } else { digit1 };
+                    let second = if *negate_second { -digit2 } else { digit2 };
+                    let point = fixed_generator::point(first, second);
+                    if live {
+                        words::add_assign(&mut acc, point);
+                    } else {
+                        acc = *point;
+                        live = true;
+                    }
+                    continue;
+                }
+            };
             for (table, digit) in [(table1, digit1), (table2, digit2)] {
                 if digit == 0 {
                     continue;
