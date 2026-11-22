@@ -1594,6 +1594,23 @@ a latency improvement from guest instructions alone.
 
 ### Recursion and native domain trade-offs
 
+The CPU direct-product profile uses seven QM31 rows per general OM31
+multiplication, down from nine. It has its own outer transcript identity
+and keeps arity four, cap depth three and the same outer FRI parameters.
+Native proofs remain byte-identical.
+
+On OP 121,135,704, the prior admitted arity-four profile took 66.19 s
+native, 158.79 s wrapping and folding, and 19.48 s to receive. With the
+direct-product profile these measured stages took 55.96 s, 115.27 s and
+12.15 s, for 183.38 s cold end to end against 244.46 s. The reduction
+in the recursion and verification stages was 28.5%. Peak RSS was
+31.39 GiB versus 30.94 GiB. A fresh receiver accepted the pinned output
+and rejected a changed root proof, reordered children and the wrong outer
+profile. The timings use plain source openings. The packed source and
+shared FRI experiments below are a different proof layout.
+The device path retains its current profile. The same arithmetic cut can
+reduce device trace size when the resident prover admits the new circuit.
+
 | Physical trial | Measured result | Decision |
 |---|---|---|
 | OP tiled GKR and paired loads | 116.77 s complete. Local GKR sums to 24.56 s versus 22.45 s in the live-handoff control | Keep the original GKR kernel |

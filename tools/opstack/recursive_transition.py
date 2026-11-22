@@ -27,6 +27,7 @@ OUTER_DOMAINS = {
     "m5_outer_canonical_m3_b4_q51_p26_fold4_v1": "m5-canonical-m3-b4-q51-p26-fold4",
     "m6_outer_diet_k3_r1_b2_q108_p20_fold4_v1": "m6-diet-k3-q108-p20-fold4",
     "m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1": "m6-diet-k4-cap3-q108-p20-fold4",
+    "cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1": "cpu-direct-products-k4-cap3-q108-p20-fold4",
     "m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1": "m7-outer-gkr-k4-cap3-q108-p20-fold4",
 }
 FIELDS = (

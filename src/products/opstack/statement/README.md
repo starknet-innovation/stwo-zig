@@ -77,10 +77,12 @@ with no setup directory. Fixture paths reach `test-e2e-probe` through the
 `opstack_fixture_paths` build options module, never through the environment.
 
 For recursion in `tools/opstack/cpu.py` pass
-`--recursive-runner zig-out/bin/stwo-opstack-recursion` and
-`--recursive-profile m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1`. This runner wraps an admitted complete native bundle
-and verifies the root in a new process against the pinned input and output.
-It requires the k4/cap3 OM31 outer profile and `--fold-arity 4`.
+`--recursive-runner zig-out/bin/stwo-opstack-recursion`. The tool defaults to
+`cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1` with four-child folds.
+This runner wraps an admitted complete native bundle and verifies the root
+in a new process against the pinned input and output. Use
+`--recursive-profile m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1`
+for proofs produced with the earlier circuit topology.
 
 `test-e2e-probe` also runs `tests/e2e_probe_prove.zig`: it proves the golden
 probe with `stwo-opstack-native prove`, receives it with `verify` in a fresh

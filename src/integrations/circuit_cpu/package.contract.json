@@ -1,7 +1,7 @@
 {
   "schema": "stwo-zig-package-contract-v2",
   "package": "stwo_circuit_cpu_integration",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "layer": "integration",
   "owner": "circuit-cpu-integration",
   "public_modules": {

@@ -4537,7 +4537,7 @@
       ],
       "default_evidence": {
         "path": "src/integrations/circuit_cpu/om31/protocol.zig",
-        "text": "pub const PROFILE_ENV = \"STWO_RV64_OUTER_PROFILE\";\n/// Historical r1 domain string. This is NOT the active outer profile: every\n/// identity, wire header, transcript, class key and report must use\n/// `domainName()` (adversarial review, canon-vk: a `pub const domain` kept the\n/// old name and silently meant r1 under every other profile, so a consumer\n/// built against it, e.g. a VK-table header, would label a canonical/m3 table\n/// as r1). Renamed so such callers fail to compile instead.\npub const r1_domain = Profile.r1_b2_q108_p20_fold4.domainName();\nconst unset: u8 = 0xff;\nvar selected = std.atomic.Value(u8).init(unset);"
+        "text": "pub const DEFAULT_PROFILE: Profile = .r1_b2_q108_p20_fold4;\npub const PROFILE_ENV = \"STWO_RV64_OUTER_PROFILE\";"
       },
       "expires": "2026-12-09"
     },

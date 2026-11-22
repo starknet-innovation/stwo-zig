@@ -180,6 +180,8 @@ pub const ParallelExecution = struct {
 /// optional factory, or the strict receiver (existing_only). Node IDs are in
 /// topological order, so a parent always follows all of its children.
 pub fn runPreparedSequential(input: PreparedExecution, arity: usize) !Report {
+    const products = @import("../om31_circuit_lane.zig").ProductScope.init(@import("execution_wrap.zig").directProducts());
+    defer products.deinit();
     const a = input.allocator;
     const plan = try Dag.Plan.initArity(input.inventory.workers.len, arity);
     const nodes = try a.alloc(Node, plan.count);

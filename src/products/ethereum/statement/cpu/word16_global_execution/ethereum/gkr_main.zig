@@ -1,17 +1,11 @@
 //! Experimental OM/GKR Ethereum driver. Receiver parameters are pinned here;
 //! durable producer metadata cannot select configuration or security authority.
-const Receiver = @import("gkr_receiver.zig");
-const Worker = @import("stwo_riscv_cpu_integration").rv64_gkr_worker_protocol;
-const since = @import("gkr_request_execution.zig").since;
 const std = @import("std");
 const engine = @import("stwo_prover_engine");
 pub const EarlyCPU = @import("early_cpu0.zig");
 pub const EarlySegments = @import("early_segments.zig");
 pub const Recycler = @import("stwo_riscv_cpu_integration").rv64_large_block_recycler.LargeBlockRecycler;
 const ReceiverBudget = @import("receiver_budget.zig");
-/// Producer-owned trusted setup acceleration; forbidden to fresh receivers.
-/// block_to_inputs phase report (observation only; never proof authority).
-/// Every *_at_ns is nanoseconds since gkr_main entry on the monotonic clock.
 pub const candidateLabel = @import("gkr_resources.zig").candidateLabel;
 const selectProfile = @import("gkr_resources.zig").selectProfile;
 pub fn main() !void {

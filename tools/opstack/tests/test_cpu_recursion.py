@@ -25,7 +25,7 @@ class CpuRecursionTests(unittest.TestCase):
     def received(self, output):
         report = receipt(output)
         report["native"]["security_profile"] = D2_NATIVE_PROFILE
-        report["outer_profile"] = "stwo/circuit/native-om31/m6-diet-k3-q108-p20-fold4/lens-v1"
+        report["outer_profile"] = "stwo/circuit/native-om31/cpu-direct-products-k4-cap3-q108-p20-fold4/lens-v1"
         report["recursive"].update(fold_proofs=1, restored_folds=1)
         return report
 
@@ -62,7 +62,7 @@ class CpuRecursionTests(unittest.TestCase):
             "recurse-candidate", "verify-recursion-candidate"
         ])
         produce, receive = (c[0] for c in commands)
-        self.assertEqual(produce[produce.index("--fold-arity") + 1], "3")
+        self.assertEqual(produce[produce.index("--fold-arity") + 1], "4")
         self.assertEqual(produce[-4:], receive[-4:])
         self.assertNotIn("--setup-cache", receive)
         self.assertFalse(any(key.startswith("STWO_") for _, env in commands for key in env))

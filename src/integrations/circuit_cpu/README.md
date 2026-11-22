@@ -17,7 +17,7 @@ prover, `recursion` folds leaf proofs into a root exactly as
 
 | Property | Value |
 | :--- | :--- |
-| Version | `0.5.0` |
+| Version | `0.6.0` |
 | Layer | `integration` |
 | Owner | `circuit-cpu-integration` |
 | Public Zig module | `stwo_circuit_cpu_integration` |
