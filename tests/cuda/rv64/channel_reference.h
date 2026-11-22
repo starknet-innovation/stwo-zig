@@ -1,5 +1,5 @@
 #pragma once
-#include "../blake2s_reference.h"
+#include "../native/blake2s_reference.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>

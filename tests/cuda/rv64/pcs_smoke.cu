@@ -1,5 +1,5 @@
 // Real-device OM31 PCS primitive parity and custody. No accepting proof path.
-#include "../blake2s_reference.h"
+#include "../native/blake2s_reference.h"
 #include "context_owner.cuh"
 #include "rv64/om31.cuh"
 #include "rv64/pcs.h"
