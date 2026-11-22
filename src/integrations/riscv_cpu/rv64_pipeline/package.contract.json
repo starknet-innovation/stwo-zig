@@ -1,7 +1,7 @@
 {
   "schema": "stwo-zig-package-contract-v2",
   "package": "stwo_riscv_rv64_pipeline",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "layer": "integration",
   "owner": "riscv-cpu-integration",
   "public_modules": {

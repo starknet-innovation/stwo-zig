@@ -1,7 +1,7 @@
 {
   "schema": "stwo-zig-package-contract-v2",
   "package": "stwo_circuit_cpu_integration",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "layer": "integration",
   "owner": "circuit-cpu-integration",
   "public_modules": {
@@ -64,14 +64,14 @@
     ]
   },
   "budget": {
-    "code_files": 64,
-    "code_lines": 9833,
+    "code_files": 69,
+    "code_lines": 10567,
     "generated_code_files": 0,
     "generated_code_lines": 0,
     "script_files": 0,
     "api_entries": 9,
     "dependencies": 8,
     "rv64_registry_flags": 1,
-    "versioned_files": 67
+    "versioned_files": 72
   }
 }

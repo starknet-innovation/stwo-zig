@@ -78,10 +78,11 @@ pub const Authority = struct {
             if (pp != self.pp) return error.InvalidOm31CircuitPreparedAuthority;
             const bound = self.bound orelse return error.InvalidOm31CircuitPreparedAuthority;
             self.bound = null;
-            return .{ .allocator = self.allocator, .pp = pp, .layout = self.layout, .logs = self.logs, .fixed_logs = self.fixed_logs, .bound = bound, .fixed = null, .fixed_root = root, .device_fixed = true, .identity = identityOf(root, self.logs, pp.n_outputs) };
+            return .{ .allocator = self.allocator, .pp = pp, .layout = self.layout, .logs = self.logs, .fixed_logs = self.fixed_logs, .bound = bound, .fixed = null, .fixed_root = root, .device_fixed = true, .identity = identityOf(root, self.logs, pp.n_outputs, pp.mixed_arithmetic) };
         }
     };
     pub fn prepareForDeviceProver(a: std.mem.Allocator, pp: *const Preprocessed) !DevicePrepared {
+        if (pp.mixed_arithmetic) return error.MixedArithmeticRequiresHost;
         const bytes = try std.fs.cwd().readFileAlloc(a, Air.bundle_path, 64 << 20);
         defer a.free(bytes);
         var template = try parsePinnedAir(a, bytes);
@@ -113,11 +114,12 @@ pub const Authority = struct {
         const bound = try Air.bind(a, &template, logs, &layout);
         var fixed_logs: [circuit.common.preprocessed.N_PREPROCESSED_COLUMNS]u32 = undefined;
         for (layout.entries, &fixed_logs) |entry, *log| log.* = entry.log_size;
-        return .{ .allocator = a, .pp = stub, .layout = layout, .logs = logs, .fixed_logs = fixed_logs, .bound = bound, .fixed = null, .fixed_root = root, .retired = true, .identity = identityOf(root, logs, stub.n_outputs) };
+        return .{ .allocator = a, .pp = stub, .layout = layout, .logs = logs, .fixed_logs = fixed_logs, .bound = bound, .fixed = null, .fixed_root = root, .retired = true, .identity = identityOf(root, logs, stub.n_outputs, false) };
     }
-    fn identityOf(root: P.H.Hash, logs: List.PerComponent(u32), n_outputs: usize) [32]u8 {
+    fn identityOf(root: P.H.Hash, logs: List.PerComponent(u32), n_outputs: usize, mixed: bool) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(P.domainName());
+        if (mixed) hash.update("qm31/mixed-arithmetic/v1\x00");
         hash.update(Air.bundle_sha256);
         hash.update(&root);
         var word: [4]u8 = undefined;
@@ -139,6 +141,16 @@ pub const Authority = struct {
         _ = try validateGatherMass(logs, pp.n_outputs);
         var bound = try Air.bind(a, &template, logs, &layout);
         errdefer bound.deinit();
+        if (pp.mixed_arithmetic) {
+            if (device_root != null) return error.MixedArithmeticRequiresHost;
+            if (P.active() != .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1)
+                return error.MixedArithmeticProfileRequired;
+            const arithmetic_log = logs.get(.qm31_ops);
+            const original_mass = try validateGatherMass(logs, pp.n_outputs);
+            if (original_mass + (@as(u64, 1) << @intCast(arithmetic_log)) >= core.fields.m31.Modulus)
+                return error.Om31CircuitCharacteristicBound;
+            try @import("arithmetic/air.zig").bind(a, &bound, &layout);
+        }
         var fixed: ?P.Scheme.CommittedTree = null;
         errdefer if (fixed) |*tree| tree.deinit(a);
         var fixed_logs: [circuit.common.preprocessed.N_PREPROCESSED_COLUMNS]u32 = undefined;
@@ -155,7 +167,7 @@ pub const Authority = struct {
             try fixed.?.share(a);
             break :blk fixed.?.root();
         };
-        return .{ .allocator = a, .pp = pp, .layout = layout, .logs = logs, .fixed_logs = fixed_logs, .bound = bound, .fixed = fixed, .fixed_root = root, .device_fixed = device_root != null, .identity = identityOf(root, logs, pp.n_outputs) };
+        return .{ .allocator = a, .pp = pp, .layout = layout, .logs = logs, .fixed_logs = fixed_logs, .bound = bound, .fixed = fixed, .fixed_root = root, .device_fixed = device_root != null, .identity = identityOf(root, logs, pp.n_outputs, pp.mixed_arithmetic) };
     }
     pub fn deinit(self: *Authority) void {
         if (self.fixed) |*fixed| fixed.deinit(self.allocator);
@@ -183,7 +195,8 @@ pub const Authority = struct {
     pub fn treeLogs(self: *const Authority, a: std.mem.Allocator, tree: usize) ![]u32 {
         if (tree == 0) return a.dupe(u32, &self.fixed_logs);
         if (tree > 2) return error.InvalidOm31CircuitTree;
-        const widths = if (tree == 1) circuit.witness.trace.traceWidths() else circuit.witness.trace.interactionWidths();
+        var widths = if (tree == 1) circuit.witness.trace.traceWidths() else circuit.witness.trace.interactionWidths();
+        if (tree == 1 and self.pp.mixed_arithmetic) widths[List.ComponentList.qm31_ops.idx()] += 4;
         var count: usize = 0;
         for (widths) |width| count += if (tree == 2) width * 2 else width;
         const out = try a.alloc(u32, count);
@@ -251,9 +264,20 @@ pub fn prove(a: std.mem.Allocator, key: *const Authority, values: []const Q) !Pr
     P.MC.mixRoot(&channel, key.fixedRoot());
     // MAIN is generated and committed exactly once. Lookup arithmetic does not
     // rebuild the builder assignment or its table multiplicities.
-    try scheme.commit(a, base.columns, &channel);
+    const addend = if (key.pp.mixed_arithmetic) try W.addendColumns(a, key.pp, values) else null;
+    defer if (addend) |cols| for (cols) |col| a.free(col.values);
+    if (addend) |cols| {
+        const widths = circuit.witness.trace.traceWidths();
+        const end = widths[List.ComponentList.eq.idx()] + widths[List.ComponentList.qm31_ops.idx()];
+        const mixed = try a.alloc(Col, base.columns.len + cols.len);
+        defer a.free(mixed);
+        @memcpy(mixed[0..end], base.columns[0..end]);
+        @memcpy(mixed[end..][0..cols.len], &cols);
+        @memcpy(mixed[end + cols.len ..], base.columns[end..]);
+        try scheme.commit(a, mixed, &channel);
+    } else try scheme.commit(a, base.columns, &channel);
     const elements = draw(&channel);
-    var interaction = try W.writeReleasing(a, &base, key.pp, elements.z, elements.alpha);
+    var interaction = try W.writeMixedReleasing(a, &base, key.pp, elements.z, elements.alpha, if (addend) |*cols| cols else null);
     defer interaction.deinit();
     channel.mixFelts(&interaction.claimed_sums.toArray());
     // PCS consumes the interaction buffers on success and on failure.
@@ -296,4 +320,21 @@ pub fn verify(a: std.mem.Allocator, key: *const Authority, outputs: []const Q, c
     var capture: Capture = undefined;
     try core.verifier.ForField(O).verifyBorrowedWithProofCapture(P.H, P.MC, a, components, &channel, &receiver, proof, &capture);
     return capture;
+}
+
+const Mixed = @import("arithmetic/preprocessed.zig");
+const Finalize = circuit.common.finalize;
+pub fn selectMixed(a: std.mem.Allocator, graph: *const circuit.builder.Circuit, targets: Finalize.ComponentSizes) !?Mixed.Plan {
+    // Range and bitwise provider heights also participate in the global lift.
+    var largest_other = @max(targets.eq, targets.blake_g_gate, targets.m31_to_u32, targets.triple_xor);
+    for (circuit.common.preprocessed.FIXED_COLUMNS) |column|
+        largest_other = @max(largest_other, @as(usize, 1) << @intCast(column.log_size));
+    return Mixed.Plan.select(a, graph, largest_other);
+}
+pub fn prepareMixed(a: std.mem.Allocator, graph: *const circuit.builder.Circuit, plan: *const Mixed.Plan) !Preprocessed {
+    var block = try plan.assemble(a, graph);
+    defer block.deinit();
+    var output: Preprocessed.ArithmeticBlock = .{ .columns = undefined, .first_permutation_row = block.first_permutation_row };
+    for (&output.columns, 0..) |*column, i| column.* = block.column(i);
+    return Preprocessed.fromCircuitWithArithmetic(a, circuit.common.preprocessed.CircuitView.fromBuilder(graph), output);
 }

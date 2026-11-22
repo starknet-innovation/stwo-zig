@@ -79,6 +79,10 @@ with no setup directory. Fixture paths reach `test-e2e-probe` through the
 For recursion in `tools/opstack/cpu.py` pass
 `--recursive-runner zig-out/bin/stwo-opstack-recursion`. The tool defaults to
 `cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1` with four-child folds.
+For an explicit CPU profile comparison, select
+`--recursive-profile cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1` in the benchmark
+harness. The receiver reconstructs the adaptive arithmetic layout from each
+finalized circuit and verifies the same profile.
 This runner wraps an admitted complete native bundle and verifies the root
 in a new process against the pinned input and output. Use
 `--recursive-profile m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1`

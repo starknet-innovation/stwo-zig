@@ -127,9 +127,22 @@ const Row = struct {
     raw: *const T.RawLookupRows,
     kind: List.ComponentList,
     elements: *const TraceElements,
+    mixed: ?Mixed = null,
     fn fill(self: @This(), row: usize, out: []L.Fraction) !void {
         var storage: [T.RawLookupRows.MAX_LOOKUPS]C.Lookup = undefined;
-        try pairFractionsUsing(self.elements, try self.raw.fill(self.kind, row, &storage), out);
+        const original = try self.raw.fill(self.kind, row, &storage);
+        const lookup = if (self.mixed) |mixed| blk: {
+            storage[3] = storage[2];
+            var addend = C.Lookup{
+                .numerator = @import("arithmetic/row.zig").addendWeight(M, M.one(), .{ mixed.fixed[0][row], mixed.fixed[1][row], mixed.fixed[2][row] }),
+                .tuple = .{ M.fromCanonical(List.GATE_RELATION_ID), mixed.fixed[3][row], M.zero(), M.zero(), M.zero(), M.zero() },
+                .len = 6,
+            };
+            for (addend.tuple[2..], mixed.addend) |*word, col| word.* = col.values[row];
+            storage[2] = addend;
+            break :blk storage[0..4];
+        } else original;
+        try pairFractionsUsing(self.elements, lookup, out);
     }
 };
 pub fn outputTerm(elements: *const Elements, address: usize, output: Q) !O {
@@ -146,12 +159,40 @@ pub fn lookupSum(outputs: []const Q, claims: Claims, elements: *const Elements) 
 /// Atomic ownership: no MAIN plane is retired until all eleven new INTER
 /// components, independent public closure and output headers exist.
 pub fn write(a: std.mem.Allocator, base: *T.BaseTrace, pp: *const circuit.common.preprocessed.PreprocessedCircuit, z: O, alpha: O) !Interaction {
-    return writeImpl(a, base, pp, z, alpha, false);
+    return writeImpl(a, base, pp, z, alpha, false, null);
 }
 pub fn writeReleasing(a: std.mem.Allocator, base: *T.BaseTrace, pp: *const circuit.common.preprocessed.PreprocessedCircuit, z: O, alpha: O) !Interaction {
-    return writeImpl(a, base, pp, z, alpha, true);
+    return writeImpl(a, base, pp, z, alpha, true, null);
 }
-fn writeImpl(a: std.mem.Allocator, base: *T.BaseTrace, pp: *const circuit.common.preprocessed.PreprocessedCircuit, z: O, alpha: O, release: bool) !Interaction {
+const PP = circuit.common.preprocessed;
+const Mixed = struct { fixed: [4][]const M, addend: *const [4]Col };
+fn mixedFixed(pp: *const PP.PreprocessedCircuit) ![4][]const M {
+    var fixed: [4][]const M = undefined;
+    for (PP.QM31_OPS_COLUMN_IDS[0..4], &fixed) |id, *out| out.* = pp.columnValues(id) orelse return error.InvalidMixedFixedLayout;
+    return fixed;
+}
+pub fn addendColumns(a: std.mem.Allocator, pp: *const PP.PreprocessedCircuit, values: []const Q) ![4]Col {
+    const addresses = (try mixedFixed(pp))[3];
+    const log = std.math.log2_int(usize, addresses.len);
+    var out: [4]Col = undefined;
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |col| a.free(col.values);
+    for (&out) |*col| {
+        col.* = .{ .log_size = log, .values = try a.alloc(M, addresses.len) };
+        initialized += 1;
+    }
+    for (addresses, 0..) |addr, i| {
+        if (addr.v >= values.len) return error.InvalidMixedAddendAddress;
+        const limbs = values[addr.v].toM31Array();
+        for (&out, limbs) |*col, limb| @constCast(col.values)[i] = limb;
+    }
+    return out;
+}
+pub fn writeMixedReleasing(a: std.mem.Allocator, base: *T.BaseTrace, pp: *const PP.PreprocessedCircuit, z: O, alpha: O, addend: ?*const [4]Col) !Interaction {
+    return writeImpl(a, base, pp, z, alpha, true, addend);
+}
+fn writeImpl(a: std.mem.Allocator, base: *T.BaseTrace, pp: *const PP.PreprocessedCircuit, z: O, alpha: O, release: bool, addend: ?*const [4]Col) !Interaction {
+    const mixed: ?Mixed = if (addend) |cols| .{ .fixed = try mixedFixed(pp), .addend = cols } else null;
     const rows = try T.RawLookupRows.init(base.columns, pp);
     const elements = Elements.init(z, alpha);
     const trace_elements = if (PackedElements.enabled) PackedElements.init(&elements) else elements;
@@ -160,7 +201,7 @@ fn writeImpl(a: std.mem.Allocator, base: *T.BaseTrace, pp: *const circuit.common
     var total: usize = 0;
     var claims: [List.N_COMPONENTS]O = undefined;
     for (std.enums.values(List.ComponentList), base.log_sizes.toArray(), 0..) |kind, log, i| {
-        const out = try L.build(a, log, (T.RawLookupRows.count(kind) + 1) / 2, Row{ .raw = &rows, .kind = kind, .elements = &trace_elements }, Row.fill);
+        const out = try L.build(a, log, (T.RawLookupRows.count(kind) + 1) / 2, Row{ .raw = &rows, .kind = kind, .elements = &trace_elements, .mixed = if (kind == .qm31_ops) mixed else null }, Row.fill);
         outputs[i] = out;
         if (out.columns.len != 8 * ((T.RawLookupRows.count(kind) + 1) / 2)) return error.InvalidOm31InteractionWidth;
         claims[i] = out.claimed_sum;

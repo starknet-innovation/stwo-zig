@@ -4,7 +4,7 @@ Public module `stwo_riscv_cpu_integration`.
 
 | Fact | Value |
 | --- | --- |
-| Version | `1.2.0` |
+| Version | `1.3.0` |
 | Layer | `integration` |
 | Owner | `riscv-cpu-integration` |
 | Focused CI host | Linux |

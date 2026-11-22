@@ -17,7 +17,7 @@ prover, `recursion` folds leaf proofs into a root exactly as
 
 | Property | Value |
 | :--- | :--- |
-| Version | `0.6.0` |
+| Version | `0.7.0` |
 | Layer | `integration` |
 | Owner | `circuit-cpu-integration` |
 | Public Zig module | `stwo_circuit_cpu_integration` |
@@ -70,6 +70,11 @@ The integration owns only composition:
 ## Public API
 
 - `om31`: existing native OM31 program, proof, transcript and bounded wire authorities.
+
+The opt-in mixed CPU profile uses a four-wire QM31 arithmetic row when
+fusion lowers a node's largest padded component. The ordinary mode stays
+available under its prior proof identity. The circuit CPU integration
+owns the arithmetic AIR, witness layout and profile separation.
 
 ```zig
 const circuit_cpu = @import("stwo_circuit_cpu_integration");

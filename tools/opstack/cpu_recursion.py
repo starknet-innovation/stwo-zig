@@ -10,6 +10,7 @@ DEFAULT_OUTER = "cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1"
 FOLD_ARITIES = {
     "m6_outer_diet_k3_r1_b2_q108_p20_fold4_v1": 3,
     DEFAULT_OUTER: 4,
+    "cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1": 4,
     "m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1": 4,
     "m7_outer_gkr_k4_cap3_r1_b2_q108_p20_fold4_v1": 4,
 }

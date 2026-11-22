@@ -75,7 +75,7 @@ fn admitCpuRecursionArgs(args: []const [:0]const u8) !CpuOuterProtocol.Profile {
         return error.InvalidCpuRecursionArguments;
     const profile = CpuOuterProtocol.Profile.parse(args[9]) catch return error.UnsupportedCpuRecursionProfile;
     switch (profile) {
-        .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1 => {},
+        .m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1, .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1, .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1 => {},
         else => return error.UnsupportedCpuRecursionProfile,
     }
     if (!std.mem.eql(u8, args[11], "4")) return error.Om31ProfileFoldArityMismatch;

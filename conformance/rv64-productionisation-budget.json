@@ -12,6 +12,13 @@
   },
   "entries": [
     {
+      "id": "rv64_adaptive_outer_arithmetic",
+      "net_code_budget": 825,
+      "flags_added_budget": 0,
+      "scripts_added_budget": 0,
+      "positive_growth_justification": "Issue 499: independently lower exact outer graphs on CPU when fused arithmetic removes a padded domain. One mixed AIR owns four authenticated wires and keeps the existing paired interaction width. The versioned outer profile is opt-in; selecting the prior profile restores ordinary proofs."
+    },
+    {
       "id": "opstack_cpu_guest_shard_cut",
       "net_code_budget": 48,
       "flags_added_budget": 0,
@@ -1592,6 +1599,60 @@
     }
   ],
   "package_budget_changes": [
+    {
+      "package": "stwo_circuit_frontend",
+      "base_commit": "9ee69253e51bb077ec2522aacd9ab21c5e49f087",
+      "before": {
+        "code_files": 116,
+        "code_lines": 22595,
+        "generated_code_files": 0,
+        "generated_code_lines": 0,
+        "script_files": 0,
+        "api_entries": 7,
+        "dependencies": 2,
+        "rv64_registry_flags": 0,
+        "versioned_files": 119
+      },
+      "after": {
+        "code_files": 116,
+        "code_lines": 22618,
+        "generated_code_files": 0,
+        "generated_code_lines": 0,
+        "script_files": 0,
+        "api_entries": 7,
+        "dependencies": 2,
+        "rv64_registry_flags": 0,
+        "versioned_files": 119
+      },
+      "decision": "https://github.com/starknet-innovation/stwo-zig/issues/499#issuecomment-7075777155"
+    },
+    {
+      "package": "stwo_circuit_cpu_integration",
+      "base_commit": "9ee69253e51bb077ec2522aacd9ab21c5e49f087",
+      "before": {
+        "code_files": 64,
+        "code_lines": 9833,
+        "generated_code_files": 0,
+        "generated_code_lines": 0,
+        "script_files": 0,
+        "api_entries": 9,
+        "dependencies": 8,
+        "rv64_registry_flags": 1,
+        "versioned_files": 67
+      },
+      "after": {
+        "code_files": 69,
+        "code_lines": 10567,
+        "generated_code_files": 0,
+        "generated_code_lines": 0,
+        "script_files": 0,
+        "api_entries": 9,
+        "dependencies": 8,
+        "rv64_registry_flags": 1,
+        "versioned_files": 72
+      },
+      "decision": "https://github.com/starknet-innovation/stwo-zig/issues/499#issuecomment-7075777155"
+    },
     {
       "package": "stwo_ethereum_statement",
       "base_commit": "1942ac7df56dffb2f0e3e80a7c86473ee461a10c",
