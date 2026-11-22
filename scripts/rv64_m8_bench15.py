@@ -67,6 +67,7 @@ from scripts.rv64.rv64_m8_bench15_lib.metrics import (
     arm_failure_reason,
     median_row,
     aggregate_arm,
+    verified_requests,
     METRICS,
     DEVICES,
     FIELD,
@@ -189,6 +190,7 @@ def aggregate(blocks, arms, rows):
                 services = [s for s in state.get('services', []) if s['arm'] == arm]
                 if services:
                     entry['arms'][arm] = aggregate_arm(services)
+                    entry['arms'][arm]['verified_requests'] = verified_requests(services, state.get('receivers') or {})
         result['blocks'].append(entry)
     for arm in arms:
         done = [b for b in result['blocks'] if b['status'] == 'done' and arm in b['arms'] and b['arms'][arm]['warm']['proving_s'] is not None]
@@ -272,6 +274,17 @@ def markdown(result):
                          f"{fmt(w['recursion_after_native_s'], 2)} | {fmt(w['tail_s'], 2)} | {fmt(p.get('kernel_gpu_s'), 2)} | "
                          f"{fmt(p.get('gpu_busy') and p['gpu_busy'] * 100, 0)}{'%' if p.get('gpu_busy') else ''} | "
                          f"{fmt(device and device / 1e9, 1)} | {fmt(peak and peak / 1e9, 1)} | {fmt(launches, 0)} | {fmt(syncs, 1)} |")
+    verified = [(block['block'], name, trial) for block in result['blocks']
+                for name, arm in block['arms'].items() for trial in arm.get('verified_requests', [])]
+    if verified:
+        lines += ['', '## Timed requests with fresh CPU verification', '',
+                  'Only retained proofs appear here. Startup is charged once to the first request. Totals sum the observed phases for the same proof.', '',
+                  '| block | arm | round | trial | service startup s | request s | verify s | request and verify s | first request incl. startup s |',
+                  '|---|---|---:|---:|---:|---:|---:|---:|---:|']
+        for block, arm, trial in verified:
+            lines.append(f"| {block} | {arm} | {trial['round'] + 1} | {trial['trial']} | "
+                         f"{fmt(trial['service_start_s'], 2)} | {fmt(trial['request_s'], 2)} | {fmt(trial['verify_s'], 2)} | "
+                         f"{fmt(trial['request_and_verify_s'], 2)} | {fmt(trial['startup_request_and_verify_s'], 2)} |")
     lines += ['', 'launches/syncs per node: job receipts (`GPU_M8_OUTER_NODE launches/host_waits`) where the arm runs OuterNodeJobs [M], '
               'else Nsight `cudaLaunchKernel`/`cudaStreamSynchronize` in the profiled warm window / nodes [D]. '
               'device peak: NVML-sampled max used bytes over selected GPUs in the headline services [M]. '
@@ -578,7 +591,7 @@ class Bench:
             validate_receivers(verdicts, [r['proof'] for r in receipt['requests']], self.assets['asset_sha256']['receiver'])
         except RuntimeError as error:
             raise Stop(f'{block}: {error}') from error
-        return [{'trial': v.get('trial'), 'accepted': True, 'wall_s': round(v['process']['wall_ns'] / 1e9, 1)} for v in verdicts]
+        return [{'trial': v.get('trial'), 'accepted': True, 'wall_s': round(v['process']['wall_ns'] / 1e9, 4)} for v in verdicts]
 
     def gpu_seconds(self, entry, reference_run):
         run = Path(entry['run'])

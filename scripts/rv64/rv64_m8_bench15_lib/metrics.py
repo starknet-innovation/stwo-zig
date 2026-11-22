@@ -157,6 +157,27 @@ def median_row(rows):
     return out
 
 
+def verified_requests(services, receivers):
+    """Join setup, request and receiver times for the same retained proof."""
+    rows = []
+    for service in services:
+        if service.get('status') != 'ok' or service['role'] != 'headline':
+            continue
+        verdicts = {v.get('trial'): v for v in receivers.get(service.get('run'), []) if v.get('accepted') is True}
+        for request in service['requests']:
+            trial = request.get('ordinal')
+            receiver = verdicts.get(trial, {}).get('wall_s')
+            boot = service.get('service_start_s')
+            elapsed = request.get('request_s')
+            if trial is None or None in (boot, elapsed, receiver):
+                continue
+            rows.append({'trial': trial, 'round': service['round'], 'service_start_s': boot,
+                         'request_s': elapsed, 'verify_s': receiver,
+                         'request_and_verify_s': round(elapsed + receiver, 4),
+                         'startup_request_and_verify_s': round(boot + elapsed + receiver, 4) if trial == 0 else None})
+    return rows
+
+
 def aggregate_arm(services):
     """Headline medians (cold, warm), job/peak receipts, profiled GPU accounting for one arm of one block."""
     headline = [s for s in services if s['role'] == 'headline' and s.get('status') == 'ok']
