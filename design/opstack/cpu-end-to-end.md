@@ -1326,3 +1326,50 @@ requires correlated-agreement analysis at the selected rate, a composed
 failure budget, and a scheduler that admits both members together. The
 prototype sources and full guarded receipts are in the operator evidence
 directory under `recursion-next/packed-width8-native`.
+
+### Packed arithmetic and SHA service openings
+
+The next arm packs the secp256k1 row providers and SHA-256 MAIN and INTER
+sources. Their AIR still evaluates on its original trace domain. The PCS
+uses a three-log larger degree class to fit the width-eight stack. Both
+verifiers derive the layout from the original provider descriptor. The
+sealed manifest binds each packed root alongside the CPU roots, and the
+fresh receiver checks the shared Wire closure.
+
+| Complete guarded run | Native s | Recursion s | Fresh receiver s | Total s | Recursive peak GiB |
+|---|---:|---:|---:|---:|---:|
+| OP 121,135,704 | 59.29 | 57.26 | 11.32 | **127.86** | 22.19 |
+| Ethereum 24,628,607 | 92.76 | 103.34 | 17.56 | **213.67** | 22.49 |
+
+On OP the three-service graph falls from 7,043,280 to 3,332,160 raw Blake
+G gates and from 8,132,752 to 4,496,692 raw field operations. On Ethereum
+the corresponding counts fall from 7,415,040 to 3,626,960 and from
+8,361,608 to 4,740,946. Both Blake domains shrink from 2²³ to 2²². Both field
+domains are still 2²³. On Ethereum the first shared suffix's maximum
+rendezvous duration falls from 32.93 to 4.89 s when the two CPU jobs are
+admitted together. The overall native differences also include the changed
+service commitments.
+
+Both independent receivers accept the pinned 43-byte output and reject a
+changed CPU root, a changed packed service root with its repaired transport
+checksum, and changed fold-child order. The first build rejected the
+16-column SHA interaction tree under the CPU packing profit heuristic.
+The revised arm makes main and interaction layout admission explicit for
+the service source. The size and mask checks remain in force.
+
+A separate retained-native Ethereum comparison enables bounded BLAKE2s
+leaf-state reuse in the keyed-node tree. Summed outer interaction commitment
+falls from 27.93 to 19.58 s. Recursion takes 95.27 s and fresh reception takes
+17.97 s, versus 103.34 and 17.56 s before. The 16 recursive proof files and
+tree description match byte for byte. The timing report differs. Adding
+the original native stage gives a 206.01 s stitched observation.
+
+The six-child experiment on the earlier retained native bundle takes
+136.10 s for recursion and fresh reception, versus 129.16 s for three
+children. Its two larger folds increase the interaction commit work.
+The complete results above retain three-child folds.
+
+The service packing and leaf-state reuse arms use pinned research runners.
+The native and outer settings keep the same target under documented
+assumptions. The packed service extension also needs a composed bound and
+maintained protocol ownership before it can select production proofs.
