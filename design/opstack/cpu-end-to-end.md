@@ -1,12 +1,54 @@
-# CPU proof latency for OP Mainnet and Mantle
+# CPU proof latency across Ethereum and OP Stack
+
+## Current full-block results
+
+These complete CPU measurements include native production, recursion and a
+fresh receiver against the pinned input and expected output. These runs
+use the packed research prover on real block inputs. The OP product
+also has a maintained CPU recursion command and a fresh receiver.
+
+| Block | Study control s | Fastest observed s | Reduction | Peak producer RSS GiB |
+|---|---:|---:|---:|---:|
+| OP 121,135,704 | 179.29 | 101.80 | 43.2% | 25.17 |
+| Ethereum 24,628,607 | 301.54 | 176.01 | 41.6% | 30.48 |
+| Mantle 103,133,433 | 97.04 | 57.22 | 41.0% | 20.89 |
+| OP 121,049,889, fixed-generator comparison | 56.95 | 49.77 | 12.6% | — |
+
+The large OP run spends 53.91 s in native proving and has a 31.35 s
+recursion tail after native completion. Ethereum spends 85.45 s in native
+proving and has a 64.13 s recursion tail. Capture, setup and verification
+also contribute to end-to-end latency. The 10× objective needs a native
+work reduction in addition to shorter wraps and folds.
+
+The packed layouts group CPU and Keccak columns at width sixteen and
+arithmetic columns at width thirty-two. On large OP and Ethereum, adjacent
+admitted CPU workers share a FRI suffix. The runs target 128-bit security
+under the documented assumptions. The packed format and shared suffix need
+composed soundness review and maintained receiver integration before
+production selection.
+
+Mantle uses the same pinned guest and block bytes as its grouped control.
+The native, recursive and fresh processes take 26.34 s, 26.59 s and 4.29 s.
+The independent receiver accepts the expected statement and rejects changed
+commitments for the CPU and Keccak sources and reordered fold children.
+
+A timing fit across 29 outer proofs explains the padding threshold in
+seconds. On this CPU and the measured q108 outer profile, each additional
+1,048,576 padded QM31 rows adds about 0.71 s of outer prover time. The
+corresponding Blake estimate is 0.67 s. Holding out either block gives mean
+absolute error of 0.22 s or 0.24 s per node. The fit covers the outer
+prover stage across four runs of two blocks and applies to this circuit family.
+Doubling both padded domains from 2²² to 2²³ adds about 5.5 s to a single
+parent under that fit.
+
+## Initial OP Mainnet and Mantle cohort
 
 The November 21 cohort measures native production, recursive production and
 fresh root verification on an Apple M5 Max with 18 cores and 64 GiB. It used
 16 native workers in one lane and a 1,048,575-step shard limit. Each row is one
 observation. Archive commit d1934ae1ecd35a6952069d267acce696e8c460c5
 provides the qualified D2 native and M7 recursive benchmark route. The proof
-profile targets 128-bit security under documented assumptions. The maintained
-OP product currently exposes native proving.
+profile targets 128-bit security under documented assumptions.
 
 | Chain and block | RV64 steps | Native s | Recursion s | Root verification s | Total s |
 |---|---:|---:|---:|---:|---:|
@@ -1515,6 +1557,11 @@ existing complete Ethereum proof in 13.88 s, versus 16.67 s in the
 prior combined run. That replay keeps the original proof protocol and
 is a separate measurement from the maintained receiver above.
 
+A new complete Ethereum repeat with independently derived receiver keys
+takes 171.42 s to produce and 15.46 s to receive. Every native and recursive
+proof and the tree match the 176.01 s run byte for byte. The 186.88 s repeat
+shows the spread across these host observations.
+
 ### Fixed-generator windows in the Kona guest
 
 The shared Rust guest keeps its signed radix-16 GLV digits. When the input
@@ -1544,3 +1591,68 @@ guest and 105.52 s with the prior one. Both revised proofs verified the pinned
 terminal statement and refused the changed CPU commitment, changed
 Keccak commitment and reordered fold. The larger case does not establish
 a latency improvement from guest instructions alone.
+
+### Recursion and native domain trade-offs
+
+| Physical trial | Measured result | Decision |
+|---|---|---|
+| OP tiled GKR and paired loads | 116.77 s complete. Local GKR sums to 24.56 s versus 22.45 s in the live-handoff control | Keep the original GKR kernel |
+| OP stage-specific lane allocation on the same fused binary | 116.77 → 107.83 s complete, with native finish 42.41 → 34.41 s and peak producer RSS 25.24 → 23.34 GiB | Useful for this roster. All proof and tree bytes match |
+| Ethereum fused GKR and changed native lane allocation | 230.26 s complete versus 176.01 s on the prior packed run. All proof and tree bytes match | Keep the prior Ethereum schedule |
+| Ethereum smaller Keccak shards | 188.71 s complete and 33.13 GiB producer RSS, versus 176.01 s and 30.48 GiB | Keep the prior shard geometry |
+| OP resident MAIN with a 16 GiB admission | 107.27 s versus 101.80 s with parked MAIN and matching proof bytes | Keep parked MAIN |
+
+Native blowup two with 108 queries cuts the measured OP seal and finish
+from 64.59 s to 47.52 s at the same proof-of-work setting. The larger
+query roster exhausts the streamed allocation budget in the first paired
+leaf. With independent CPU leaves, the first parent grows to 4,288,586
+QM31 rows and 4,241,216 Blake gates. Both component domains pad to 2²³.
+The successful reference uses blowup four with 54 queries.
+
+In the next experiment, depth-seven routed parent caps and direct OM31
+arithmetic bring that parent to 4,239,014 QM31 rows and 4,182,080 Blake
+gates. The parent proves in 8.85 s. Its Blake domain now fits 2²² and its
+field domain needs 44,710 further rows removed. The streamed run reaches
+the grouped service leaf and exhausts the allocation budget there. The
+measured parent and the incomplete run have separate receipts.
+
+The split-process blowup-two run completes with the wider arithmetic
+layouts and seven-level parent caps. It takes 54.91 s native, 85.82 s
+recursive and 9.83 s for fresh verification, for 150.57 s total. The
+recursive producer peaks at 30.22 GiB. The receiver rejects the changed
+CPU and Keccak commitments and reordered fold children. This provides
+complete proof evidence for the smaller native domain. The doubled query
+roster pays more in recursion than the native domain saves on this block.
+
+The blowup-four comparison with depth-seven parent caps handles both cap
+depths using their independently derived frontier sizes. The complete run
+takes 111.66 s with a 24.59 GiB peak. An independent receiver accepts the
+expected statement and rejects altered CPU and Keccak commitments and
+reordered fold children. The paired comparison with the same guest and
+earlier caps takes 107.35 s. Keep that faster configuration.
+
+Ethereum 24,628,607 with the same wider arithmetic and depth-seven
+configuration takes 170.50 s with the live handoff and 15.39 s in a fresh
+receiver, for 185.90 s total. The independent receiver accepts the pinned
+output and rejects all three mutations. The 176.01 s configuration stays
+ahead. Its successor needs to move both the grouped service leaf and the
+final fold below their field-domain thresholds. Their measured raw field
+counts in the depth-seven arm are 4,518,074 and 5,081,140.
+
+The grouped blowup-four service leaf has 4,294,227 field rows. Its census
+finds 928,086 additions or subtractions with a single-use product input.
+An independently sized fused multiply-add component could replace each
+eligible multiplication and addition with one `a*b+c` or signed variant.
+It must bind all four wires to the circuit's variable relation and preserve
+the independently derived graph authority. Products exposed as outputs
+keep their authenticated wires. At twelve MAIN columns for the
+ordinary component and sixteen for the fused component, the census projects
+67.1M padded field MAIN cells versus 100.7M. This is a cell model. Interaction
+columns, degree bounds and block-level time still require a physical proof.
+
+For the rebuilt C++ Ethereum guest, fixed-generator windows reduce
+secp256k1 ADD calls from 10,358 to 8,159 and retirements from 25,837,408
+to 25,788,180. Under the same prover and input, complete latency moves
+from 179.91 s to 176.79 s in one paired observation. Both fresh receivers
+accept the pinned output. `-O2` and `-O3` retire the same steps. `-Os` and
+`-Oz` each retire 32,891,466. Keep the maintained build configuration.
