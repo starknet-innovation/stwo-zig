@@ -1437,3 +1437,53 @@ is byte-identical. Combined production takes 113.91 s and a fresh process
 takes 10.08 s. The 124.00 s total loses to 116.89 s with split processes.
 The smaller pool continues after the native barrier, limiting the tail.
 Peak combined RSS is 25.35 GiB.
+
+### Native-to-recursion handoff
+
+The next arm lets early CPU leaves run while native proofs are still
+producing. Once the native terminal check completes, the remaining
+recursion nodes use the full worker pool. A bounded readiness queue
+releases leaves only when each admitted source range is complete.
+Both trials reproduce every native proof and recursive proof byte and
+the recursive tree of the split mixed-width run.
+
+| Complete guarded run | Combined native and recursion s | Fresh receiver s | Total s | Combined peak GiB |
+|---|---:|---:|---:|---:|
+| OP 121,135,704 | 96.91 | 10.44 | **107.35** | 25.33 |
+| Ethereum 24,628,607 | 159.34 | 16.67 | **176.01** | 30.48 |
+
+This is 40.1% faster on OP and 41.6% faster on Ethereum than the matched
+cold controls. Native completion, recursion and receiver verification
+use the same authorities as the split mixed-width arm. Restoring full
+worker capacity for the tail saves 16.65 s on OP compared with the
+static six-worker overlap. These are single guarded runs with a research
+binary. The physical staged service and CPU opening protocols require
+maintained provider integration and a composed soundness review before
+production selection. The 10× target remains open.
+
+A fresh OP receiver derived independent, request-owned CPU source
+identities with no persisted keys. It accepted the same proof and
+pinned output in 8.66 s, versus 10.45 s in the prior independent process.
+The result is measured on an existing complete proof. A separate run
+changed a canonical packed Keccak MAIN opening and repaired the
+transport checksum. It failed with `RootMismatch`.
+
+### OP-owned CPU recursion command
+
+The OP product now builds its own recursion executable against the
+shared RV64 pipeline. The product passes its expected input and terminal
+statement to the same independent receiver. The CPU command accepts the
+explicit k4/cap3 outer profile with four-child folds.
+
+| Complete production-shaped fixture | Native s | Recursion s | Fresh receiver s | Total s |
+|---|---:|---:|---:|---:|
+| OP Mainnet 120,794,432 | 6.78 | 17.92 | 2.86 | **27.57** |
+| Mantle 103,132,217 | 13.55 | 35.97 | 4.05 | **53.57** |
+
+Both commands reproduced the native proofs and recursive root of their
+prior pinned fixture. An independent process accepted the expected
+43-byte output and refused the same root after a byte was changed.
+Mantle used separate native, recursion and receiver RSS limits of 24,
+46 and 30 GiB. An earlier attempt hit the 24 GiB guard during its root
+fold. These measurements qualify the product entry point and preserve
+the fixture's proof protocol.

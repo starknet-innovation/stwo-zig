@@ -4,8 +4,15 @@ const Setup = @import("stwo_riscv_cpu_integration").rv64_execution.word16.setup.
 const Driver = @import("../word16_execution/driver.zig");
 const Terminal = @import("terminal.zig");
 const F = @import("terminal_fixture.zig");
+const Pool = @import("stwo_prover_engine").work_pool;
 const a = std.testing.allocator;
 test "actual valid execution proofs require independently expected PC halt length and43byte RAM output" {
+    // Use the engine's byte-identical pooled nonce search for the five proofs.
+    var pool: Pool.WorkPool = .{};
+    try pool.initInPlaceWithOptions(.{ .worker_count = 8, .backing_allocator = a });
+    defer pool.deinit();
+    var binding = try Pool.ScopedPoolBinding.init(&pool);
+    defer binding.deinit();
     for ([_]F.Mode{ .honest, .wrong_halt, .wrong_length, .wrong_output, .early }) |mode| {
         var f = try F.Fixture.init(a, mode);
         defer f.deinit();

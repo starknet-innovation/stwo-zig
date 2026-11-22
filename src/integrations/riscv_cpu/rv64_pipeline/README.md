@@ -4,7 +4,7 @@ Public module `stwo_riscv_rv64_pipeline`.
 
 | Fact | Value |
 |---|---|
-| Version | `0.1.0` |
+| Version | `0.2.0` |
 | Layer | `integration` |
 | Owner | `riscv-cpu-integration` |
 | Focused CI host | Linux |
@@ -59,6 +59,9 @@ const Op = pipeline.Pipeline(@import("rv64_pipeline_hooks"));
   (`describe-candidate`, `plan`, `produce-candidate`, `verify-candidate`,
   `verify-prefix-candidate`), plus `runArgv` for a product that translates its
   own command surface onto that argv.
+- `Pipeline.runCpuRecursionArgv` admits a complete native bundle for CPU
+  recursion and checks an existing recursive root from fresh input authority.
+  The explicit argv selects the k4/cap3 OM31 profile and arity four.
 - `ProductHooks` documents the contract: required declarations, guest ABI
   fields and the `violation` checker.
 - `ServiceFamily` is the RFC-3 extension shape. Products declare none in S1.

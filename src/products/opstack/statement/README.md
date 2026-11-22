@@ -4,7 +4,7 @@ Public module `stwo_opstack_statement`.
 
 | Fact | Value |
 |---|---|
-| Version | `0.1.0` |
+| Version | `0.2.0` |
 | Layer | `product` |
 | Owner | `opstack-statement` |
 | Focused CI host | Linux |
@@ -31,6 +31,7 @@ flowchart LR
   H --> P[stwo_riscv_rv64_pipeline instance]
   P --> C[cpu.zig: Pipeline]
   C --> N[cpu/native_main.zig: stwo-opstack-native]
+  C --> R[cpu/recursion_main.zig: stwo-opstack-recursion]
   M[mod.zig: stwo_opstack_statement] --> C
   M --> F
 ```
@@ -63,6 +64,7 @@ const output = try opstack.statement.decode(&bytes);
 zig build test --build-file src/products/opstack/statement/build.zig -Doptimize=Debug -j2 --verbose --summary all
 zig build test-e2e-probe --build-file src/products/opstack/statement/build.zig -Doptimize=ReleaseFast -j2 --verbose --summary all
 zig build opstack-native --build-file src/products/opstack/statement/build.zig -Doptimize=ReleaseFast
+zig build opstack-recursion --build-file src/products/opstack/statement/build.zig -Doptimize=ReleaseFast
 ```
 
 `opstack-native` installs `stwo-opstack-native`. `cpu/cli.zig` maps its
@@ -73,6 +75,12 @@ non-default `--gkr-storage` and a non-committed `--receiver-setup` exit with a
 named error until the S2 RFCs land. The receiver runs in a separate process
 with no setup directory. Fixture paths reach `test-e2e-probe` through the
 `opstack_fixture_paths` build options module, never through the environment.
+
+For recursion in `tools/opstack/cpu.py` pass
+`--recursive-runner zig-out/bin/stwo-opstack-recursion` and
+`--recursive-profile m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1`. This runner wraps an admitted complete native bundle
+and verifies the root in a new process against the pinned input and output.
+It requires the k4/cap3 OM31 outer profile and `--fold-arity 4`.
 
 `test-e2e-probe` also runs `tests/e2e_probe_prove.zig`: it proves the golden
 probe with `stwo-opstack-native prove`, receives it with `verify` in a fresh

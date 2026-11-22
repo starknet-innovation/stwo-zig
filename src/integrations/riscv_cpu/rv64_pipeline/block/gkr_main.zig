@@ -72,6 +72,28 @@ pub fn runArgv(all_args: []const [:0]u8) !void {
     defer base.free(args);
     return runArguments(&recycler, args, .{}, null, false, {});
 }
+const CpuOuterProtocol = @import("stwo_circuit_cpu_integration").om31.protocol;
+
+fn admitCpuRecursionArgs(args: []const [:0]const u8) !CpuOuterProtocol.Profile {
+    if (args.len != 12 or !std.mem.eql(u8, args[1], "--security-profile") or
+        !(std.mem.eql(u8, args[3], "recurse-candidate") or std.mem.eql(u8, args[3], "verify-recursion-candidate")) or
+        !std.mem.eql(u8, args[8], "--outer-profile") or !std.mem.eql(u8, args[10], "--fold-arity"))
+        return error.InvalidCpuRecursionArguments;
+    const profile = CpuOuterProtocol.Profile.m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1;
+    if (!std.mem.eql(u8, args[9], profile.name())) return error.UnsupportedCpuRecursionProfile;
+    if (!std.mem.eql(u8, args[11], "4")) return error.Om31ProfileFoldArityMismatch;
+    return profile;
+}
+
+/// An explicit linked CPU recursion command. Both modes reuse the block
+/// pipeline, including the independent request and terminal checks.
+pub fn runCpuRecursionArgv(args: []const [:0]u8) !void {
+    const profile = try admitCpuRecursionArgs(args);
+    try CpuOuterProtocol.select(profile);
+    var recycler = Recycler.init(std.heap.smp_allocator, ReceiverBudget.RECYCLER_CACHE_BYTES);
+    defer recycler.deinit();
+    try runArguments(&recycler, args[0..8], .{}, null, true, .{});
+}
 /// Separate linked product: the resident native executable does not pull the
 /// circuit stack into every GPU build merely to expose an unavailable mode.
 pub fn mainWithRecursion() !void {
@@ -165,4 +187,23 @@ const runArguments = @import("gkr_request_execution.zig").runArguments;
 
 test {
     _ = @import("gkr_resources_test.zig");
+}
+
+test "CPU recursion command requires a complete execution and admitted outer profile" {
+    const profile = @import("stwo_circuit_cpu_integration").om31.protocol.Profile.m6_outer_diet_k4_cap3_r1_b2_q108_p20_fold4_v1;
+    var args = [_][:0]const u8{
+        "stwo-opstack-recursion",     "--security-profile", "d2_native_b4_q54_p20_fold4",
+        "verify-recursion-candidate", "request.json",       "proof",
+        "4096",                       "8192",               "--outer-profile",
+        @tagName(profile),            "--fold-arity",       "4",
+    };
+    try std.testing.expectEqual(profile, try admitCpuRecursionArgs(&args));
+    args[3] = "verify-prefix-candidate";
+    try std.testing.expectError(error.InvalidCpuRecursionArguments, admitCpuRecursionArgs(&args));
+    args[3] = "recurse-candidate";
+    args[9] = "cpu_keyed_direct_arith_b2_q108_p20_exp";
+    try std.testing.expectError(error.UnsupportedCpuRecursionProfile, admitCpuRecursionArgs(&args));
+    args[9] = @tagName(profile);
+    args[11] = "3";
+    try std.testing.expectError(error.Om31ProfileFoldArityMismatch, admitCpuRecursionArgs(&args));
 }

@@ -1,6 +1,6 @@
 .{
     .name = .stwo_opstack_statement,
-    .version = "0.1.0",
+    .version = "0.2.0",
     .fingerprint = 0x3bf58fd9ca4bd0a2,
     .minimum_zig_version = "0.15.2",
     .paths = .{"."},
