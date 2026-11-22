@@ -5,10 +5,20 @@ const core = @import("stwo_core");
 const Stack = @import("stacked_layout.zig");
 const Allocator = std.mem.Allocator;
 const Base = core.fields.m31.M31;
-const Coefficients = @import("poly.zig").CircleCoefficients;
+const Coefficients = polys.CircleCoefficients;
 const Channel = core.channel.raw_mod_m31.Om31Channel;
 const max_log = core.poly.circle.MAX_CIRCLE_DOMAIN_LOG_SIZE;
 const Sha256 = std.crypto.hash.sha2.Sha256;
+const polys = @import("poly.zig");
+const twiddles = @import("../twiddles.zig");
+const pool = @import("../../work_pool.zig");
+const Coset = core.poly.circle.canonic.CanonicCoset;
+const H = core.vcs_lifted.blake2_merkle.Blake2sPrefixedMerkleHasher;
+pub const Tree = @import("../../vcs_lifted/prover.zig").MerkleProverLifted(H);
+const wave_columns = 32;
+
+const Column = @import("stwo_prover_api").ColumnEvaluation;
+const openCoefficients = @import("../../pcs/coefficient_opening.zig").decommit;
 
 pub const Scope = struct {
     air_log: u32,
@@ -139,6 +149,115 @@ fn mix(hash: *Sha256, words: []const u32) void {
         std.mem.writeInt(u32, &bytes, word, .little);
         hash.update(&bytes);
     }
+}
+
+/// Build only the packed tree. Each evaluation wave drops its column backing
+/// immediately after absorption. The caller owns the byte budget for waves
+/// separately from the compact hash state and shared twiddle table.
+pub fn commit(
+    a: std.mem.Allocator,
+    layout: *const Layout,
+    logical: []const Coefficients,
+    scratch_bytes: usize,
+) !Tree {
+    if (scratch_bytes < bytesForColumn(layout.commitment_log) or logical.len != layout.groups.order.len)
+        return error.InvalidPackedSourceGeometry;
+    var transform = try twiddles.precomputeM31(a, Coset.new(layout.commitment_log).circleDomain().half_coset);
+    defer twiddles.deinitM31(a, &transform);
+    var committer = Tree.StreamingCommitter.initCompactBlake(a);
+    var committed = false;
+    defer if (!committed) committer.deinit();
+    const active_pool = pool.currentScopedPool();
+    var offset: usize = 0;
+    while (offset < layout.column_logs.len) {
+        var buffers: [wave_columns][]Base = undefined;
+        var refs: [wave_columns]Tree.ColumnRef = undefined;
+        var count: usize = 0;
+        defer for (buffers[0..count]) |buffer| a.free(buffer);
+        var used: usize = 0;
+        while (offset + count < layout.column_logs.len and count < buffers.len) {
+            const index = offset + count;
+            const log = layout.column_logs[index];
+            const bytes = bytesForColumn(log);
+            if (bytes > scratch_bytes - used) break;
+            const dst = try a.alloc(Base, bytes / @sizeOf(Base));
+            errdefer a.free(dst);
+            const rows = @as(usize, 1) << @intCast(layout.groups.groups[layout.merkle_order[index]].targetLog());
+            try layout.packColumn(index, logical, dst[0..rows]);
+            buffers[count] = dst;
+            refs[count] = .{ .values = dst, .log_size = log, .original_index = index };
+            count += 1;
+            used += bytes;
+        }
+        std.debug.assert(count != 0); // The largest column fits the admitted wave.
+        var first: usize = 0;
+        while (first < count) {
+            const log = refs[first].log_size;
+            var end = first + 1;
+            while (end < count and refs[end].log_size == log) : (end += 1) {}
+            const degree_log = layout.groups.groups[layout.merkle_order[offset + first]].targetLog();
+            try polys.evaluateDyadicExtensionBuffersWithTwiddlesWithPool(
+                buffers[first..end],
+                degree_log,
+                Coset.new(log).circleDomain(),
+                .{ .root_coset = transform.root_coset, .twiddles = transform.twiddles, .itwiddles = transform.itwiddles },
+                active_pool,
+            );
+            first = end;
+        }
+        try committer.addColumns(refs[0..count]);
+        offset += count;
+    }
+    const result = try committer.finalize();
+    committed = true;
+    return result;
+}
+
+fn bytesForColumn(log: u32) usize {
+    return @sizeOf(Base) * (@as(usize, 1) << @intCast(log));
+}
+
+/// The held tree owns only its Merkle levels. The layout and source
+/// coefficients are borrowed, immutable, and belong to the same PCS worker.
+pub fn open(
+    a: std.mem.Allocator,
+    layout: *const Layout,
+    tree: *const Tree,
+    logical: []const Coefficients,
+    positions: []const usize,
+    packed_bytes: usize,
+) !Tree.DecommitmentResult {
+    if (tree.maxLogSize() != layout.commitment_log or logical.len != layout.groups.order.len)
+        return error.InvalidPackedSourceGeometry;
+    const columns = try a.alloc(Column, layout.column_logs.len);
+    defer a.free(columns);
+    var initialized: usize = 0;
+    defer for (columns[0..initialized], 0..) |column, index| {
+        const group = layout.groups.groups[layout.merkle_order[index]];
+        if (group.log_width != 0) a.free(column.coefficient_values.?);
+    };
+    var used: usize = 0;
+    for (columns, layout.column_logs, 0..) |*column, log, index| {
+        const group = layout.groups.groups[layout.merkle_order[index]];
+        const members = layout.groups.members(group);
+        const coefficients = if (members.len == 1) blk: {
+            const input = logical[members[0]].coefficients();
+            if (input.len * @sizeOf(Base) != bytesForColumn(group.source_log))
+                return error.InvalidPackedSourceGeometry;
+            break :blk input;
+        } else blk: {
+            const bytes = bytesForColumn(group.targetLog());
+            if (bytes > packed_bytes - used) return error.PackedCoefficientBudget;
+            const output = try a.alloc(Base, bytes / @sizeOf(Base));
+            errdefer a.free(output);
+            try layout.packColumn(index, logical, output);
+            used += bytes;
+            break :blk output;
+        };
+        column.* = .{ .log_size = log, .values = &.{}, .coefficient_values = coefficients };
+        initialized += 1;
+    }
+    return openCoefficients(H, a, .{ .columns = columns, .commitment = tree.* }, positions);
 }
 
 const test_allocator = std.testing.allocator;

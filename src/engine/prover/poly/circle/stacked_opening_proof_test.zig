@@ -9,14 +9,14 @@ const Base = core.fields.m31.M31;
 const Secure = core.fields.om31.OM31;
 const Point = core.circle.CirclePoint(Secure);
 const Channel = core.channel.raw_mod_m31.Om31Channel;
-const Hash = core.vcs_lifted.blake2_merkle.Blake2sPlainMerkleHasher;
+const Hash = core.vcs_lifted.blake2_merkle.Blake2sPrefixedMerkleHasher;
 const Host = @import("../../pcs/commitment_tree.zig").HostMerkleBackend;
 const Tree = Host.MerkleTree(Hash);
 const TreeVerifier = core.vcs_lifted.verifier.MerkleVerifierLifted(Hash);
 const FRI = core.fri.ForField(Secure);
 const Mix = struct {
     pub fn mixRoot(channel: *Channel, root: Hash.Hash) void {
-        core.vcs_lifted.blake2_merkle.Blake2sPlainMerkleChannel.mixRoot(&channel.inner, root);
+        core.vcs_lifted.blake2_merkle.Blake2sPrefixedMerkleChannel.mixRoot(&channel.inner, root);
     }
 };
 const Prover = @import("../../fri_family.zig").ForField(Secure).FriProver(Host, Hash, Mix);
@@ -158,6 +158,15 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
     }
     var tree = try Tree.commit(alloc, &trace_columns);
     defer tree.deinit(alloc);
+    const column_bytes = @sizeOf(Base) * domain.size();
+    try std.testing.expectError(error.InvalidPackedSourceGeometry, Source.commit(alloc, &layout, &logical, column_bytes - 1));
+    var compact = try Source.commit(alloc, &layout, &logical, column_bytes);
+    defer compact.deinit(alloc);
+    var wide_wave = try Source.commit(alloc, &layout, &logical, groups * column_bytes);
+    defer wide_wave.deinit(alloc);
+    try std.testing.expectEqual(tree.root(), compact.root());
+    try std.testing.expectEqual(tree.root(), wide_wave.root());
+    compact.pruneBottomLayers(2);
     // A separate direct tree uses the shorter source domain and one OODS mask.
     var coefficients: [rows]Base = undefined;
     for (&coefficients, 0..) |*v, i| v.* = Base.fromU64(23 * i * i + 101);
@@ -226,8 +235,14 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
     defer result.deinit(alloc);
     var projection = try layout.projectQueries(alloc, result.query_positions);
     defer projection.deinit(alloc);
-    var opening = try tree.decommit(alloc, projection.positions, &trace_columns);
+    var reference_opening = try tree.decommit(alloc, projection.positions, &trace_columns);
+    defer reference_opening.deinit(alloc);
+    const coefficient_bytes = @sizeOf(Base) * rows * width * groups;
+    try std.testing.expectError(error.PackedCoefficientBudget, Source.open(alloc, &layout, &compact, &logical, projection.positions, coefficient_bytes - 1));
+    var opening = try Source.open(alloc, &layout, &compact, &logical, projection.positions, coefficient_bytes);
     defer opening.deinit(alloc);
+    try std.testing.expectEqualDeep(reference_opening.queried_values, opening.queried_values);
+    try std.testing.expectEqualDeep(reference_opening.decommitment.decommitment, opening.decommitment.decommitment);
     const direct_indices = try directPositions(result.query_positions);
     defer alloc.free(direct_indices);
     var direct_opening = try small_tree.decommit(alloc, direct_indices, &.{&small_trace});
