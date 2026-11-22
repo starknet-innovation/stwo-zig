@@ -3,6 +3,7 @@
 const std = @import("std");
 const core = @import("stwo_core");
 const stack = @import("stacked_opening.zig");
+const Source = @import("stacked_commitment.zig");
 const Poly = @import("poly.zig").CircleCoefficients;
 const Base = core.fields.m31.M31;
 const Secure = core.fields.om31.OM31;
@@ -27,7 +28,7 @@ const rows = 16;
 const degree_log = std.math.log2_int(usize, rows * width);
 const domain_log = degree_log + 2;
 const domain = core.poly.circle.canonic.CanonicCoset.new(domain_log).circleDomain();
-const groups = 3;
+const groups = 5;
 const direct_log = domain_log - 2;
 const direct_domain = core.poly.circle.canonic.CanonicCoset.new(direct_log).circleDomain();
 const Samples = [2][groups * width]Secure;
@@ -40,8 +41,22 @@ fn config() core.fri.FriConfig {
     return c;
 }
 
-fn start(channel: *Channel, roots: [2]Hash.Hash) ![2]Point {
+fn sourceLayout(tree_ordinal: u32) !Source.Layout {
+    const logs: [groups * width]u32 = @splat(std.math.log2_int(usize, rows));
+    const masks: [logs.len][]const i32 = @splat(&.{ 0, 1 });
+    return (try Source.Layout.init(alloc, &logs, &masks, .{
+        .air_log = std.math.log2_int(usize, rows),
+        .quotient_log = degree_log,
+        .blowup_log = domain_log - degree_log,
+        .max_width = width,
+        .worker_ordinal = 0,
+        .tree_ordinal = tree_ordinal,
+    })) orelse error.TestLayoutDidNotPack;
+}
+
+fn start(channel: *Channel, roots: [2]Hash.Hash, layout: *const Source.Layout) ![2]Point {
     channel.mixU32s(&.{ 0x53544b50, groups, width, rows, domain_log, direct_log, 0, 1 });
+    layout.mixInto(channel);
     for (roots) |root| Mix.mixRoot(channel, root);
     const z = try core.circle.randomSecureFieldPointFor(Secure, channel);
     const step = core.poly.circle.canonic.CanonicCoset.new(4).step();
@@ -64,17 +79,6 @@ fn rawAnswer(opened: Row, alpha: [groups]Secure) Secure {
     return sum;
 }
 
-fn pairs(queries: []const usize, out: *[2 * 15]usize) []const usize {
-    var n: usize = 0;
-    for (queries) |i| {
-        const first = i & ~@as(usize, 1);
-        if (n != 0 and out[n - 2] == first) continue;
-        out[n..][0..2].* = .{ first, first + 1 };
-        n += 2;
-    }
-    return out[0..n];
-}
-
 const Opening = Tree.DecommitmentResult;
 const Proof = FRI.FriProof(Hash);
 fn directPositions(queries: []const usize) ![]usize {
@@ -83,9 +87,9 @@ fn directPositions(queries: []const usize) ![]usize {
     return core.queries.sortedUniquePositions(alloc, projected);
 }
 
-fn receive(roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, opening: *const Opening, direct_opening: *const Opening, proof: Proof) !void {
+fn receive(roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, opening: *const Opening, direct_opening: *const Opening, proof: Proof, layout: *const Source.Layout) !void {
     var channel = Channel.init();
-    const z = try start(&channel, roots);
+    const z = try start(&channel, roots, layout);
     const alpha = weights(&channel, samples, direct_sample);
     const direct_raw = channel.drawSecureFelt();
     const direct_deep = channel.drawSecureFelt();
@@ -93,11 +97,11 @@ fn receive(roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, 
     defer verifier.deinit(alloc);
     const queries = try verifier.sampleQueryPositions(alloc, &channel);
     defer alloc.free(queries);
-    var positions: [30]usize = undefined;
-    const both = pairs(queries, &positions);
-    var auth = try TreeVerifier.init(alloc, roots[0], &([_]u32{domain_log} ** groups));
+    var projection = try layout.projectQueries(alloc, queries);
+    defer projection.deinit(alloc);
+    var auth = try TreeVerifier.init(alloc, roots[0], layout.column_logs);
     defer auth.deinit(alloc);
-    try auth.verify(alloc, both, opening.queried_values, opening.decommitment.decommitment);
+    try auth.verify(alloc, projection.positions, opening.queried_values, opening.decommitment.decommitment);
 
     const direct_indices = try directPositions(queries);
     defer alloc.free(direct_indices);
@@ -112,9 +116,8 @@ fn receive(roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, 
     var second = try stack.Batch.init(alloc, width, &alpha[2], z[1], &samples[1]);
     defer second.deinit(alloc);
     var answers: [15]Secure = undefined;
-    var at: usize = 0;
-    for (queries, 0..) |i, j| {
-        while (both[at] != i) at += 1;
+    for (queries, projection.selections, 0..) |i, selected, j| {
+        const at = 2 * selected.pair + @intFromBool(selected.odd);
         var opened: Row = undefined;
         var sibling: Row = undefined;
         for (opening.queried_values, &opened, &sibling) |payload, *v, *s| {
@@ -132,15 +135,20 @@ fn receive(roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, 
 }
 
 test "stacked Circle width eight authenticates both siblings and verifies a two-mask OM31 FRI proof" {
+    var layout = try sourceLayout(1);
+    defer layout.deinit(alloc);
+    try std.testing.expectEqualSlices(u32, &([_]u32{domain_log} ** groups), layout.column_logs);
     var columns: [groups * width][rows]Base = undefined;
     for (&columns, 0..) |*c, j| for (c, 0..) |*v, i| {
         v.* = Base.fromU64((j + 13) * (i + 5) * (i + 101) + 311 * j * j);
     };
+    var logical: [groups * width]Poly = undefined;
+    for (&columns, &logical) |*column, *polynomial| polynomial.* = try Poly.initBorrowed(column);
     var traces: [groups][1 << domain_log]Base = undefined;
     var trace_columns: [groups][]const Base = undefined;
     for (&traces, &trace_columns, 0..) |*trace, *column, g| {
         var coefficients: [width * rows]Base = undefined;
-        try stack.pack(std.mem.bytesAsSlice(Base, std.mem.sliceAsBytes(columns[g * width ..][0..width])), width, &coefficients);
+        try layout.packColumn(g, &logical, &coefficients);
         const packed_poly = try Poly.initBorrowed(&coefficients);
         for (trace, 0..) |*v, i| {
             const p = domain.at(core.utils.bitReverseIndex(i, domain_log));
@@ -163,7 +171,7 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
     defer small_tree.deinit(alloc);
     const roots = [2]Hash.Hash{ tree.root(), small_tree.root() };
     var channel = Channel.init();
-    const z = try start(&channel, roots);
+    const z = try start(&channel, roots, &layout);
     var samples: Samples = undefined;
     for (z, &samples) |p, *mask| for (columns, mask) |col, *sample| {
         sample.* = (try Poly.initBorrowed(&col)).evalAtPointFor(Secure, p);
@@ -216,33 +224,40 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
     const prover = try Prover.commit(alloc, &channel, config(), domain, values);
     var result = try prover.decommit(alloc, &channel);
     defer result.deinit(alloc);
-    var positions: [30]usize = undefined;
-    var opening = try tree.decommit(alloc, pairs(result.query_positions, &positions), &trace_columns);
+    var projection = try layout.projectQueries(alloc, result.query_positions);
+    defer projection.deinit(alloc);
+    var opening = try tree.decommit(alloc, projection.positions, &trace_columns);
     defer opening.deinit(alloc);
     const direct_indices = try directPositions(result.query_positions);
     defer alloc.free(direct_indices);
     var direct_opening = try small_tree.decommit(alloc, direct_indices, &.{&small_trace});
     defer direct_opening.deinit(alloc);
-    try receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof);
+    try receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout);
+
+    var wrong_tree = try sourceLayout(2);
+    defer wrong_tree.deinit(alloc);
+    if (receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &wrong_tree)) |_|
+        return error.ChangedTreeIdentityAccepted
+    else |_| {}
 
     const small_word = &direct_opening.queried_values[0][0];
     small_word.* = small_word.add(Base.one());
-    try std.testing.expectError(error.RootMismatch, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof));
+    try std.testing.expectError(error.RootMismatch, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
     small_word.* = small_word.sub(Base.one());
 
-    const index = if (result.query_positions[0] & 1 == 0) @as(usize, 1) else 0;
-    const word = &opening.queried_values[groups - 1][index];
-    const saved = word.*;
-    word.* = saved.add(Base.one());
-    try std.testing.expectError(error.RootMismatch, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof));
-    word.* = saved;
+    for (0..2) |sign| {
+        const word = &opening.queried_values[groups - 1][sign];
+        word.* = word.add(Base.one());
+        try std.testing.expectError(error.RootMismatch, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
+        word.* = word.sub(Base.one());
+    }
     // Changing the shifted mask changes the Fiat-Shamir query set.
     samples[1][width + 2] = samples[1][width + 2].add(Secure.one());
-    try std.testing.expectError(error.InvalidQueryShape, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof));
+    try std.testing.expectError(error.InvalidQueryShape, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
     samples[1][width + 2] = samples[1][width + 2].sub(Secure.one());
     // Mutate an unqueried FRI witness under the original transcript. The trace
     // authentication still succeeds, so the FRI verifier must reject it.
     const witness = &result.fri_proof.proof.first_layer.fri_witness[0];
     witness.* = witness.add(Secure.one());
-    try std.testing.expectError(error.FirstLayerCommitmentInvalid, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof));
+    try std.testing.expectError(error.FirstLayerCommitmentInvalid, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
 }
