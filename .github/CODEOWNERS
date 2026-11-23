@@ -142,6 +142,10 @@
 /src/frontends/sm83/build.zig.zon @teddyjfpender
 /src/frontends/sm83/package.contract.json @teddyjfpender
 
+# owner-role: int-inference-frontend
+/src/frontends/int_inference/build.zig.zon @teddyjfpender
+/src/frontends/int_inference/package.contract.json @teddyjfpender
+
 # owner-role: sm83-metal-integration
 /src/integrations/sm83_metal/build.zig.zon @teddyjfpender
 /src/integrations/sm83_metal/package.contract.json @teddyjfpender

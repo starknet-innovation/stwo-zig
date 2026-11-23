@@ -224,8 +224,9 @@ class IntegrationPackageCiContractTests(unittest.TestCase):
         )
 
     def test_prover_diff_selects_only_the_link_reach(self) -> None:
-        # The circuit frontend and both CPU/Metal integrations declare prover
-        # engine dependencies, so its link reach retains all three lanes.
+        # The circuit and integer-inference frontends and the CPU/Metal
+        # integrations declare prover engine dependencies, so its link reach
+        # retains their lanes.
         changed = [
             "src/engine/prover/pcs/quotient_tile_executor.zig",
             "src/engine/prover/vcs_lifted/prover.zig",
@@ -244,7 +245,7 @@ class IntegrationPackageCiContractTests(unittest.TestCase):
                 "cairo_metal_integration", "circuit_cpu_integration",
                 "circuit_frontend", "circuit_metal_integration", "cpu_backend",
                 "cuda_backend", "ethereum_statement", "ethereum_statement_releasefast",
-                "metal_backend", "native_cpu",
+                "int_inference_frontend", "metal_backend", "native_cpu",
                 "native_cuda_device", "native_cuda_integration", "native_cuda_static",
                 "native_examples", "native_metal",
                 "native_oracle", "opstack_statement", "opstack_statement_releasefast",

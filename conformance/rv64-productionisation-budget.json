@@ -1558,6 +1558,13 @@
       "flags_added_budget": 0,
       "scripts_added_budget": 0,
       "positive_growth_justification": "Issue 436 gives the existing isolated RISC-V timing lane a UTC advisory expiry in the focused planner and verifies the boundary. Keep the benchmark roster, commands and thresholds intact. No proof or runtime change."
+    },
+    {
+      "id": "port_int_inference_frontend_issue438",
+      "net_code_budget": 34253,
+      "flags_added_budget": 0,
+      "scripts_added_budget": 0,
+      "positive_growth_justification": "Issue 438 restores the archived CPU tensor frontend (head 97dc093f2) as the owned frontend package stwo_int_inference_frontend: its prover, verifier, proof and tamper tests, split under the 850-line ceiling. Growth is code that already existed on the archived branch; no flag or script is added, and Metal, CUDA, tooling and the shared QM31 change stay archived."
     }
   ],
   "results_owner": "vectors/reports/rv64-productionisation/current.json#budget_results",

@@ -90,6 +90,7 @@ fn addMissingConsumerModules(b: *std.Build, target: std.Build.ResolvedTarget, op
     // Their contracts own roots and dependencies; this list selects composition,
     // never defines a second API/dependency registry or a runtime product.
     for ([_][]const u8{
+        "src/frontends/int_inference",
         "src/frontends/sm83",
         "src/integrations/sm83_cpu",
         "src/integrations/sm83_metal",

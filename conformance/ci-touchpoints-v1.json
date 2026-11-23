@@ -278,6 +278,40 @@
         ]
       ]
     },
+    "int_inference_frontend": {
+      "host": "linux",
+      "description": "Independent CPU integer-inference frontend package: ReleaseFast, Debug and the degree-8 (om31) challenge field",
+      "commands": [
+        [
+          "zig",
+          "build",
+          "test",
+          "--build-file",
+          "src/frontends/int_inference/build.zig",
+          "-Doptimize=ReleaseFast",
+          "-j2"
+        ],
+        [
+          "zig",
+          "build",
+          "test",
+          "--build-file",
+          "src/frontends/int_inference/build.zig",
+          "-Doptimize=Debug",
+          "-j2"
+        ],
+        [
+          "zig",
+          "build",
+          "test",
+          "--build-file",
+          "src/frontends/int_inference/build.zig",
+          "-Doptimize=ReleaseFast",
+          "-Dchallenge=om31",
+          "-j2"
+        ]
+      ]
+    },
     "riscv_cpu_integration": {
       "host": "linux",
       "description": "Independent RISC-V frontend and CPU backend composition package",
@@ -1789,6 +1823,7 @@
         "riscv_frontend_acceptance",
         "riscv_frontend_releasefast",
         "sm83_frontend",
+        "int_inference_frontend",
         "riscv_cpu_integration",
         "sm83_cpu_integration",
         "cairo_frontend",

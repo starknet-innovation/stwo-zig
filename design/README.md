@@ -10,6 +10,7 @@ preset or a machine-read pin; those live in `src/`, `conformance/` and
 | [`riscv/`](riscv/) | RISC-V / RV64 proving stack: AIR, services, recursion, CUDA, promotion gates and retained performance designs. Start at [`rv64-gpu-hygiene.md`](riscv/rv64-gpu-hygiene.md), [`rv64-m9-plan.md`](riscv/rv64-m9-plan.md) and [`rv64-archive-index.md`](riscv/rv64-archive-index.md) |
 | [`opstack/`](opstack/) | OP Stack integration, qualification boundaries and historical tuning records |
 | [`starknet/`](starknet/) | Starknet proving pipeline and circuit recursion design |
+| [`tensor-frontend/`](tensor-frontend/) | Integer-inference (tensor) protocol: PCS, statement binding, security accounting, hiding protocol and wire format (ported from the archived branch, issue #438) |
 | [`typed-air/`](typed-air/) | Typed-AIR language: charter, IR, soundness, validation and numbered decisions |
 | [`soundness/`](soundness/) | Soundness contracts, verification status and the evidence roadmap |
 | [`decisions/`](decisions/) | Dated repository-level goals, amendments and audits that still bind current work |
