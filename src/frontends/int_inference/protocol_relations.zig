@@ -13,18 +13,18 @@ const TensorInfo = @import("protocol_statement.zig").TensorInfo;
 // ---------------------------------------------------------------------------
 // Relations derived from the statement (shared by prover and verifier).
 
-const KeyKind = enum { remainder, y_range, lookup_pair, plain_range, glu_triple, ext };
+pub const KeyKind = enum { remainder, y_range, lookup_pair, plain_range, glu_triple, ext };
 
-const KeyInst = struct {
+pub const KeyInst = struct {
     kind: KeyKind,
     op: usize, // for .ext: index into Relations.ext_keys
     log_size: u32,
     table: usize, // index into `tables` list below
 };
 
-const TableKind = union(enum) { range: u5, act: u32, glu: struct { table: u32, shift: u5 }, ext_lookup: u32 };
+pub const TableKind = union(enum) { range: u5, act: u32, glu: struct { table: u32, shift: u5 }, ext_lookup: u32 };
 
-const RelTable = struct {
+pub const RelTable = struct {
     kind: TableKind,
     log_size: u32,
     mult_tensor: usize, // index of multiplicity tensor in the extended witness list
@@ -348,8 +348,15 @@ pub fn multiplicities(a: std.mem.Allocator, pool: *f.Pool, st: Statement, rel: R
                 for (0..n) |i| {
                     const vg = @as(i64, w[g.g][i]);
                     const vu = @as(i64, w[g.u][i]);
-                    if (vg < -128 or vg > 127 or vu < -128 or vu > 127) return error.ValueOutOfRange;
-                    if (gluValue(st, g.table, g.shift, vg, vu) != w[g.h][i]) return error.LookupMismatch;
+                    // test builds with xt.test_unchecked_prover: a cheating prover
+                    // counts what it can and continues, so adversarial tests reach
+                    // the verifier (out-of-domain keys are left uncounted)
+                    const cheat = @import("builtin").is_test and xt.test_unchecked_prover;
+                    if (vg < -128 or vg > 127 or vu < -128 or vu > 127) {
+                        if (cheat) continue;
+                        return error.ValueOutOfRange;
+                    }
+                    if (!cheat and gluValue(st, g.table, g.shift, vg, vu) != w[g.h][i]) return error.LookupMismatch;
                     mult[@intCast((vg + 128) * 256 + (vu + 128))] += 1;
                 }
             },

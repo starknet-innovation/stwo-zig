@@ -4,11 +4,14 @@ const f = @import("field.zig");
 const proto = @import("protocol.zig");
 const xt = @import("ext.zig");
 const model = @import("model.zig");
+const prep = @import("prep.zig");
 const tf = @import("transformer.zig");
 
 const TensorInfo = proto.TensorInfo;
 const Ref = xt.Ref;
+const AttnOut = tf.AttnOut;
 const Builder = tf.Builder;
+const GLU_MIN_NUMEL = tf.GLU_MIN_NUMEL;
 const Ctx = tf.Ctx;
 const LayerCfg = tf.LayerCfg;
 const LayerOut = tf.LayerOut;
@@ -27,11 +30,11 @@ const setupWeightsWith = tf.setupWeightsWith;
 
 const testing = std.testing;
 
-fn testCfg() proto.Config {
+pub fn testCfg() proto.Config {
     return .{ .pcs = .{ .log_blowup = 2, .n_queries = 12, .pow_bits = 1 }, .weight_log_cols = 4, .witness_log_cols_max = 8, .gkr_threads = 2 };
 }
 
-fn proveVerify(a: std.mem.Allocator, pool: *f.Pool, pc: proto.Config, b: *const Builder, ws: *const proto.WeightStore) !proto.Proof {
+pub fn proveVerify(a: std.mem.Allocator, pool: *f.Pool, pc: proto.Config, b: *const Builder, ws: *const proto.WeightStore) !proto.Proof {
     const st = b.statement();
     const wv = try b.witnessView(a);
     defer a.free(wv);
@@ -42,7 +45,7 @@ fn proveVerify(a: std.mem.Allocator, pool: *f.Pool, pc: proto.Config, b: *const 
     return proof;
 }
 
-fn expectReject(a: std.mem.Allocator, pc: proto.Config, st: proto.Statement, ws: *const proto.WeightStore, proof: *const proto.Proof) !void {
+pub fn expectReject(a: std.mem.Allocator, pc: proto.Config, st: proto.Statement, ws: *const proto.WeightStore, proof: *const proto.Proof) !void {
     if (proto.verify(a, pc, st, proto.weightKey(ws), proof)) |_| {
         return error.TamperAccepted;
     } else |_| {}
@@ -168,13 +171,13 @@ test "two-layer stack proves and verifies" {
 
 const SmallCfg = LayerCfg{ .log_t = 2, .log_d = 4, .log_f = 5, .log_heads = 2, .log_kv_heads = 1 };
 
-const Fixture = struct {
+pub const Fixture = struct {
     sw: WeightSetup,
     b: Builder,
     c: Ctx,
     out: LayerOut,
 
-    fn init(a: std.mem.Allocator, pool: *f.Pool, cfg: LayerCfg, pc: proto.Config, seed: u64) !*Fixture {
+    pub fn init(a: std.mem.Allocator, pool: *f.Pool, cfg: LayerCfg, pc: proto.Config, seed: u64) !*Fixture {
         const fx = try a.create(Fixture);
         errdefer a.destroy(fx);
         fx.sw = try setupWeights(a, pool, cfg, pc, seed);
@@ -186,7 +189,7 @@ const Fixture = struct {
         return fx;
     }
 
-    fn deinit(fx: *Fixture, a: std.mem.Allocator) void {
+    pub fn deinit(fx: *Fixture, a: std.mem.Allocator) void {
         fx.b.deinit();
         fx.sw.ws.deinit(a);
         for (fx.sw.wdata) |w| a.free(w);
@@ -275,7 +278,37 @@ test "decoder layer witness matches a direct integer reference (RoPE, GQA scores
     }
 }
 
-const Cheat = enum { sel_nonbinary, acc_plus_one, sel_moved, max_lowered, rt_plus_one, residual, exp_value, masked_exp, score, ss_value };
+const Cheat = enum { sel_nonbinary, acc_plus_one, sel_moved, m_lowered, m_raised, m_z_raised, z_split, rt_plus_one, residual, exp_value, masked_exp, score, ss_value };
+
+/// Factored-selector cheats (log_t >= FACTORED_SEL_MIN_LOG_T).
+/// log_t = 4: the factored argmax selector (ljh = ljl = 2).
+pub const FactCfg = LayerCfg{ .log_t = 4, .log_d = 4, .log_f = 5, .log_heads = 1, .log_kv_heads = 0 };
+
+/// Lower m of `row` to the (masked) score at some j2 < max, keeping m = z1 + z2
+/// attained at j2 (z1, z2 consistent) and e recomputed wherever the new D is
+/// in the exp domain: only the exp key at the true argmax (D < 0) can fail.
+pub fn lowerMax(b: *Builder, at: AttnOut, c: Ctx, row: usize) !usize {
+    const T = @as(usize, 1) << @intCast(c.cfg.log_t);
+    const t = row % T;
+    const bias = b.vals(Ref.p(c.bias));
+    const S = b.wit.items[at.scores];
+    const m = b.wit.items[at.m];
+    var jlow: ?usize = null;
+    for (0..T) |j| if (S[row * T + j] + bias[t * T + j] < m[row]) {
+        jlow = j;
+    };
+    const j2 = jlow orelse return error.NoLowerScore;
+    const nm = S[row * T + j2] + bias[t * T + j2];
+    m[row] = nm;
+    b.wit.items[at.z1][row] = S[row * T + j2];
+    b.wit.items[at.z2][row] = bias[t * T + j2];
+    const et = b.xtables.items[c.exp_table].values;
+    for (0..T) |j| {
+        const d = nm - S[row * T + j] - bias[t * T + j];
+        if (d >= 0 and d < et.len) b.wit.items[at.e][row * T + j] = et[@intCast(d)];
+    }
+    return j2;
+}
 
 fn cheatCase(a: std.mem.Allocator, cheat: Cheat) !void {
     var pool: f.Pool = undefined;
@@ -290,9 +323,8 @@ fn cheatCase(a: std.mem.Allocator, cheat: Cheat) !void {
     const T = @as(usize, 1) << @intCast(SmallCfg.log_t);
     const bias = b.vals(Ref.p(fx.c.bias));
     const S = b.wit.items[at.scores];
-    const sel = b.wit.items[at.sel];
+    const sel = b.wit.items[at.sel.?];
     const m = b.wit.items[at.m];
-    const Dd = b.wit.items[at.d];
     const row = T - 1; // head 0, last token: all positions unmasked
     var jstar: usize = 0;
     for (0..T) |j| if (sel[row * T + j] == 1) {
@@ -308,14 +340,30 @@ fn cheatCase(a: std.mem.Allocator, cheat: Cheat) !void {
             sel[row * T + jstar] = 0;
             sel[row * T + jlow.?] = 1;
         },
-        .max_lowered => {
-            // claim the max is a smaller score; D recomputed consistently
-            const j2 = jlow.?;
-            const nm = S[row * T + j2] + bias[(T - 1) * T + j2];
-            m[row] = nm;
+        .m_lowered => {
+            // claim the max is a smaller score, attained (sel, z1, z2) consistently
+            const j2 = try lowerMax(b, at, fx.c, row);
             sel[row * T + jstar] = 0;
             sel[row * T + j2] = 1;
-            for (0..T) |j| Dd[row * T + j] = nm - S[row * T + j] - bias[(T - 1) * T + j];
+        },
+        .m_raised => {
+            // m above every score: D >= 1 everywhere (in the exp domain), not attained
+            m[row] += 1;
+            const et = b.xtables.items[fx.c.exp_table].values;
+            for (0..T) |j| b.wit.items[at.e][row * T + j] = et[@intCast(m[row] - S[row * T + j] - bias[(T - 1) * T + j])];
+        },
+        .m_z_raised => {
+            // m and z1 raised together: the lineq m = z1 + z2 and every exp key
+            // (D >= 1) hold; only the one-hot einsum z1 = sum_j sel S can fail
+            m[row] += 1;
+            b.wit.items[at.z1][row] += 1;
+            const et = b.xtables.items[fx.c.exp_table].values;
+            for (0..T) |j| b.wit.items[at.e][row * T + j] = et[@intCast(m[row] - S[row * T + j] - bias[(T - 1) * T + j])];
+        },
+        .z_split => {
+            // z1 + z2 unchanged (lineq holds), each forged
+            b.wit.items[at.z1][row] += 1;
+            b.wit.items[at.z2][row] -= 1;
         },
         .acc_plus_one => b.wit.items[at.acc][0] += 1,
         .sel_nonbinary => {
@@ -551,10 +599,18 @@ test "fused QKV projection (fixed-bit slices) proves and verifies; RoPE reads th
 // unmodified prover (base 61ba1ce6c + the Builder.add aliasing fix). Every
 // prover optimisation must reproduce these bytes. The shapes reach the GEMM
 // einsum accumulator (score and PV contractions of 2^4 terms), the split-eq
-// einsum sumcheck (sel * sel, sel * D) and the split-eq MLE evaluations.
+// einsum sumcheck (selector zero-checks, one-hot argmax einsums) and the
+// split-eq MLE evaluations.
+//
+// Repinned (codex/tensor-wv-attn-virtual-d-sel): commit 1 attn/d removed
+// (the exp key takes m - S - Bias as a virtual input; m = z1 + z2 attained
+// by one-hot einsums, m range-keyed): flat 8424c4b6..., pcs2_moe 79360fbd...;
+// commit 2 attn/sel -> 2 sqrt(T) one-hots A (x) B at log_t >=
+// FACTORED_SEL_MIN_LOG_T (this shape: log_t = 4): the pins below. Before
+// both: flat 837b19ac..., pcs2_moe 0d99b4e3....
 
-const GOLDEN_LAYER_FLAT = "837b19acbf642dbe2707dd2bf04a0dba665c9b3785e650e6adf057ae4f77811f";
-const GOLDEN_LAYER_PCS2_MOE = "0d99b4e3b1d02bf55691128c7c5da83fa91a2338ccf31fad20c003a654ad05ad";
+const GOLDEN_LAYER_FLAT = "a2bcc5c766a04bf0d67cd9916f261cb298c11297312fe2d39126ceefbb414584";
+const GOLDEN_LAYER_PCS2_MOE = "4dd2827981e3781644d05607975ff6a5f7eb3e40bc0f68b4ec5c81a72e9cd795";
 
 fn layerDigest(cfg: LayerCfg, pc_in: proto.Config, threads: usize) ![32]u8 {
     return layerDigestOpt(cfg, pc_in, threads, false);

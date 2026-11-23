@@ -24,6 +24,8 @@ pub const MoeOut = struct { out: u32, logits: u32, sel: u32, dr: u32, pre: u32, 
 /// runs its SwiGLU MLP on its 2^log_capacity slots only, outputs combined.
 pub fn moe(b: *Builder, c: Ctx, wb: u32, y: u32) !MoeOut {
     const r = try moeRoute(b, c, wb, y);
+    const prev_scope = b.enter("moe.expert");
+    defer b.scope = prev_scope;
     const cfg = c.cfg;
     const lt = cfg.log_t;
     const ld = cfg.log_d;
@@ -37,24 +39,29 @@ pub fn moe(b: *Builder, c: Ctx, wb: u32, y: u32) !MoeOut {
     const mo_all = try b.a.alloc(i32, E * C * D);
     var mo_ids: [64]u32 = undefined;
     for (0..E) |x| {
+        b.tag("xe.gather");
         const xe = (try b.einsumExact(TensorInfo.mat(lc, ld), lc + ld, Ref.w(disp_id), Ref.w(y), lt, &.{ fixesOf(x, le), ids(0, lc), ids(lc + ld, lt) }, &.{ ids(lc + ld, lt), ids(lc, ld) })).?;
         const we = wb + cfg.wExpert(@intCast(x));
+        b.tag("gate");
         const g = try b.matmul(c.ws, xe, we);
+        b.tag("up");
         const u = try b.matmul(c.ws, xe, we + 1);
-        const act = try b.lookup(g, c.silu);
-        const hm = try b.hadamard(act, u);
+        const hm = try b.gate(g, u, c.silu);
+        b.tag("down");
         const mo = try b.matmul(c.ws, hm, we + 2);
         @memcpy(mo_all[x * C * D ..][0 .. C * D], b.wit.items[mo]);
         mo_ids[x] = mo;
     }
     // stack MO[x, c, d] = mo_x[c, d]
     const nmo = le + lc + ld;
+    b.tag("mo.stack");
     const mo_st = try b.addVec(nmo, mo_all);
     for (0..E) |x| {
         try b.lineq(lc + ld, try b.expr(&.{ term(1, Ref.w(mo_st), &.{ fixesOf(x, le), ids(0, lc + ld) }), term(-1, Ref.w(mo_ids[x]), &.{ids(0, lc + ld)}) }, 0));
     }
     // combine out[t, d] = sum_{x, c} Disp[x, c, t] MO[x, c, d]
     const n_out = lt + ld;
+    b.tag("combine");
     const out = (try b.einsumExact(TensorInfo.mat(lt, ld), n_out, Ref.w(disp_id), Ref.w(mo_st), le + lc, &.{ ids(n_out, le + lc), ids(0, lt) }, &.{ ids(n_out, le + lc), ids(lt, ld) })).?;
     return .{ .out = out, .logits = r.logits, .sel = r.sel, .dr = r.dr, .pre = r.pre, .disp = disp_id, .occ = r.occ, .mo = mo_st, .slot_of = r.slot_of, .expert_of = r.expert_of };
 }
@@ -74,6 +81,9 @@ pub fn moeRoute(b: *Builder, c: Ctx, wb: u32, y: u32) !MoeRoute {
     const C = @as(usize, 1) << @intCast(lc);
     const Ncol = @as(usize, 1) << @intCast(lrc);
     const ar = b.arena.allocator();
+    const prev_scope = b.enter("moe.route");
+    defer b.scope = prev_scope;
+    b.tag("logits");
     const logits = try b.matmul(c.ws, y, wb + cfg.wRouter());
     const lg = b.wit.items[logits];
     // routing (first argmax; test hook: last)
@@ -96,12 +106,15 @@ pub fn moeRoute(b: *Builder, c: Ctx, wb: u32, y: u32) !MoeRoute {
         sel[t * E + arg] = 1;
         expert_of[t] = arg;
     }
+    b.tag("m");
     const m_id = try b.addVec(lt, m);
+    b.tag("sel");
     const sel_id = try b.addVec(nr, sel);
     const dr = try b.a.alloc(i32, T * E);
     for (0..T) |t| for (0..E) |x| {
         dr[t * E + x] = m[t] - lg[t * Ncol + x];
     };
+    b.tag("dr");
     const dr_id = try b.addVec(nr, dr);
     const tv = ids(0, lt);
     const xv = ids(lt, le);
@@ -113,6 +126,7 @@ pub fn moeRoute(b: *Builder, c: Ctx, wb: u32, y: u32) !MoeRoute {
     try b.lineq(lt, try b.expr(&.{term(1, Ref.w(sel_id), &.{ tv, sums(le) })}, -1));
     _ = try b.einsumExact(null, lt, Ref.w(sel_id), Ref.w(dr_id), le, &.{ tv, ids(lt, le) }, &.{ tv, ids(lt, le) });
     // first argmax: pre[t, x] = sum_{x' > x} sel[t, x'];  Dr - pre >= 0
+    b.tag("pre");
     const pre = (try b.einsumExact(TensorInfo.vec(nr), nr, Ref.w(sel_id), Ref.p(c.tri), le, &.{ tv, ids(nr, le) }, &.{ ids(nr, le), xv })).?;
     try b.key(nr, try b.expr(&.{ term(1, Ref.w(dr_id), &.{ tv, xv }), term(-1, Ref.w(pre), &.{ tv, xv }) }, 0), null, .{ .range = 8 });
     // dispatch Disp[x, c, t]
@@ -137,6 +151,7 @@ pub fn moeRoute(b: *Builder, c: Ctx, wb: u32, y: u32) !MoeRoute {
         disp[(x * C + fill[x]) * T + t] = 1;
         fill[x] += 1;
     }
+    b.tag("disp");
     const disp_id = try b.addVec(nd, disp);
     try b.einsumInto(disp_id, Ref.w(disp_id), Ref.w(disp_id), 0, &.{ids(0, nd)}, &.{ids(0, nd)});
     // sum_c Disp[x, c, t] = sel[t, x]   (vars: x, t)
@@ -147,6 +162,7 @@ pub fn moeRoute(b: *Builder, c: Ctx, wb: u32, y: u32) !MoeRoute {
     for (0..E) |x| for (0..fill[x]) |cc| {
         occ[x * C + cc] = 1;
     };
+    b.tag("occ");
     const occ_id = try b.addVec(le + lc, occ);
     try b.lineq(le + lc, try b.expr(&.{ term(1, Ref.w(occ_id), &.{ids(0, le + lc)}), term(-1, Ref.w(disp_id), &.{ ids(0, le + lc), sums(lt) }) }, 0));
     try b.einsumInto(occ_id, Ref.w(occ_id), Ref.w(occ_id), 0, &.{ids(0, le + lc)}, &.{ids(0, le + lc)});

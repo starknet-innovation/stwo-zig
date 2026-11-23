@@ -165,7 +165,7 @@ fn zkCheatCase(a: std.mem.Allocator, pool: *f.Pool, cheat: ZkCheat) !void {
     const at = fx.out.attn;
     const T = @as(usize, 1) << @intCast(lc.log_t);
     const row = T - 1; // head 0, last token: no masked positions
-    const sel = b.wit.items[at.sel];
+    const sel = b.wit.items[at.sel.?];
     var jstar: usize = 0;
     for (0..T) |j| if (sel[row * T + j] == 1) {
         jstar = j;
@@ -458,7 +458,7 @@ test "zk pinned seeded hiding digests (product flat/rec, mlp virtual rec, decode
         .{ .cfg = mlp_cfg, .case = 1, .hex = "fb96502a6b11a38c86867e8856f104396632a8d6e95f4a300e944a9f83ff9921" },
         .{ .cfg = testCfg(), .case = 1, .hex = "0109242eb8ccacaeea2523ccb06146fea4c766bec4128bd1c0bc807756db3497" },
         .{ .cfg = mlp_cfg, .case = 3, .hex = "fb96502a6b11a38c86867e8856f104396632a8d6e95f4a300e944a9f83ff9921" },
-        .{ .cfg = layerCfgZk(), .case = 2, .hex = "b46709bff021a0660d8283524c1ac54b98a45bcf318349b98fafe4e63bac95f7" },
+        .{ .cfg = layerCfgZk(), .case = 2, .hex = "a8ae737cd1d9dcddff478292e15519f81684bfd79f5c9e050dbf26507351af89" },
     };
     var bad = false;
     // the fused and unfused fold schedules of the masked sumcheck give the same proofs

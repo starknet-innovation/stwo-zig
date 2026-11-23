@@ -45,6 +45,8 @@ pub fn decoderLayerAt(b: *Builder, c: Ctx, layer: u32, wb: u32, x: u32, x_int8: 
     const q = ab.q;
     const qr = ab.qr;
     const cfg = c.cfg;
+    const prev_scope = b.enter("residual");
+    defer b.scope = prev_scope;
     if (cfg.isMoe()) {
         const mo = try moe(b, c, wb, r2.y);
         return .{ .out = try residual(b, h, mo.out), .h = h, .attn = at, .rms1 = r1, .rms2 = r2, .q = q, .qr = qr, .moe = mo };
@@ -60,15 +62,21 @@ pub fn decoderLayerAt(b: *Builder, c: Ctx, layer: u32, wb: u32, x: u32, x_int8: 
 /// (A-bit, symmetric data-chosen shift) and an R-bit down projection.
 pub fn denseMlp(b: *Builder, c: Ctx, wb: u32, y: u32) !u32 {
     const cfg = c.cfg;
+    const prev_scope = b.enter("mlp");
+    defer b.scope = prev_scope;
     if (cfg.act_bits == 8) {
+        b.tag("gate");
         const g = try b.matmul(c.ws, y, wb + cfg.wGate());
+        b.tag("up");
         const u = try b.matmul(c.ws, y, wb + cfg.wUp());
-        const act = try b.lookup(g, c.silu);
-        const hm = try b.hadamard(act, u);
+        const hm = try b.gate(g, u, c.silu);
+        b.tag("down");
         return b.matmulBits(c.ws, hm, wb + cfg.wDown(), null, cfg.residBits());
     }
     const A = cfg.actBits();
+    b.tag("gate");
     const g = try b.matmulBits(c.ws, y, wb + cfg.wGate(), null, A);
+    b.tag("up");
     const u = try b.matmulBits(c.ws, y, wb + cfg.wUp(), null, A);
     const n = b.infos.items[g].logSize();
     const half = @as(i64, 1) << (A - 1);
@@ -76,6 +84,7 @@ pub fn denseMlp(b: *Builder, c: Ctx, wb: u32, y: u32) !u32 {
     const av = try b.a.alloc(i32, b.wit.items[g].len);
     for (b.wit.items[g], av) |v, *o| o.* = tab[@intCast(v + half)];
     const info = b.infos.items[g];
+    b.tag("silu");
     const act = try b.add(info, av);
     try b.key(n, try b.expr(&.{term(1, Ref.w(g), &.{ids(0, n)})}, half), try b.expr(&.{term(1, Ref.w(act), &.{ids(0, n)})}, 0), .{ .lookup = c.silu_x.? });
     // hadamard shift: chooseShiftSym(act * u, A) in record mode (the plan's
@@ -88,7 +97,9 @@ pub fn denseMlp(b: *Builder, c: Ctx, wb: u32, y: u32) !u32 {
         sh = chooseShiftSym(acc, A);
     }
     sh = try b.nextShift(sh);
+    b.tag("glu");
     const hm = try b.einsumRequant(info, Ref.w(act), Ref.w(u), 0, &.{ids(0, n)}, &.{ids(0, n)}, sh, A);
+    b.tag("down");
     return b.matmulBits(c.ws, hm, wb + cfg.wDown(), null, cfg.residBits());
 }
 
@@ -98,7 +109,10 @@ pub const AttnBlockOut = struct { h: u32, attn: AttnOut, rms1: RmsOut, rms2: Rms
 /// input RMSNorm(h) (rms2.y). Weights wb + wQ.. wb + wO.
 pub fn attnBlock(b: *Builder, c: Ctx, layer: u32, wb: u32, x: u32, x_int8: bool) !AttnBlockOut {
     const cfg = c.cfg;
+    const prev_scope = b.enter("rms1");
+    defer b.scope = prev_scope;
     const r1 = try rmsnorm(b, c, x, c.gammas[2 * layer], x_int8);
+    b.scope = "attn.proj";
     const y1 = r1.y;
     var q: u32 = undefined;
     var k: u32 = undefined;
@@ -111,6 +125,7 @@ pub fn attnBlock(b: *Builder, c: Ctx, layer: u32, wb: u32, x: u32, x_int8: bool)
     var vfix: []const u8 = &.{};
     if (cfg.fused_qkv) {
         // columns: Q [0, D), K [D, D + Dkv), V [D + Dkv, D + 2 Dkv)
+        b.tag("qkv");
         const qkv = try b.matmulBits(c.ws, y1, wb + cfg.wQ(), null, cfg.actBits());
         const D = @as(usize, 1) << @intCast(cfg.log_d);
         const Dkv = @as(usize, 1) << @intCast(cfg.logDkv());
@@ -122,15 +137,21 @@ pub fn attnBlock(b: *Builder, c: Ctx, layer: u32, wb: u32, x: u32, x_int8: bool)
         k = qkv;
         v = qkv;
     } else {
+        b.tag("q");
         q = try b.matmulBits(c.ws, y1, wb + cfg.wQ(), null, cfg.actBits());
+        b.tag("k");
         k = try b.matmulBits(c.ws, y1, wb + cfg.wK(), null, cfg.actBits());
+        b.tag("v");
         v = try b.matmulBits(c.ws, y1, wb + cfg.wV(), null, cfg.actBits());
     }
     const qr = try rope(b, c, q, cfg.log_heads, qfix);
     const kr = try rope(b, c, k, cfg.log_kv_heads, kfix);
     const at = try attention(b, c, qr, kr, v, vfix);
+    b.tag("wo");
     const ao = try b.matmulBits(c.ws, at.o, wb + cfg.wO(), null, cfg.residBits());
+    b.scope = "residual";
     const h = try residual(b, x, ao);
+    b.scope = "rms2";
     const r2 = try rmsnorm(b, c, h, c.gammas[2 * layer + 1], false);
     return .{ .h = h, .attn = at, .rms1 = r1, .rms2 = r2, .q = q, .qr = qr };
 }
@@ -140,11 +161,17 @@ pub fn attnBlock(b: *Builder, c: Ctx, layer: u32, wb: u32, x: u32, x_int8: bool)
 /// b.io_in / b.io_out, lineqs witness == public.
 pub fn buildStack(b: *Builder, c: Ctx, x_in: []const i32) !LayerOut {
     const n_in = c.cfg.log_t + c.cfg.log_d;
+    const prev_scope = b.enter("input");
+    b.tag("x");
     var x = try b.add(TensorInfo.mat(c.cfg.log_t, c.cfg.log_d), try b.a.dupe(i32, x_in));
+    b.scope = prev_scope;
     b.io_in = try b.public(n_in, x_in);
     try b.lineq(n_in, try b.expr(&.{ term(1, Ref.w(x), &.{ids(0, n_in)}), term(-1, Ref.p(b.io_in.?), &.{ids(0, n_in)}) }, 0));
     var o: LayerOut = undefined;
     for (0..c.cfg.n_layers) |l| {
+        b.cur_layer = @intCast(l);
+        b.cur_moe = c.cfg.isMoe();
+        defer b.cur_layer = null;
         o = try decoderLayer(b, c, @intCast(l), x, l == 0);
         x = o.out;
     }

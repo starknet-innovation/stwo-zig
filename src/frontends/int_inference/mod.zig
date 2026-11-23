@@ -31,6 +31,7 @@ pub const serve = @import("serve.zig");
 pub const lm = @import("lm.zig");
 pub const wire = @import("wire.zig");
 pub const canonical = @import("canonical.zig");
+pub const ledger = @import("ledger.zig");
 
 test "api signature: integer-inference facade exposes the protocol, statement and wire namespaces" {
     comptime {
@@ -73,12 +74,15 @@ test {
         // reached through wide_test before the file split
         _ = @import("ext_test.zig");
         _ = @import("transformer_test.zig");
+        _ = @import("transformer_lever_test.zig");
         return;
     }
     _ = @import("qmul_check_test.zig");
     _ = @import("matmul_kernel_test.zig");
     _ = @import("review_pcs_test.zig");
     _ = @import("review_fix_test.zig");
+    _ = @import("wide_slack_test.zig");
+    _ = @import("wide_slack_adv_test.zig");
     _ = @import("zk_review_test.zig");
     _ = @import("review_serve_test.zig");
     _ = @import("review_lm_test.zig");
@@ -103,6 +107,7 @@ test {
     _ = @import("ext_test.zig");
     _ = transformer;
     _ = @import("transformer_test.zig");
+    _ = @import("transformer_lever_test.zig");
     _ = prep;
     _ = recycle;
     _ = accel;
@@ -122,6 +127,7 @@ test {
     _ = @import("security_test.zig");
     _ = serve;
     _ = lm;
+    _ = ledger;
     _ = @import("lm_test.zig");
     _ = wire;
     _ = @import("wire_test.zig");
