@@ -53,6 +53,31 @@ pub const Builder = struct {
     io_in: ?u32 = null,
     io_out: ?u32 = null,
     model_digest: ?[32]u8 = null,
+    /// witness ledger (ledger.zig): one label per witness
+    /// tensor, aligned with `infos`. Diagnostic only: never part of the
+    /// statement or the transcript.
+    labels: std.ArrayList(Label) = .empty,
+    /// current ledger scope (block: "attn", "rms1", "mlp", ...)
+    scope: []const u8 = "other",
+    /// one-shot name for the next added tensor (overrides its op kind)
+    next_name: ?[]const u8 = null,
+    /// current decoder layer (null outside the layers) and whether it is MoE
+    cur_layer: ?u32 = null,
+    cur_moe: bool = false,
+
+    pub const Label = struct { scope: []const u8, name: []const u8, sub: []const u8 = "", layer: ?u32 = null, moe: bool = false };
+
+    /// Sets the ledger scope; returns the previous one (restore with defer).
+    pub fn enter(self: *Builder, scope: []const u8) []const u8 {
+        const prev = self.scope;
+        self.scope = scope;
+        return prev;
+    }
+
+    /// Names the next added witness tensor in the ledger.
+    pub fn tag(self: *Builder, n: []const u8) void {
+        self.next_name = n;
+    }
 
     pub fn init(a: std.mem.Allocator, pool: *f.Pool) Builder {
         return .{ .a = a, .arena = std.heap.ArenaAllocator.init(a), .pool = pool };
@@ -69,6 +94,7 @@ pub const Builder = struct {
         self.xtables.deinit(a);
         self.tables.deinit(a);
         self.weight_infos.deinit(a);
+        self.labels.deinit(a);
         for (self.core_accs.items) |x| if (x) |v| a.free(v);
         self.core_accs.deinit(a);
         for (self.ext_accs.items) |x| if (x) |v| a.free(v);
@@ -161,6 +187,12 @@ pub const Builder = struct {
 
     /// Takes ownership of `data` (allocated with self.a).
     pub fn add(self: *Builder, info_in: TensorInfo, data: []i32) !u32 {
+        return self.addKind(info_in, data, "raw", "");
+    }
+
+    /// As `add`, with the ledger kind of the producing op (the label is the
+    /// current scope and the pending `name`, else `kind`).
+    pub fn addKind(self: *Builder, info_in: TensorInfo, data: []i32, kind: []const u8, sub: []const u8) !u32 {
         // Zig may pass `info_in` by reference, and callers pass elements of
         // `self.infos` (which ensureUnusedCapacity may reallocate). Copy the
         // bytes explicitly before growing the list; a plain `const info =
@@ -171,7 +203,10 @@ pub const Builder = struct {
         std.debug.assert(data.len == info.size());
         try self.infos.ensureUnusedCapacity(self.a, 1);
         try self.wit.ensureUnusedCapacity(self.a, 1);
+        try self.labels.ensureUnusedCapacity(self.a, 1);
         self.infos.appendAssumeCapacity(info);
+        self.labels.appendAssumeCapacity(.{ .scope = self.scope, .name = self.next_name orelse kind, .sub = sub, .layer = self.cur_layer, .moe = self.cur_moe });
+        if (sub.len == 0 or std.mem.eql(u8, sub, "hi")) self.next_name = null;
         try self.wit.append(self.a, data);
         return @intCast(self.wit.items.len - 1);
     }
@@ -215,7 +250,7 @@ pub const Builder = struct {
             }
             o.* = q;
         }
-        const id = try self.add(info, y);
+        const id = try self.addKind(info, y, "einsum.rq", "");
         e.y = id;
         e.shift = s;
         e.out_bits = out_bits;
@@ -240,8 +275,8 @@ pub const Builder = struct {
                 }
                 o.* = @intCast(v);
             }
-            id = try self.add(inf, y);
-        }
+            id = try self.addKind(inf, y, "einsum.exact", "");
+        } else self.next_name = null;
         e.y = id;
         try self.pushXop(.{ .einsum = e }, null);
         return id;
@@ -269,10 +304,28 @@ pub const Builder = struct {
         return xt.materializePar(self.a, self.pool, self.statement(), self.view(), e, n);
     }
 
-    /// expr in [0, 2^bits) over {0,1}^n. Above 16 bits: committed 16-bit limbs
-    /// lo, hi with expr == lo + 2^16 hi (lineq) and range keys on both.
+    /// expr in [0, 2^bits) over {0,1}^n. Up to 16 bits: one key into
+    /// range(bits). Above 16 bits, when `wideKeyDirect(n, bits)`: one key of
+    /// the (virtual) expression into range(bits), nothing committed
+    /// (ledger.md, "wide slack key"). Otherwise: committed 16-bit limbs lo,
+    /// hi with expr == lo + 2^16 hi (lineq) and range keys on both. The
+    /// choice depends only on (n, bits), which the verifier rebuilds from
+    /// the model description, so the statement stays deterministic.
     pub fn rangeWide(self: *Builder, n: u32, e: xt.Expr, bits: u32) !void {
-        if (bits <= 16) return self.key(n, e, null, .{ .range = @intCast(bits) });
+        if (bits <= 16) {
+            self.next_name = null;
+            return self.key(n, e, null, .{ .range = @intCast(bits) });
+        }
+        if (wideKeyDirect(n, bits)) {
+            // honest-prover refusal, as in the limb path
+            if (!self.shape_only) {
+                const v = try self.materialize(e, n);
+                defer self.a.free(v);
+                for (v) |x| if (x < 0 or x >= (@as(i64, 1) << @intCast(bits))) return error.ValueOutOfRange;
+            }
+            self.next_name = null;
+            return self.key(n, e, null, .{ .range = @intCast(bits) });
+        }
         std.debug.assert(bits <= 32);
         const v = try self.materialize(e, n);
         defer self.a.free(v);
@@ -287,8 +340,9 @@ pub const Builder = struct {
             l.* = @intCast(x & 0xffff);
             h.* = @intCast(x >> 16);
         }
-        const lo_id = try self.addVec(n, lo);
-        const hi_id = try self.addVec(n, hi);
+        if (self.next_name == null) self.next_name = "range.limb";
+        const lo_id = try self.addKind(TensorInfo.vec(n), lo, "range.limb", "lo");
+        const hi_id = try self.addKind(TensorInfo.vec(n), hi, "range.limb", "hi");
         try self.key(n, try self.expr(&.{term(1, Ref.w(lo_id), &.{ids(0, n)})}, 0), null, .{ .range = 16 });
         try self.key(n, try self.expr(&.{term(1, Ref.w(hi_id), &.{ids(0, n)})}, 0), null, .{ .range = @intCast(bits - 16) });
         const terms = try self.arena.allocator().alloc(xt.Term, e.terms.len + 2);
@@ -296,6 +350,14 @@ pub const Builder = struct {
         terms[e.terms.len] = term(-1, Ref.w(lo_id), &.{ids(0, n)});
         terms[e.terms.len + 1] = term(-65536, Ref.w(hi_id), &.{ids(0, n)});
         try self.lineq(n, .{ .terms = terms, .constant = e.constant });
+    }
+
+    /// rangeWide's single-key rule above 16 bits: the range(bits) table fits
+    /// (bits <= MAX_TABLE_BITS) and the key count 2^n is at least 4 x the
+    /// table (n >= bits + 2), so the 2^bits multiplicity column costs at most
+    /// 1/4 of the two limb columns it replaces.
+    pub fn wideKeyDirect(n: u32, bits: u32) bool {
+        return bits > 16 and bits <= xt.MAX_TABLE_BITS and n >= bits + 2;
     }
 
     /// Signed range: x + 2^(bits-1) in [0, 2^bits) (elementwise, all bits of x).
@@ -320,7 +382,7 @@ pub const Builder = struct {
             self.a.free(xs);
             return e;
         };
-        const id = try self.add(info, xs);
+        const id = try self.addKind(info, xs, "requant.out", "");
         try self.key(n, try self.expr(&.{ term(1, Ref.w(x), &.{ids(0, n)}), term(-(@as(i64, 1) << s), Ref.w(id), &.{ids(0, n)}) }, @as(i64, 1) << (s - 1)), null, .{ .range = s });
         try self.rangeSigned(id, bits);
         return id;
@@ -360,7 +422,7 @@ pub const Builder = struct {
             self.a.free(y);
             return e;
         };
-        const id = try self.add(TensorInfo.mat(xi.log_dims[0], ws.infos[w].log_dims[1]), y);
+        const id = try self.addKind(TensorInfo.mat(xi.log_dims[0], ws.infos[w].log_dims[1]), y, "matmul.out", "");
         acc_owned = false;
         try self.pushOp(.{ .matmul = .{ .x = x, .w = w, .y = id, .shift = s, .out_bits = out_bits } }, acc);
         return id;
@@ -375,7 +437,7 @@ pub const Builder = struct {
         const out = try self.a.alloc(i32, self.wit.items[x].len);
         for (self.wit.items[x], out) |v, *o| o.* = self.tables.items[table].values[@intCast(v + 128)];
         const info = self.infos.items[x]; // copy: add() may reallocate infos
-        const id = try self.add(info, out);
+        const id = try self.addKind(info, out, "lookup.out", "");
         try self.pushOp(.{ .lookup = .{ .in = x, .out = id, .table = table } }, null);
         return id;
     }
@@ -394,9 +456,51 @@ pub const Builder = struct {
             return e;
         };
         const info = self.infos.items[x]; // copy: add() may reallocate infos
-        const id = try self.add(info, out);
+        const id = try self.addKind(info, out, "hadamard.out", "");
         acc_owned = false;
         try self.pushOp(.{ .hadamard = .{ .a = x, .b = y, .y = id, .shift = s } }, acc);
         return id;
+    }
+
+    /// Fused SwiGLU gate h = clamp8(rq_s(table(g) * u)) as ONE glu triple
+    /// lookup (proto Op.glu): the activation table(g) and the product are
+    /// never committed, only h. The shift is the hadamard's (same plan slot,
+    /// same model.chooseShift on the same accumulator), and checkInt8 keeps
+    /// the honest refusal, so the clamp is the identity and h equals the
+    /// `lookup(g, table)` + `hadamard(act, u)` output bit for bit.
+    pub fn glu(self: *Builder, g: u32, u: u32, table: u32) !u32 {
+        const n = self.wit.items[g].len;
+        const tv = self.tables.items[table].values;
+        const acc = try self.a.alloc(i64, n);
+        defer self.a.free(acc);
+        for (self.wit.items[g], self.wit.items[u], acc) |vg, vu, *o| o.* = @as(i64, tv[@intCast(vg + 128)]) * vu;
+        const s = try self.nextShift(if (self.replaying()) 0 else model.chooseShift(acc));
+        const out = try self.a.alloc(i32, n);
+        for (acc, out) |v, *o| o.* = proto.requant(v, s);
+        // honest refusal unchanged (replay outside the calibrated model);
+        // after it the clamp of the glu table is the identity on real data
+        self.checkInt8(out) catch |e| {
+            self.a.free(out);
+            return e;
+        };
+        for (out) |*o| o.* = std.math.clamp(o.*, -128, 127);
+        const info = self.infos.items[g]; // copy: add() may reallocate infos
+        const id = try self.addKind(info, out, "glu.out", "");
+        try self.pushOp(.{ .glu = .{ .g = g, .u = u, .h = id, .table = table, .shift = s } }, null);
+        return id;
+    }
+
+    /// The int8 SwiGLU gate: the fused glu triple when g has >= 2^16
+    /// elements (the glu table has 2^16 rows, so it pays for itself), else
+    /// the committed SiLU lookup + hadamard pair (small shapes, pinned).
+    pub fn gate(self: *Builder, g: u32, u: u32, table: u32) !u32 {
+        if (self.wit.items[g].len >= tf.GLU_MIN_NUMEL) {
+            self.tag("glu");
+            return self.glu(g, u, table);
+        }
+        self.tag("silu");
+        const act = try self.lookup(g, table);
+        self.tag("glu");
+        return self.hadamard(act, u);
     }
 };

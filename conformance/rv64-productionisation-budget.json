@@ -1560,6 +1560,13 @@
       "positive_growth_justification": "Issue 436 gives the existing isolated RISC-V timing lane a UTC advisory expiry in the focused planner and verifies the boundary. Keep the benchmark roster, commands and thresholds intact. No proof or runtime change."
     },
     {
+      "id": "int_inference_witness_volume_levers_issue438",
+      "net_code_budget": 1577,
+      "flags_added_budget": 0,
+      "scripts_added_budget": 0,
+      "positive_growth_justification": "Owner-approved protocol revision 0.2.0 of the int-inference frontend: the three reviewed witness-volume levers from the archive (virtual attention D with a factored argmax selector, the wide slack key, the fused SwiGLU gate) and the witness ledger that measures them. Decoder layer 512 tokens: 48.3M -> 34.9M committed elements (-27.8%), witness commitment -45%, proof about -15%. Growth is the levers, their adversarial tests and the ledger; no flag or script (the archived TENSOR_LEDGER switches and ledger_project.py are not ported)."
+    },
+    {
       "id": "int_inference_tiled_matmul_issue438",
       "net_code_budget": 116,
       "flags_added_budget": 0,

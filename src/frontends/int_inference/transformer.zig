@@ -8,6 +8,7 @@ const std = @import("std");
 const f = @import("field.zig");
 const proto = @import("protocol.zig");
 const xt = @import("ext.zig");
+const prep = @import("prep.zig");
 const model = @import("model.zig");
 
 const TensorInfo = proto.TensorInfo;
@@ -44,6 +45,10 @@ pub fn term(c: i64, r: Ref, parts: []const []const u8) xt.Term {
 }
 
 /// Smallest s >= 1 with requant(acc, s) in [-2^(ob-1), 2^(ob-1)) for all entries.
+/// Builder.gate fuses SiLU + hadamard into one glu triple lookup at and
+/// above this many gate elements (the glu table's 2^16 rows).
+pub const GLU_MIN_NUMEL: usize = 1 << 16;
+
 pub fn chooseShiftBits(acc: []const i64, ob: u5) !u5 {
     var mx: i64 = 0;
     var mn: i64 = 0;

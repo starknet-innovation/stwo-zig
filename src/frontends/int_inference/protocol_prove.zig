@@ -11,6 +11,7 @@ const eqsum = @import("eqsum.zig");
 const accel = @import("accel.zig");
 const Transcript = @import("transcript.zig").Transcript;
 const xt = @import("ext.zig");
+const ledger = @import("ledger.zig");
 const M31 = f.M31;
 const QM31 = f.QM31;
 const lookups = engine.lookups;
@@ -547,6 +548,9 @@ pub fn proveCore(
     else
         .{ .flat = try pcs.open(i32, a, pool, &tr, cfg.pcs, &wcom, wm, wgroups, true) };
     timings.witness_open_ns = nowNs(t0);
+    // witness ledger (diagnostic, when a caller sets ledger.sink): reads the committed
+    // tensors after the proof is complete; never touches the transcript
+    if (ledger.sink) |lg| try lg.capture(st, rel, all, .{ .log_total = lay.log_total, .used = lay.used, .log_rows = split.lr, .log_cols = split.lc, .rows_used = w_ru }, wopen.byteSize());
 
     tr_io.* = tr;
     weight_claims_out.* = weight_claims;
@@ -566,4 +570,32 @@ pub fn proveCore(
         .weight_opening = null,
         .ext = .{ .values = try ext_values.toOwnedSlice(a), .sumchecks = try ext_sumchecks.toOwnedSlice(a), .finals = try ext_finals.toOwnedSlice(a) },
     };
+}
+
+/// Witness ledger without proving (ledger.zig): the committed tensors of
+/// `proveCore` (witness, multiplicities) and the witness-table layout,
+/// computed by the same steps, with no commitment and no transcript. For
+/// shapes whose full proof exceeds the host's memory.
+pub fn witnessLedger(a: std.mem.Allocator, pool: *f.Pool, cfg: Config, st: Statement, witness: []const []const i32, acc: []const ?[]i64, ext_acc: ?[]const ?[]const i64, lg: *ledger.Ledger) !void {
+    var rel = try deriveRelations(a, st);
+    defer rel.deinit(a);
+    try checkLogUpCounts(rel);
+    var eps = try xt.proverInitWith(a, pool, st, witness, ext_acc);
+    defer eps.deinit(a);
+    const mults = try multiplicities(a, pool, st, rel, witness, acc, &eps);
+    defer {
+        for (mults) |m| a.free(m);
+        a.free(mults);
+    }
+    const ext = try extendedInfos(a, st, rel);
+    defer a.free(ext);
+    const all = try a.alloc([]const i32, ext.len);
+    defer a.free(all);
+    for (witness, 0..) |w, i| all[i] = w;
+    for (mults, 0..) |m, i| all[witness.len + i] = m;
+    const lay = try layout(a, ext, &.{});
+    defer a.free(lay.offsets);
+    const split = witnessSplit(cfg, lay.log_total, lay.used);
+    const w_ru = (lay.used + (@as(usize, 1) << @intCast(split.lc)) - 1) >> @intCast(split.lc);
+    try lg.capture(st, rel, all, .{ .log_total = lay.log_total, .used = lay.used, .log_rows = split.lr, .log_cols = split.lc, .rows_used = w_ru }, 0);
 }

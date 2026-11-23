@@ -1,7 +1,7 @@
 {
   "schema": "stwo-zig-package-contract-v2",
   "package": "stwo_int_inference_frontend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "layer": "frontend",
   "owner": "int-inference-frontend",
   "public_modules": {
@@ -24,6 +24,7 @@
     "eqsum",
     "ext",
     "field",
+    "ledger",
     "linalg",
     "lm",
     "model",
@@ -51,6 +52,7 @@
     ],
     "invariant_tests": [
       "canonical_proof_test.zig::KERN-1 canonicity: flat-PCS decoder layer, every transmitted field class rejects a limb >= P",
+      "ledger.zig::ledger: every witness tensor labelled, proofs unchanged with the ledger on",
       "model.zig::mlp block proves and verifies; tampering rejected",
       "pcs2_test.zig::pcs2 depth 2 roundtrip and tampering",
       "proof_digest.zig::proof digest is pinned under the recommended config (pcs2 + batched matmuls)",
@@ -59,8 +61,13 @@
       "review_lm_test.zig::regression LM-1: X = Emb[prompt || y[0..P-1)] from the committed Emb; an unrelated window is rejected",
       "security_test.zig::end-to-end accounting of a product proof: more queries, more bits",
       "serve.zig::per-request proofs with one shared weight opening: every request verifies; tampering rejected",
+      "transformer_lever_test.zig::fused glu (checker): up output wrapped mod p with an in-range field remainder is rejected by the glu int8 domain",
+      "transformer_lever_test.zig::fused glu: verifier rejects h + 1, a moved g with u fixed, and g / u outside int8 (unchecked prover)",
+      "transformer_lever_test.zig::verifier rejects forged factored argmax selectors / virtual-D maxima (unchecked prover)",
       "transformer_test.zig::golden decoder layer digests (flat; pcs2 + batched matmuls + MoE), 1 vs 5 threads",
       "weight_key.zig::weight key: range proof verifies, tampering rejected",
+      "wide_slack_adv_test.zig::wide slack adv: edges accepted, every out-of-range value rejected by the verifier",
+      "wide_slack_adv_test.zig::wide slack adv: virtual key expression that can wrap mod p is refused",
       "wire_test.zig::wire fuzz: mutated product / mlp / layer proofs and keys are rejected cleanly",
       "wire_test.zig::wire: product / mlp / layer roundtrip byte-identically and verify from bytes",
       "zk_layer_test.zig::zk pinned seeded hiding digests (product flat/rec, mlp virtual rec, decoder layer)",
@@ -81,14 +88,14 @@
     ]
   },
   "budget": {
-    "code_files": 102,
-    "code_lines": 34365,
+    "code_files": 106,
+    "code_lines": 35942,
     "generated_code_files": 0,
     "generated_code_lines": 0,
     "script_files": 0,
-    "api_entries": 29,
+    "api_entries": 30,
     "dependencies": 2,
     "rv64_registry_flags": 0,
-    "versioned_files": 105
+    "versioned_files": 109
   }
 }

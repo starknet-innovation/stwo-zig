@@ -12,7 +12,7 @@ a later slice of issue #438) owns command-line tools and benchmarks.
 
 | Property | Value |
 | --- | --- |
-| Version | `0.1.0` |
+| Version | `0.2.0` |
 | Layer | `frontend` |
 | Owner | `int-inference-frontend` |
 | Public Zig module | `stwo_int_inference_frontend` |
@@ -75,6 +75,9 @@ The facade exposes these namespaces:
   `serve`, `proof_digest`, `wire`.
 - Hiding variants: `zk`, `zk_pcs`, `zk_pcs2`, `zk_sumcheck`.
 - Soundness accounting: `security`.
+- Witness accounting: `ledger` (committed tensors and LogUp leaves per
+  label; a caller sets `ledger.sink` around a prove call, and proofs are
+  unchanged with it on).
 - Device hook: `accel`.
 
 Verifiers must build statements themselves (`model.mlpStatement`,
@@ -118,6 +121,13 @@ to its facade, in the challenge-field branch where its tests apply.
   arithmetic. Core field arithmetic is defined on canonical values only.
 - Statistical hiding tests draw prover randomness from a seed derived from
   the test name (`zk.testSeedFor`); production proofs always use OS entropy.
+- Witness volume (protocol 0.2.0): attention keeps D virtual (the exp key
+  reads m - S - Bias) and uses a factored argmax selector (A ⊗ B one-hots);
+  a wide range above 16 bits is one key into range(bits) when the rule
+  `wideKeyDirect(n, bits)` allows it (nothing committed), else 16-bit limbs;
+  and the SwiGLU gate is one glu triple lookup at ≥ 2^16 gate elements.
+  The rules depend only on shapes the verifier rebuilds from the model
+  description. Version 0.2.0 changes proof bytes relative to 0.1.0.
 - The weight-key denominators are materialised for the GKR prover; the archived
   lazy-regeneration hook in the shared GKR prover was not ported.
 
@@ -139,5 +149,6 @@ The invariant tests listed in `package.contract.json` pin these rules.
 - [Security accounting](../../../design/tensor-frontend/security.md)
 - [Hiding protocol](../../../design/tensor-frontend/zk.md)
 - [Wire format](../../../design/tensor-frontend/wire.md)
+- [Witness ledger and volume levers](../../../design/tensor-frontend/ledger.md)
 - [Frontends index](../README.md)
 - Issue #438 tracks the port; the archived branch head is `97dc093f2`.

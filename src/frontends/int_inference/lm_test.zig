@@ -9,6 +9,7 @@ const serve = @import("serve.zig");
 const ModelCfg = @import("lm.zig").ModelCfg;
 const ModelDesc = @import("lm.zig").ModelDesc;
 const ModelOut = @import("lm_build.zig").ModelOut;
+const Request = @import("lm.zig").Request;
 const TensorInfo = proto.TensorInfo;
 const TestRequest = @import("lm.zig").TestRequest;
 const buildModel = @import("lm_build.zig").buildModel;
@@ -661,4 +662,52 @@ test "wide widths: statement validation rejects shapes that could wrap" {
     cfg.log_f = 8;
     cfg.weight_log_cols = 8;
     try testing.expectError(error.BadConfig, wideStatement(a, &pool, cfg));
+}
+
+test "fused glu gate in the model (dense, stacked and per-expert MoE): verifier-built statement matches; per-request proof verifies" {
+    const a = testing.allocator;
+    var pool: f.Pool = undefined;
+    try pool.init(a, 4);
+    defer pool.deinit();
+    // dense T F = 2^16; stacked MoE E C Fe = 2^16; per-expert C Fe = 2^16
+    var base = SmallModel;
+    base.log_t = 4;
+    base.log_f = 12;
+    base.log_capacity = 4;
+    for ([_]bool{ true, false }) |stacked| {
+        var cfg = base;
+        cfg.stacked_experts = stacked;
+        cfg.log_f_expert = if (stacked) 11 else 12;
+        var pc = testPc();
+        pc.weight_log_cols = cfg.weight_log_cols;
+        var sw = try setupWeights(a, &pool, cfg, pc, 2100);
+        defer {
+            sw.ws.deinit(a);
+            for (sw.wdata) |w| a.free(w);
+            a.free(sw.wdata);
+            a.free(sw.winfos);
+        }
+        var desc = try testDesc(a, &pool, cfg, &sw.ws, 3);
+        defer desc.deinit(a);
+        var rq = try TestRequest.init(a, &pool, &desc, &sw.ws, 91);
+        defer rq.deinit(a);
+        const st = rq.b.statement();
+        var n_glu: usize = 0;
+        var n_had: usize = 0;
+        for (st.ops) |op| {
+            n_glu += @intFromBool(op == .glu);
+            n_had += @intFromBool(op == .hadamard);
+        }
+        // one dense layer + one MoE layer (stacked: one glu; per expert: E glus)
+        try testing.expectEqual(@as(usize, if (stacked) 2 else 3), n_glu);
+        try testing.expectEqual(@as(usize, 0), n_had);
+        const req = Request{ .prompt = rq.prompt, .y = rq.y };
+        try checkRequestStatement(a, &pool, pc, proto.weightKey(&sw.ws), &desc, req, st);
+        const wv = try rq.b.witnessView(a);
+        defer a.free(wv);
+        const reqs = [_]serve.Request{.{ .st = st, .witness = wv, .salt = serve.testSalt(7) }};
+        var batch = try serve.proveRequests(a, &pool, pc, &sw.ws, &reqs, null);
+        defer batch.deinit(a);
+        try verifyRequest(a, &pool, pc, proto.weightKey(&sw.ws), &desc, req, &batch.requests[0], &batch.shared, 0);
+    }
 }
