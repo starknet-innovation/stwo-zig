@@ -1,0 +1,94 @@
+{
+  "schema": "stwo-zig-package-contract-v2",
+  "package": "stwo_int_inference_frontend",
+  "version": "0.1.0",
+  "layer": "frontend",
+  "owner": "int-inference-frontend",
+  "public_modules": {
+    "stwo_int_inference_frontend": "mod.zig"
+  },
+  "dependencies": {
+    "stwo_core": "../../waist/core",
+    "stwo_prover_engine": "../../engine/prover"
+  },
+  "injected_modules": [
+    "int_inference_options"
+  ],
+  "api_surface": [
+    "accel",
+    "batch",
+    "batch_eq",
+    "batch_sumcheck",
+    "canonical",
+    "digest",
+    "eqsum",
+    "ext",
+    "field",
+    "linalg",
+    "lm",
+    "model",
+    "pcs",
+    "pcs2",
+    "prep",
+    "proof_digest",
+    "protocol",
+    "recycle",
+    "security",
+    "serve",
+    "sumcheck",
+    "transcript",
+    "transformer",
+    "weight_key",
+    "wire",
+    "zk",
+    "zk_pcs",
+    "zk_pcs2",
+    "zk_sumcheck"
+  ],
+  "api_contract": {
+    "signature_tests": [
+      "mod.zig::api signature: integer-inference facade exposes the protocol, statement and wire namespaces"
+    ],
+    "invariant_tests": [
+      "canonical_proof_test.zig::KERN-1 canonicity: flat-PCS decoder layer, every transmitted field class rejects a limb >= P",
+      "model.zig::mlp block proves and verifies; tampering rejected",
+      "pcs2_test.zig::pcs2 depth 2 roundtrip and tampering",
+      "proof_digest.zig::proof digest is pinned under the recommended config (pcs2 + batched matmuls)",
+      "review_fix_test.zig::P1/P2: decoder layer statements are built by the verifier from (ModelConfig, x, y); other inputs, outputs, configs rejected",
+      "review_kern_test.zig::review-kern: non-canonical QM31.mul operands are excluded by the canonical-input contract",
+      "review_lm_test.zig::regression LM-1: X = Emb[prompt || y[0..P-1)] from the committed Emb; an unrelated window is rejected",
+      "security_test.zig::end-to-end accounting of a product proof: more queries, more bits",
+      "serve.zig::per-request proofs with one shared weight opening: every request verifies; tampering rejected",
+      "transformer_test.zig::golden decoder layer digests (flat; pcs2 + batched matmuls + MoE), 1 vs 5 threads",
+      "weight_key.zig::weight key: range proof verifies, tampering rejected",
+      "wire_test.zig::wire fuzz: mutated product / mlp / layer proofs and keys are rejected cleanly",
+      "wire_test.zig::wire: product / mlp / layer roundtrip byte-identically and verify from bytes",
+      "zk_layer_test.zig::zk pinned seeded hiding digests (product flat/rec, mlp virtual rec, decoder layer)",
+      "zk_test.zig::zk product: proves, verifies, rejects tampering, randomized"
+    ]
+  },
+  "ci": {
+    "lane": "int_inference_frontend",
+    "host": "linux",
+    "command": [
+      "zig",
+      "build",
+      "test",
+      "--build-file",
+      "src/frontends/int_inference/build.zig",
+      "-Doptimize=ReleaseFast",
+      "-j2"
+    ]
+  },
+  "budget": {
+    "code_files": 101,
+    "code_lines": 34249,
+    "generated_code_files": 0,
+    "generated_code_lines": 0,
+    "script_files": 0,
+    "api_entries": 29,
+    "dependencies": 2,
+    "rv64_registry_flags": 0,
+    "versioned_files": 104
+  }
+}

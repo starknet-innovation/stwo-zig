@@ -211,6 +211,18 @@
       "owner_module": "legacy_riscv_cpu_integration"
     },
     {
+      "id": "package:stwo_int_inference_frontend",
+      "root": "src/frontends/int_inference/contract_tests/stwo_core_test.zig",
+      "route": "dependency:stwo_core",
+      "imports": [
+        "stwo_core",
+        "waist_consumer_laws"
+      ],
+      "tests": [
+        "cdc: stwo_int_inference_frontend field authority preserves inverse and zero refusal"
+      ]
+    },
+    {
       "id": "package:stwo_metal_backend",
       "root": "src/backends/metal/contract_tests/stwo_core_test.zig",
       "route": "dependency:stwo_core",

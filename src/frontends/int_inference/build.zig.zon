@@ -1,0 +1,11 @@
+.{
+    .fingerprint = 0x23a2a1ad5dfb58df,
+    .name = .stwo_int_inference_frontend,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.2",
+    .paths = .{"."},
+    .dependencies = .{
+        .stwo_core = .{ .path = "../../waist/core" },
+        .stwo_prover_engine = .{ .path = "../../engine/prover" },
+    },
+}

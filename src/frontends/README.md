@@ -9,6 +9,7 @@ public API and the appropriate semantic checks.
 | [Cairo](cairo/README.md) | `stwo_cairo_frontend` |
 | [Circuit recursion](circuit/README.md) | `stwo_circuit_frontend` |
 | [RISC-V](riscv/README.md) | `stwo_riscv_frontend` with separate [RV32](riscv/rv32/README.md) and [RV64](riscv/rv64/README.md) packages |
+| [Integer inference](int_inference/README.md) | `stwo_int_inference_frontend` (CPU; tensor product tooling is a later slice) |
 | [SM83](sm83/README.md) | `stwo_sm83_frontend` |
 
 [Integrations](../integrations/README.md) own backend-specific assembly.
