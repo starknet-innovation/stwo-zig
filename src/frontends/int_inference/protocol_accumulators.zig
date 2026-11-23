@@ -49,6 +49,50 @@ pub fn matmulAcc(a: std.mem.Allocator, pool: *f.Pool, xi: TensorInfo, x: []const
         matmulAccWide(pool, x, wm, acc, T, K, N);
         return acc;
     }
+    if (T % TILE_T == 0 and N % TILE_N == 0) {
+        matmulAccTiled(pool, x, wm, acc, T, K, N);
+        return acc;
+    }
+    matmulAccRows(pool, x, wm, acc, K, N, T);
+    return acc;
+}
+
+/// Register tile of the i32 matmul kernel: TILE_T tokens x TILE_N columns of
+/// accumulators stay in registers across the whole K loop, so each weight
+/// vector is loaded and widened once per TILE_T tokens and no partial sums
+/// round-trip through memory.
+const TILE_T = 4;
+const TILE_N = 16;
+
+/// acc = x . W in i32 (exact under matmulAcc's bound), tiled TILE_T x TILE_N.
+pub fn matmulAccTiled(pool: *f.Pool, x: []const i32, wm: pcs.Matrix(i8), acc: []i64, T: usize, K: usize, N: usize) void {
+    const Ctx = struct { x: []const i32, w: []const i8, acc: []i64, K: usize, N: usize };
+    const ctx = Ctx{ .x = x, .w = wm.data, .acc = acc, .K = K, .N = N };
+    pool.parallelFor(T / TILE_T, 1, &ctx, struct {
+        fn run(c: *const Ctx, s: usize, e: usize) void {
+            const VI = @Vector(TILE_N, i32);
+            for (s..e) |blk| {
+                const t0 = blk * TILE_T;
+                var n0: usize = 0;
+                while (n0 < c.N) : (n0 += TILE_N) {
+                    var sums: [TILE_T]VI = @splat(@splat(0));
+                    for (0..c.K) |k| {
+                        const wv: VI = c.w[k * c.N + n0 ..][0..TILE_N].*;
+                        inline for (0..TILE_T) |i| sums[i] += @as(VI, @splat(c.x[(t0 + i) * c.K + k])) * wv;
+                    }
+                    inline for (0..TILE_T) |i| {
+                        const arr: [TILE_N]i32 = sums[i];
+                        for (c.acc[(t0 + i) * c.N + n0 ..][0..TILE_N], arr) |*o, v| o.* = v;
+                    }
+                }
+            }
+        }
+    }.run);
+}
+
+/// acc = x . W in i32, one token row at a time (small shapes; the tiled
+/// kernel's reference).
+pub fn matmulAccRows(pool: *f.Pool, x: []const i32, wm: pcs.Matrix(i8), acc: []i64, K: usize, N: usize, T: usize) void {
     const Ctx = struct { x: []const i32, wm: pcs.Matrix(i8), acc: []i64, K: usize, N: usize };
     const ctx = Ctx{ .x = x, .wm = wm, .acc = acc, .K = K, .N = N };
     pool.parallelFor(T, 1, &ctx, struct {
@@ -67,7 +111,6 @@ pub fn matmulAcc(a: std.mem.Allocator, pool: *f.Pool, xi: TensorInfo, x: []const
             }
         }
     }.run);
-    return acc;
 }
 
 /// Batched matmul accumulators: X [E, T, K], W [E, K, N] (as the [E K, N]

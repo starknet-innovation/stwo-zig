@@ -76,6 +76,7 @@ test {
         return;
     }
     _ = @import("qmul_check_test.zig");
+    _ = @import("matmul_kernel_test.zig");
     _ = @import("review_pcs_test.zig");
     _ = @import("review_fix_test.zig");
     _ = @import("zk_review_test.zig");
