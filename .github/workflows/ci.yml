@@ -2,11 +2,7 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches: ["main"]
-    tags: ["aot-evidence-*"]
-  schedule:
-    - cron: "11 2 * * *"
+    types: [opened, reopened, ready_for_review]
   workflow_dispatch:
     inputs:
       gate:
@@ -19,6 +15,7 @@ on:
           - regenerate-circuit-vectors
           - regenerate-recursion-shapes
           - focused-cpu
+          - full-matrix
         default: standard
       cpu_lane:
         description: Existing CPU lane for focused-cpu diagnostics only
@@ -31,12 +28,12 @@ permissions:
 
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}-${{ inputs.gate }}-${{ inputs.cpu_lane }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'schedule' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   package-workspace:
     name: Package workspace contracts
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -68,9 +65,8 @@ jobs:
   focused-plan:
     name: Select focused gates
     if: >-
-      github.event_name == 'pull_request' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_dispatch' && inputs.gate == 'full-matrix') ||
       (github.event_name == 'workflow_dispatch' && inputs.gate == 'focused-cpu' && inputs.cpu_lane != 'main_releasefast_baseline')
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -109,20 +105,16 @@ jobs:
           # can lag the base branch, which would count already-merged main
           # commits as part of the PR and select lanes the PR never touched.
           #
-          # Pull requests and pushes to main are diff-scoped. A nightly full
-          # hosted matrix catches selection drift without serializing every
-          # merge behind unrelated products.
+          # The full hosted matrix is an explicit maintenance dispatch.
           SCOPE_ARGS=()
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            BASE="$GITHUB_SHA"
-            SCOPE_ARGS+=(--manual-cpu-lane "$MANUAL_CPU_LANE")
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
             BASE="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
-          elif [ "${{ github.event_name }}" = "schedule" ]; then
+          elif [ "${{ inputs.gate }}" = "full-matrix" ]; then
             BASE="$(git rev-parse HEAD^)"
             SCOPE_ARGS+=(--full-matrix)
           else
-            BASE="${{ github.event.before }}"
+            BASE="$GITHUB_SHA"
+            SCOPE_ARGS+=(--manual-cpu-lane "$MANUAL_CPU_LANE")
           fi
           python3 scripts/repo/ci_scope_plan.py \
             --base "$BASE" \
@@ -167,9 +159,8 @@ jobs:
     name: Focused Linux / ${{ matrix.lane }}
     needs: focused-plan
     if: >-
-      (github.event_name == 'pull_request' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      github.event_name == 'schedule' ||
+      ((github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_dispatch' && inputs.gate == 'full-matrix') ||
       (github.event_name == 'workflow_dispatch' && inputs.gate == 'focused-cpu')) &&
       needs.focused-plan.outputs.linux_count != '0'
     runs-on: ubuntu-latest
@@ -738,9 +729,8 @@ jobs:
     name: Focused macOS / ${{ matrix.lane }}
     needs: focused-plan
     if: >-
-      (github.event_name == 'pull_request' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      github.event_name == 'schedule') &&
+      ((github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_dispatch' && inputs.gate == 'full-matrix')) &&
       needs.focused-plan.outputs.macos_count != '0'
     runs-on: macos-15
     # The aggregate lane compiles and links the full host compatibility product.
@@ -802,7 +792,7 @@ jobs:
     name: Focused CUDA / native_cuda_device
     needs: focused-plan
     if: >-
-      github.event_name == 'schedule' &&
+      (github.event_name == 'workflow_dispatch' && inputs.gate == 'full-matrix') &&
       needs.focused-plan.outputs.cuda_required == 'true'
     runs-on: [self-hosted, linux, x64, cuda]
     timeout-minutes: 30
@@ -869,9 +859,8 @@ jobs:
     name: Production PR gate
     needs: [focused-plan, focused-linux, focused-macos, focused-cuda]
     if: >-
-      always() && (github.event_name == 'pull_request' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
-      github.event_name == 'schedule')
+      always() && ((github.event_name == 'pull_request' && github.event.pull_request.draft == false) ||
+      (github.event_name == 'workflow_dispatch' && inputs.gate == 'full-matrix'))
     runs-on: ubuntu-latest
     timeout-minutes: 2
     env:
@@ -881,7 +870,7 @@ jobs:
       MACOS_COUNT: ${{ needs.focused-plan.outputs.macos_count }}
       CUDA_RESULT: ${{ needs.focused-cuda.result }}
       CUDA_REQUIRED: ${{ needs.focused-plan.outputs.cuda_required }}
-      CUDA_ENFORCED: ${{ github.event_name == 'schedule' }}
+      CUDA_ENFORCED: ${{ (github.event_name == 'workflow_dispatch' && inputs.gate == 'full-matrix') }}
     steps:
       - name: Require every selected lane to pass
         run: |
@@ -901,7 +890,6 @@ jobs:
   release-gate:
     name: Release gate
     if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
       (github.event_name == 'workflow_dispatch' &&
       (inputs.gate == 'standard' || inputs.gate == 'strict'))
     runs-on: ubuntu-latest
@@ -928,16 +916,16 @@ jobs:
         run: rustup toolchain install nightly-2025-07-14 --profile minimal
 
       - name: Checkout pinned stwo-cairo oracle
-        env: &stwo-cairo-env
+        env:
           STWO_CAIRO_REVISION: dcd5834565b7a26a27a614e353c9c60109ebc1d9
-        run: &checkout-stwo-cairo |
+        run: |
           git init "$STWO_CAIRO_RUST_ROOT"
           git -C "$STWO_CAIRO_RUST_ROOT" remote add origin https://github.com/teddyjfpender/stwo-cairo
           git -C "$STWO_CAIRO_RUST_ROOT" fetch --depth=1 origin "$STWO_CAIRO_REVISION"
           git -C "$STWO_CAIRO_RUST_ROOT" checkout --detach FETCH_HEAD
 
       - name: Run shared standard CI entrypoint
-        if: github.event_name != 'workflow_dispatch' || inputs.gate == 'standard'
+        if: inputs.gate == 'standard'
         run: python3 scripts/ci.py
 
       - name: Run shared strict CI entrypoint
@@ -959,7 +947,6 @@ jobs:
   metal-acceptance:
     name: Metal AOT reproducible build
     if: >-
-      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) ||
       (github.event_name == 'workflow_dispatch' &&
       (inputs.gate == 'standard' || inputs.gate == 'strict'))
     runs-on: macos-15

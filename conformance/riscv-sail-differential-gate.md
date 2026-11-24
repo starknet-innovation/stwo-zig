@@ -19,7 +19,7 @@ understanding of an instruction is wrong, that was the wrong operational
 posture. This gate makes the snapshot mechanically un-stale-able and
 re-derives it live in hosted CI with a freshly verified pinned toolchain.
 
-## The decision: scope-blocking PR gate, daily schedule, always-on binding
+## The decision: scope-blocking ready PR gate and manual live checks
 
 Three postures were weighed:
 
@@ -34,16 +34,16 @@ Three postures were weighed:
    converting the external oracle into the self-referential failure this
    project already suffered once with Stark-V.
 3. **Cached-toolchain gate, blocking exactly where the attestation's meaning
-   can change, plus a daily scheduled live run on main.** Chosen. Warm, the
+   can change, with an explicit dispatch for a live run on main.** Chosen. Warm, the
    toolchain verifies in under a second and the full differential is minutes;
    cold, the toolchain rebuilds from pins inside the same job (measured
    10m07s on an M-series laptop with 8 jobs; hosted cold time is an estimate
-   until the first scheduled run, and a red first run is the honest outcome
+   until the first hosted run, and a red first run is the honest outcome
    if the estimate is wrong).
 
 Two mechanisms make the narrow trigger sound rather than optimistic:
 
-- **Static binding (`bind`, every PR, no toolchain).** The committed evidence
+- **Static binding (`bind`, every ready PR, no toolchain).** The committed evidence
   must describe exactly the committed corpus and pins: identities equal the
   constants that `check_upstream_pins.py` already ties to the ledger, the
   formal profile, and `authority.zig`; program/retirement counts and the
@@ -96,7 +96,7 @@ resolves to something in the tree.
 | Failure | Where it goes red |
 | --- | --- |
 | Pin drift between ledger, profile, `authority.zig`, comparator constants | `check_upstream_pins.py`, run inside `run` and in the static lane |
-| Committed evidence stale against fixtures, pins, counts, or field lists | `bind` (every PR via the static lane, and again inside `run`) |
+| Committed evidence stale against fixtures, pins, counts, or field lists | `bind` (every ready PR via the static lane, and again inside `run`) |
 | Workspace not the pinned sources (wrong revision, dirty, patch drift) | `riscv_formal_tools.py verify`, re-run inside `run` |
 | Sail binary whose `--build-info` lacks the pinned model tag or compiler | `verify_sail_binary`, checked twice: toolchain verify and corpus attest |
 | Any retirement disagreement, trap-disposition disagreement, or Spike cross-check disagreement | `riscv_trace_vectors.py` live attest — exit 1 |
@@ -107,10 +107,8 @@ resolves to something in the tree.
 | A live-selected job reporting success with its gate steps skipped, edited away, or never reached | the verdict job requires the `toolchain_health`, `differential_ran`, and `sail_leg` receipts, each written only by the step that did the work; an unselected run has the opposite shape (no job, no receipts) |
 | A workspace this run never proved usable being published into the toolchain cache | the save step's `toolchain_state` condition: `verified` or `rebuilt` only. `unavailable`, or an absent receipt because the preflight went red, skips the save |
 
-The scheduled daily run exists for provisioning rot, not semantics: pins
-cannot drift by themselves, but caches evict, upstream release assets and
-package mirrors decay, and the cold path should be found broken by a
-schedule, not by the first PR that needs it.
+Maintainers can dispatch a live run to check for cache eviction, unavailable
+release assets or stale package mirrors independently of a change to the pins.
 
 ### Cache hit, cache miss, dependency failure
 

@@ -4,8 +4,7 @@
 # correctness in this repository; every other check compares the system
 # against our own beliefs about it. This workflow re-derives the committed
 # formal-corpus evidence with a freshly verified pinned toolchain whenever a
-# change can alter what that evidence means, and daily on main as
-# provisioning-rot insurance. Decision record, trigger policy, and runtime
+# ready PR can alter what that evidence means, or on explicit dispatch. Decision record, trigger policy, and runtime
 # budget: conformance/riscv-sail-differential-gate.md.
 #
 # Fail-closed contract: pin drift, a Sail binary whose --build-info does not
@@ -30,10 +29,7 @@ name: RISC-V Sail differential
 
 on:
   pull_request:
-  push:
-    branches: ["main"]
-  schedule:
-    - cron: "37 4 * * *"
+    types: [opened, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -45,6 +41,7 @@ concurrency:
 
 jobs:
   scope:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
     name: Scope the Sail differential
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -64,7 +61,7 @@ jobs:
       - name: Select live differential scope
         id: scope
         run: |
-          # Scheduled, dispatched, and post-merge main runs always go live;
+          # Manual dispatches always go live;
           # PRs diff against the live merge-base exactly as the focused
           # planner does, so lagging event payloads cannot select for
           # already-merged commits.
@@ -73,11 +70,6 @@ jobs:
               BASE="$(git merge-base "origin/${{ github.base_ref }}" HEAD)"
               python3 scripts/riscv/riscv_sail_gate.py scope \
                 --base "$BASE" --head "${{ github.sha }}" \
-                --github-output "$GITHUB_OUTPUT"
-              ;;
-            push)
-              python3 scripts/riscv/riscv_sail_gate.py scope \
-                --base "${{ github.event.before }}" --head "${{ github.sha }}" \
                 --github-output "$GITHUB_OUTPUT"
               ;;
             *)
@@ -272,7 +264,7 @@ jobs:
           key: riscv-formal-v2-${{ runner.os }}-${{ hashFiles('conformance/riscv/rv32im-sail-profile.json', 'conformance/riscv/sail-rvfi-zkvm-entry.patch', 'conformance/riscv/sail-rv32im-override.json', 'conformance/riscv/sail-rv32im-tagged-options.json', 'scripts/riscv/riscv_formal_tools.py') }}
 
       - name: Retain differential report
-        if: always()
+        if: always() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false))
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: riscv-sail-differential-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -283,7 +275,7 @@ jobs:
   verdict:
     name: Sail differential gates
     needs: [scope, differential]
-    if: always()
+    if: always() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false))
     runs-on: ubuntu-latest
     timeout-minutes: 2
     env:

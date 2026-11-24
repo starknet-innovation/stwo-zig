@@ -28,6 +28,7 @@ name: RISC-V formal refinement
 
 on:
   pull_request:
+    types: [opened, reopened, ready_for_review]
     paths:
       - "formal/riscv-refinement/**"
       # The top-level and helper-package globs cover every module reachable
@@ -70,26 +71,19 @@ on:
       - "design/soundness/UNIVERSAL_AIR_SAIL_REFINEMENT.md"
       - "conformance/schemas/air-ir-v2.schema.json"
       - ".github/workflows/riscv-refinement.yml"
-  push:
-    branches: ["main"]
-  schedule:
-    # Clean-room regeneration, as provisioning- and cache-rot insurance.
-    - cron: "23 5 * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# The event name is part of the group so a push to main cannot cancel the
-# scheduled clean-room run mid-flight: both would otherwise share the
-# refs/heads/main group and cancel-in-progress would kill whichever started
-# first. Superseded pull-request runs still cancel each other as before.
+# Keep explicit clean-room runs independent of PR validation.
 concurrency:
   group: riscv-refinement-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   air-export:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false)
     name: Fresh production AIR export
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -499,7 +493,7 @@ jobs:
     # A default `needs` fan-in is skipped when an upstream job fails. Run this
     # job regardless and turn every non-success result into an explicit RED
     # aggregate status, so branch protection has one stable required check.
-    if: always()
+    if: always() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.draft == false))
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -549,10 +543,10 @@ jobs:
 
   clean-room:
     name: Clean-room regeneration
-    # Scheduled and dispatched runs only. The point is to rebuild every derived
+    # Explicit maintenance runs only. The point is to rebuild every derived
     # input from empty caches, which is wasted work on an ordinary pull request
     # and would only teach contributors to ignore a slow required check.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

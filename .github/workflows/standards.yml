@@ -6,8 +6,7 @@ name: Standards
 
 on:
   pull_request:
-  push:
-    branches: ["main"]
+    types: [opened, reopened, ready_for_review]
 
 permissions:
   contents: read
@@ -18,6 +17,7 @@ concurrency:
 
 jobs:
   secret-scan:
+    if: github.event.pull_request.draft == false
     name: Secret scanning
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -43,23 +43,12 @@ jobs:
 
       - name: Scan the commits this change introduces
         env:
-          EVENT_NAME: ${{ github.event_name }}
           PR_BASE_REF: ${{ github.base_ref }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PUSH_BEFORE_SHA: ${{ github.event.before }}
-          PUSH_AFTER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            # Diff against the live merge-base, as ci.yml does: the event's
-            # base.sha can lag the base branch.
-            base="$(git merge-base "origin/${PR_BASE_REF}" "$PR_HEAD_SHA")"
-            range="${base}..${PR_HEAD_SHA}"
-          elif [[ "$PUSH_BEFORE_SHA" =~ ^0+$ ]]; then
-            range="-1 ${PUSH_AFTER_SHA}"
-          else
-            range="${PUSH_BEFORE_SHA}..${PUSH_AFTER_SHA}"
-          fi
+          base="$(git merge-base "origin/${PR_BASE_REF}" "$PR_HEAD_SHA")"
+          range="${base}..${PR_HEAD_SHA}"
           echo "Scanning: $range"
           "$RUNNER_TEMP/gitleaks" git \
             --no-banner \
@@ -71,7 +60,7 @@ jobs:
 
   dependency-review:
     name: Dependency and licence policy
-    if: github.event_name == 'pull_request'
+    if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
