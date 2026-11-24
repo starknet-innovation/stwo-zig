@@ -11,8 +11,7 @@
 # refinement receipt. Command-to-claim mapping and the macOS story:
 # design/soundness/SAIL_PROVISIONING.md.
 #
-# Trigger policy: schedule + workflow_dispatch + push to main ONLY, never on
-# every pull request. A cold run builds the Sail simulator, Spike, the Sail
+# Maintainers dispatch this provisioning workflow explicitly. A cold run builds the Sail simulator, Spike, the Sail
 # Lean backend, the Lean proof tree, and the formal gate -- far too slow for a
 # per-PR required check, and a slow required check only teaches contributors
 # to ignore it. The fast PR-scoped formal leg stays in
@@ -31,12 +30,6 @@
 name: RISC-V Sail formal provisioning
 
 on:
-  push:
-    branches: ["main"]
-  schedule:
-    # Daily, offset from the 04:37 Sail differential and the 05:23 refinement
-    # clean-room so the three heavy formal jobs do not contend.
-    - cron: "41 3 * * *"
   workflow_dispatch:
     inputs:
       regenerate_bindings:

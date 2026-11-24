@@ -550,7 +550,7 @@ class CiTests(unittest.TestCase):
             "needs.focused-plan.outputs.cuda_required == 'true'",
             cuda,
         )
-        self.assertIn("github.event_name == 'schedule'", cuda)
+        self.assertIn("github.event_name == 'workflow_dispatch' && inputs.gate == 'full-matrix'", cuda)
         self.assertNotIn("github.event_name == 'pull_request'", cuda)
         self.assertIn("Require the CUDA-labelled runner contract", cuda)
         self.assertIn("test -n \"$STWO_CUDA_NVCC\"", cuda)
@@ -623,10 +623,6 @@ class CiTests(unittest.TestCase):
         self.assertIn("- architecture-authority-linux", verifier)
         self.assertIn("- architecture-authority-macos", verifier)
 
-    def test_hosted_ci_accepts_exact_commit_aot_evidence_tags(self) -> None:
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        self.assertIn('tags: ["aot-evidence-*"]', workflow)
-
     def test_release_gates_run_the_complete_test_graph_in_requested_mode(self) -> None:
         build = (ROOT / "build.zig").read_text(encoding="utf-8")
         verification_products = "\n".join(
@@ -671,17 +667,17 @@ class CiTests(unittest.TestCase):
         self.assertEqual(1, len(interop_steps))
         self.assertIn(f"--archive-dir {gate_archive}", interop_steps[0]["command"])
 
-    def test_pre_push_and_hosted_main_are_focused(self) -> None:
+    def test_pre_push_and_ready_pr_are_focused(self) -> None:
         pre_push = (ROOT / ".githooks/pre-push").read_text(encoding="utf-8")
         self.assertIn("exec python3 scripts/repo/ci_scope_push.py", pre_push)
         self.assertNotIn("zig build", pre_push)
 
         workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
         focused = workflow.split("  focused-plan:", 1)[1].split("  release-gate:", 1)[0]
-        self.assertIn("github.event.before", focused)
-        self.assertIn("github.ref == 'refs/heads/main'", focused)
+        self.assertNotIn("github.event.before", focused)
+        self.assertIn('git merge-base "origin/${{ github.base_ref }}" HEAD', focused)
         self.assertEqual(1, focused.count("SCOPE_ARGS+=(--full-matrix)"))
-        self.assertIn('elif [ "${{ github.event_name }}" = "schedule" ]', focused)
+        self.assertIn('elif [ "${{ inputs.gate }}" = "full-matrix" ]', focused)
         self.assertNotIn("PR6 fail-closed correctness smoke", focused)
         self.assertIn("run: python3 scripts/ci.py\n", workflow)
 
