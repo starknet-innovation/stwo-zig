@@ -1,0 +1,388 @@
+{
+  "schema": "rv64.ethereum.guest-execution-comparison/v1",
+  "captured_utc": "2026-11-23",
+  "tracking_issue": "https://github.com/starknet-innovation/stwo-zig/issues/387",
+  "scope": "Full Ethereum guest execution from pinned STW1 SSZ through exact 43-byte output, measured on a local CPU. Native proofs and recursive roots for the integrated ELF require separate CUDA deployment and receiver qualification.",
+  "checkout_base": "166781d4cbe9f9a5da4b262f03bd6583b62987e7",
+  "checkout_condition": "Working tree; the listed guest files include additional source changes beyond the base. Exact binary and source content pinned below.",
+  "execution_profile": "ethereum_services_v3",
+  "max_retirements_per_cpu_shard": 4194303,
+  "retirement_boundary": "output halt flag. The complete terminal-PC observer on these inputs additionally retires 16 instructions. Shard counts use ceil(flag_steps/4194303).",
+  "host": {
+    "arch": "arm64",
+    "os": "macOS-27.2.1-arm64-arm-64bit-Mach-O",
+    "host_binary_sha256": "63c0036f9f0a157d9c462185a4c0d6bb7279b671ec5ccdc33a1f9a2a92bbbef7",
+    "zig_version": "0.15.2"
+  },
+  "rv64im_audit": {
+    "rv64im": 250425,
+    "zbb_binary": 0,
+    "other_bitmanip": 0,
+    "unimp": 3,
+    "undecodable": 0,
+    "zbb_ops": {
+      "andn": 0,
+      "orn": 0,
+      "xnor": 0,
+      "rev8": 0,
+      "sext.b": 0,
+      "sext.h": 0,
+      "zext.h": 0
+    },
+    "other_ops": {}
+  },
+  "executor_sha256": "2738aff5dfac380c36f6c54fd5d7be42417baac5915373a0cd55d7b76f08ba3e",
+  "basket": "tests/fixtures/ethereum/basket.json",
+  "elf_sha256": {
+    "control": "2a7aa59557c2b0a6ad58a2796bc35a6945c6d230deb0fc119e3d2d9d9f47f23f",
+    "previous_qualified_guest": "fe28cbf60b1e854fb9d369d92ae91fbaf2cfd5439eea5a4be7c0d181c6e43c5d",
+    "integrated_guest": "2d0e1bdccbfea17e04fb663dcb49b8d14121f4ab1634b40cb0e1ce36a51fe616"
+  },
+  "guest_files_sha256": {
+    "build.py": "1798587040879bd900d0ca76ece582ac6e323c14c34450fcd1d1b6f7df374375",
+    "glue/runtime.cpp": "7a2128d9d36779a17adc7de180f05c9cb25f22b57ba57818ad22369a53f20b74",
+    "glue/keccak_stwo.cpp": "079804db70677ff804b098e37a94be1505ff2b70b67725a18828d1aa73779d41",
+    "tests/xlat_difffuzz.cpp": "0105083650516ab837d984a821a7aa9c675112ec74d57ed6a7a911d3edbdef7d",
+    "tests/blst_portable.c": "73cb39da53420024c77e17e3fc74c14a3ea40ce55c9d7ecdcd9aa1cff1e8e16b",
+    "patches/0031-evmone-rv64-evm-memory-words.patch": "197317ab3112946289a81a6543a582fdd0c11e43a2ac1e7ccdf9cba746d0728c",
+    "patches/0032-ziskethone-rv64-stack-and-memory-fusions.patch": "7b614a6fb6a7f47b768ba5ab40900b96945e2f39bfe6bf0de3117f796137b2f0",
+    "patches/0033-blst-two-prepared-miller-product.patch": "f88a9b16b7f5327d6ac97b2cf56f3a7353f86acdbf65a661899a143dd279f3ed",
+    "patches/0034-evmone-kzg-prepared-product.patch": "32881a7635c1396655c3fa98d1f415d2f07186d4ad64048348486de28ad9e003"
+  },
+  "checks": {
+    "rv64_public_outputs_per_arm": 15,
+    "integrated_host_public_outputs": 15,
+    "integrated_host_tests": "build.py --host --tests; existing memory, Keccak, trie, secp, curve, portable blst, jumpdest, word and dispatch gates passed.",
+    "integrated_switch_vs_cgoto_cases": 96384,
+    "isolated_random_and_directed_dispatch_comparisons": 144000,
+    "independent_before_exponentiation_fp12_product_comparisons": 1024,
+    "bn254_test_cases": 4920,
+    "bls_and_kzg_test_cases": 8011,
+    "keccak_sponge_test_cases": 4809
+  },
+  "totals": {
+    "control": {
+      "instructions": 1317589163,
+      "cpu_shards": 321,
+      "service_ram_word_transitions": 141440666
+    },
+    "previous_qualified_guest": {
+      "instructions": 1285147794,
+      "cpu_shards": 315,
+      "service_ram_word_transitions": 139121584
+    },
+    "integrated_guest": {
+      "instructions": 1267505327,
+      "cpu_shards": 310,
+      "service_ram_word_transitions": 139216484
+    }
+  },
+  "blocks": [
+    {
+      "block": 24626900,
+      "input_sha256": "b9b48a9319b09426ae44d471d64123703196cc04ed79759bbf772ffc8b5f3dcf",
+      "output_hex": "4b486741a31c73469538fbdf1bf63587f8776b22f72249afa639ce0b650754a60101000000000000000114",
+      "flag_steps": [
+        45173442,
+        44190108,
+        43883096
+      ],
+      "cpu_shards": [
+        11,
+        11,
+        11
+      ],
+      "service_ram_word_transitions": [
+        5881370,
+        5794793,
+        5799074
+      ]
+    },
+    {
+      "block": 24628590,
+      "input_sha256": "8df6f2fd15e02e7a4c3863765e3e9883566e129db799caede84de43b97891c79",
+      "output_hex": "de8f8c365b68abd759b946db428e67df40b82c1c39aeb3c111cd5b42cb2f05680101000000000000000114",
+      "flag_steps": [
+        146632840,
+        142672112,
+        139877291
+      ],
+      "cpu_shards": [
+        35,
+        35,
+        34
+      ],
+      "service_ram_word_transitions": [
+        15587622,
+        15306267,
+        15350471
+      ]
+    },
+    {
+      "block": 24628595,
+      "input_sha256": "d52189af39deaa7fd08f27b5bf21970411816e728a7f77e531742975243360b0",
+      "output_hex": "85f8f0212ae1228dfe1aebf870b99a9689e00b1520c4cc40fb4a4e3ea30e30a10101000000000000000114",
+      "flag_steps": [
+        159672241,
+        155866208,
+        154200500
+      ],
+      "cpu_shards": [
+        39,
+        38,
+        37
+      ],
+      "service_ram_word_transitions": [
+        18009089,
+        17725771,
+        17748703
+      ]
+    },
+    {
+      "block": 24628607,
+      "input_sha256": "e549944d05baec739cfead4e19025cdfb378949baedc6e4d891a19aa6d059d56",
+      "output_hex": "e63d2797ca5c6f826a32d20c41ba552d25777533ab295f9d232560b014d090300101000000000000000114",
+      "flag_steps": [
+        25068296,
+        24432318,
+        24254882
+      ],
+      "cpu_shards": [
+        6,
+        6,
+        6
+      ],
+      "service_ram_word_transitions": [
+        2977390,
+        2934842,
+        2935358
+      ]
+    },
+    {
+      "block": 24628608,
+      "input_sha256": "3b091861c04ad578bc8c1c15de94a100247b0fc6f9ffe51363f13a9eaa8a4b5e",
+      "output_hex": "c92cbc26f2f8a5976259a8053763dc65a58f1071c7ab65b498f470159f827be10101000000000000000114",
+      "flag_steps": [
+        35720984,
+        34905783,
+        34692793
+      ],
+      "cpu_shards": [
+        9,
+        9,
+        9
+      ],
+      "service_ram_word_transitions": [
+        4082281,
+        4015710,
+        4016042
+      ]
+    },
+    {
+      "block": 24628611,
+      "input_sha256": "1d0b0e67c646022ec1ce362f7e1d488bdf9b9a77ccc946f8567276d32a9d0fba",
+      "output_hex": "320c2fd183a93ba147d92e318d9b7773c767521cfbc4e08e473fbb10912442740101000000000000000114",
+      "flag_steps": [
+        174150059,
+        169959045,
+        167063798
+      ],
+      "cpu_shards": [
+        42,
+        41,
+        40
+      ],
+      "service_ram_word_transitions": [
+        19022361,
+        18729327,
+        18740908
+      ]
+    },
+    {
+      "block": 24647140,
+      "input_sha256": "520cc0e31b3beae6b39a06ef266fe122ff47ff9da00767ec9aab9dff63b59033",
+      "output_hex": "fe93a8702bccb85177f08c999987d3f6ed9a55c57fdcb10342a11669974858a30101000000000000000114",
+      "flag_steps": [
+        22787619,
+        22244903,
+        22103778
+      ],
+      "cpu_shards": [
+        6,
+        6,
+        6
+      ],
+      "service_ram_word_transitions": [
+        3244459,
+        3201866,
+        3202960
+      ]
+    },
+    {
+      "block": 24697070,
+      "input_sha256": "989b0a3e623f068f48b1c799ad5af3eb7a8d10b833571b20d8bab0d39300ecc5",
+      "output_hex": "cc73313f45a8b0a26aac3ea84ef57e624ac6edd0679c14abaece166c71bf5b170101000000000000000114",
+      "flag_steps": [
+        52759141,
+        51856031,
+        51363294
+      ],
+      "cpu_shards": [
+        13,
+        13,
+        13
+      ],
+      "service_ram_word_transitions": [
+        6587458,
+        6510156,
+        6514037
+      ]
+    },
+    {
+      "block": 24697073,
+      "input_sha256": "c0fdc45eb1513e1d1fcc3f59a13f1317cc8c60f64f4f94cc14c01dec5022d0d0",
+      "output_hex": "613501705955981054a902522c31c37d631ce098618a2f2bbb039f11cfd5da340101000000000000000114",
+      "flag_steps": [
+        54734914,
+        53988801,
+        52958083
+      ],
+      "cpu_shards": [
+        14,
+        13,
+        13
+      ],
+      "service_ram_word_transitions": [
+        7069648,
+        6988467,
+        6972953
+      ]
+    },
+    {
+      "block": 25229951,
+      "input_sha256": "64d2e7b2ad1796f49de4e4004461650ff7083ee5d2deaf7937d644f77ee26b53",
+      "output_hex": "3035ba8294fde3a83e654e014d9c6fa752ed2124e2d265518092495459979f0d0101000000000000000114",
+      "flag_steps": [
+        155020467,
+        150233741,
+        148459405
+      ],
+      "cpu_shards": [
+        37,
+        36,
+        36
+      ],
+      "service_ram_word_transitions": [
+        13683866,
+        13351047,
+        13377427
+      ]
+    },
+    {
+      "block": 25229955,
+      "input_sha256": "0f5d6db50b55d1100a6dca5126b0bc50b7d298a142a8eabd510bc97b52f1caf7",
+      "output_hex": "288645eda2f97ce84e364b582563f45cec26700462a3284ef037bdebc94cf22f0101000000000000000114",
+      "flag_steps": [
+        113685877,
+        110061921,
+        109678817
+      ],
+      "cpu_shards": [
+        28,
+        27,
+        27
+      ],
+      "service_ram_word_transitions": [
+        10920637,
+        10668586,
+        10675182
+      ]
+    },
+    {
+      "block": 25229957,
+      "input_sha256": "e58b6d680c99f25b25a6fcb489c526b211c5b5f8a2253e25b960fbe81e70d979",
+      "output_hex": "f2b46b233a65ceb4ae27982171910748f89ed5271b9235eb94a4044504dda8620101000000000000000114",
+      "flag_steps": [
+        24897318,
+        24345508,
+        24112214
+      ],
+      "cpu_shards": [
+        6,
+        6,
+        6
+      ],
+      "service_ram_word_transitions": [
+        3629420,
+        3584351,
+        3586551
+      ]
+    },
+    {
+      "block": 26235156,
+      "input_sha256": "93324987c481245feb5d52555c77298ab4ce5fbc21bd323ae341fcf42df9f3a0",
+      "output_hex": "9661a4e4cdf6b5f38de836fe3295d334fdc8bb6869b92e0addc027e573f993910101000000000000000114",
+      "flag_steps": [
+        13819439,
+        13566175,
+        13501559
+      ],
+      "cpu_shards": [
+        4,
+        4,
+        4
+      ],
+      "service_ram_word_transitions": [
+        2302825,
+        2282436,
+        2282723
+      ]
+    },
+    {
+      "block": 26235159,
+      "input_sha256": "7101becdbd115afe4e05487ba7f711e884e51cae29511b6a6e743833f5ca9b79",
+      "output_hex": "bf48e248f97c30d78d21bf6b1e77ec188c6e33a275d4292dd46f90778297e9ca0101000000000000000114",
+      "flag_steps": [
+        190139671,
+        185631270,
+        182095719
+      ],
+      "cpu_shards": [
+        46,
+        45,
+        44
+      ],
+      "service_ram_word_transitions": [
+        17576270,
+        17294747,
+        17284994
+      ]
+    },
+    {
+      "block": 26235168,
+      "input_sha256": "870d17f352ac42590656023cab77c3c82fb1627722bf0c2156c2a8f8ada94fc0",
+      "output_hex": "f1be347f029bcedb84175815a0f9a0dba90228bd6f27b08b97c67fbd3aaf54440101000000000000000114",
+      "flag_steps": [
+        103326855,
+        101193870,
+        99260098
+      ],
+      "cpu_shards": [
+        25,
+        25,
+        24
+      ],
+      "service_ram_word_transitions": [
+        10865970,
+        10733218,
+        10729101
+      ]
+    }
+  ],
+  "block_array_order": [
+    "control",
+    "previous_qualified_guest",
+    "integrated_guest"
+  ],
+  "qualification_boundary": "A change to ELF or guest symbols changes the authenticated program and derived ROM classes. Bind the integrated ELF by its own hash and receiver-derived symbols; require an independent root for that deployment before attributing proof timings. Existing service requests continue to select their own pinned binary."
+}

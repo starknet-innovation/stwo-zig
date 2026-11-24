@@ -30,9 +30,6 @@ inline constexpr uint64_t kCandBls12381G1Double = 0x00030111;
 inline constexpr uint64_t kCandBls12381Fp2Mul = 0x00030112;
 inline constexpr uint64_t kCandArith384Mod = 0x00030120;
 inline constexpr uint64_t kCandArith384Mont = 0x00030121;
-inline constexpr uint64_t kCandKeccakSponge = 0x00030130;
-inline constexpr uint64_t kSpongeFinalize = 1;
-inline constexpr uint64_t kSpongeFresh = 2;
 
 inline uint64_t ptr(const void* p) noexcept { return reinterpret_cast<uint64_t>(p); }
 
@@ -51,8 +48,7 @@ inline void cand4(uint64_t tag, const void* a, const void* b, const void* c, con
 
 // One call hashes `n` bytes into the first four lanes of `st` (25 lanes).
 inline void cand_keccak256(uint64_t st[25], const void* data, uint64_t n) noexcept {
-    alignas(8) uint64_t pk[4] = {ptr(st), ptr(data), n, kSpongeFinalize | kSpongeFresh};
-    ecall(kCandKeccakSponge, pk);
+    keccak_sponge(st, static_cast<const uint8_t*>(data), n, kSpongeFinalize | kSpongeFresh);
 }
 
 }  // namespace stwo

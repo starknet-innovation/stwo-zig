@@ -1,0 +1,134 @@
+--- a/lib/evmone/instructions.hpp
++++ b/lib/evmone/instructions.hpp
+@@ -671,6 +671,13 @@
+         for (size_t i = 0; i < 4; ++i)
+             w[i] = (w[i] >> sh) | (w[i + 1] << (64 - sh));
+     }
++    // ABI words such as offsets and lengths usually fit a single limb.
++    if ((w[0] | w[1] | w[2]) == 0)
++    {
++        out[0] = intx::be_bytes::bswap64(w[3], m);
++        out[1] = out[2] = out[3] = 0;
++        return;
++    }
+     const auto r0 = intx::be_bytes::bswap64(w[3], m);
+     const auto r1 = intx::be_bytes::bswap64(w[2], m);
+     const auto r2 = intx::be_bytes::bswap64(w[1], m);
+@@ -680,6 +687,45 @@
+     out[2] = r2;
+     out[3] = r3;
+ }
++
++/// The EVM memory allocation starts on a word boundary and grows in 32-byte
++/// units. For an admitted 32-byte write both boundary words lie in that
++/// allocation; preserve every byte outside the requested word.
++[[gnu::always_inline]] inline void stwo_mstore_word(uint8_t* p, const uint256& value) noexcept
++{
++    const auto masks = intx::be_bytes::g_swap_masks;
++    uint64_t w[4]{};
++    if ((value[1] | value[2] | value[3]) != 0)
++    {
++        w[0] = intx::be_bytes::bswap64(value[3], masks);
++        w[1] = intx::be_bytes::bswap64(value[2], masks);
++        w[2] = intx::be_bytes::bswap64(value[1], masks);
++    }
++    w[3] = intx::be_bytes::bswap64(value[0], masks);
++    const auto off = reinterpret_cast<uintptr_t>(p) & 7;
++    auto* const a = static_cast<uint8_t*>(__builtin_assume_aligned(p - off, 8));
++    if (off == 0)
++    {
++        for (size_t i = 0; i != 4; ++i) std::memcpy(a + 8 * i, &w[i], 8);
++        return;
++    }
++    const auto sh = off * 8;
++    const auto rs = 64 - sh;
++    const uint64_t mask = ~uint64_t{0} << sh;
++    uint64_t first, last;
++    std::memcpy(&first, a, 8);
++    std::memcpy(&last, a + 32, 8);
++    first = (first & ~mask) | (w[0] << sh);
++    last = (last & mask) | (w[3] >> rs);
++    std::memcpy(a, &first, 8);
++    for (size_t i = 1; i != 4; ++i)
++    {
++        const uint64_t middle = (w[i - 1] >> rs) | (w[i] << sh);
++        std::memcpy(a + 8 * i, &middle, 8);
++    }
++    std::memcpy(a + 32, &last, 8);
++}
++
+ #endif
+
+ inline void calldataload(StackTop stack, ExecutionState& state) noexcept
+@@ -1006,12 +1052,15 @@
+     if (!check_memory(gas_left, state.memory, index, 32))
+         return {EVMC_OUT_OF_GAS, gas_left};
+
++#ifdef INTX_BE_BYTEWISE
++    stwo_load_be256(&index[0], &state.memory[static_cast<size_t>(index)]);
++#else
+     index = intx::be::unsafe::load<uint256>(&state.memory[static_cast<size_t>(index)]);
+-    return {EVMC_SUCCESS, gas_left};
+-}
+-
+-/// MLOAD fast path for an in-bounds word at an 8-aligned address: no call, so no frame;
+-/// everything else (growth, gas, unaligned) goes to mload_slow.
++#endif
++    return {EVMC_SUCCESS, gas_left};
++}
++
++/// In-bounds MLOAD skips the expansion frame at every byte offset.
+ [[gnu::always_inline]] inline Result mload(StackTop stack, int64_t gas_left, ExecutionState& state) noexcept
+ {
+ #ifdef INTX_BE_BYTEWISE
+@@ -1020,12 +1069,8 @@
+     const auto size = state.memory.size();
+     if ((index[3] | index[2] | index[1]) == 0 && off <= size && size - off >= 32)
+     {
+-        const auto* p = &state.memory[static_cast<size_t>(off)];
+-        if ((reinterpret_cast<uintptr_t>(p) & 7) == 0)
+-        {
+-            stwo_load_be256(&index[0], p);
+-            return {EVMC_SUCCESS, gas_left};
+-        }
++        stwo_load_be256(&index[0], &state.memory[static_cast<size_t>(off)]);
++        return {EVMC_SUCCESS, gas_left};
+     }
+ #endif
+     return mload_slow(stack, gas_left, state);
+@@ -1039,7 +1084,11 @@
+     if (!check_memory(gas_left, state.memory, index, 32))
+         return {EVMC_OUT_OF_GAS, gas_left};
+
++#ifdef INTX_BE_BYTEWISE
++    stwo_mstore_word(&state.memory[static_cast<size_t>(index)], value);
++#else
+     intx::be::unsafe::store(&state.memory[static_cast<size_t>(index)], value);
++#endif
+     return {EVMC_SUCCESS, gas_left};
+ }
+
+@@ -1053,21 +1102,8 @@
+     const auto size = state.memory.size();
+     if ((index[3] | index[2] | index[1]) == 0 && off <= size && size - off >= 32)
+     {
+-        auto* p = &state.memory[static_cast<size_t>(off)];
+-        if ((reinterpret_cast<uintptr_t>(p) & 7) == 0)
+-        {
+-            const auto m = intx::be_bytes::g_swap_masks;
+-            const uint64_t w0 = intx::be_bytes::bswap64(value[3], m);
+-            const uint64_t w1 = intx::be_bytes::bswap64(value[2], m);
+-            const uint64_t w2 = intx::be_bytes::bswap64(value[1], m);
+-            const uint64_t w3 = intx::be_bytes::bswap64(value[0], m);
+-            auto* a = static_cast<uint8_t*>(__builtin_assume_aligned(p, 8));
+-            std::memcpy(a, &w0, 8);
+-            std::memcpy(a + 8, &w1, 8);
+-            std::memcpy(a + 16, &w2, 8);
+-            std::memcpy(a + 24, &w3, 8);
+-            return {EVMC_SUCCESS, gas_left};
+-        }
++        stwo_mstore_word(&state.memory[static_cast<size_t>(off)], value);
++        return {EVMC_SUCCESS, gas_left};
+     }
+ #endif
+     return mstore_slow(stack, gas_left, state);

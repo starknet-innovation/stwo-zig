@@ -6,15 +6,13 @@
 //   * evmone::crypto::secp256k1::{ecrecover, secp256k1_ecdsa_recover, to_address}
 //     used by evmone's precompile dispatch.
 //
-// Point arithmetic: projective (X:Y:Z) add/double through ECALL 0x0002_0011 /
-// 0x0002_0012, which compute the complete Renes-Costello-Batina formulas of
-// k256 (identity (0:1:0) and P+P included). Square root, inversions and (without
-// the v3 arith256_mod service, see fe_mul/sc_mul) the field and scalar products run
-// as RV64IM code: 4x64-bit limbs, MUL/MULHU products, special-form reduction.
+// The complete RCB ADD service at 0x0002_0011 handles ordinary additions,
+// equal points and the identity. Doubling copies the accumulator into the
+// second operand of the same authenticated packet. Field/scalar products
+// use the v3 arith256_mod service when available and RV64IM otherwise.
 //
-// Recovery (SEC 1, 4.1.6): R = (r, y) with y = sqrt(r^3 + 7) of the requested
-// parity, u1 = -z/r, u2 = s/r (mod n), Q = u1*G + u2*R by interleaved 4-bit
-// windows (Straus) over tables of 1..15 multiples of G (built once) and R.
+// SEC 1 recovery computes Q = (-z/r)*G + (s/r)*R. A fixed generator comb
+// and width-five signed GLV digits for R share a projective accumulator.
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -290,8 +288,9 @@ inline Proj acc_get() {
     return p;
 }
 inline void acc_double() {
-    // DOUBLE reads/writes only the first 12 words of the packet.
-    stwo::ecall(stwo::kSecpDoubleWords, g_acc.w);
+    // RCB addition is complete for equal points. Both inputs must exist in RAM.
+    __builtin_memcpy_inline(g_acc.w + 12, g_acc.w, 96);
+    stwo::ecall(stwo::kSecpAddWords, g_acc.w);
 }
 inline void acc_add(const Proj& q) {
     std::memcpy(&g_acc.w[12], q.x.v, 32);
@@ -364,11 +363,6 @@ bool split_lambda(const U256& k, U256& k1, bool& neg1, U256& k2, bool& neg2) {
     return fits128(r1) && fits128(r2);
 }
 
-inline Proj neg_point(const Proj& p) {
-    Proj q = p;
-    if (!is_zero(q.y)) sub_to(q.y, P, p.y);
-    return q;
-}
 inline Proj endo(const Proj& p) {
     Proj q = p;
     q.x = fe_mul(p.x, BETA);
@@ -380,12 +374,11 @@ const Proj kG = {
     {{0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL, 0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL}},
     {{1, 0, 0, 0}},
 };
-Table g_tg, g_tlg, g_tg_neg, g_tlg_neg;
-bool g_tables_ready = false;
+struct Affine { U256 x, y; };
+#include "secp_generator.inc"
 
-void make_neg(Table& out, const Table& in) {
-    for (int i = 0; i < 15; ++i) out.p[i] = neg_point(in.p[i]);
-}
+Table g_tg;
+bool g_tables_ready = false;
 
 inline unsigned nibble_at(const U256& k, int i) {  // i-th 4-bit window from the bottom
     return unsigned(k.v[i >> 4] >> ((i & 15) * 4)) & 15;
@@ -404,38 +397,94 @@ Proj double_mul_plain(const U256& u1, const U256& u2, const Table& tq) {
     return acc_get();
 }
 
-// Q = u1*G + u2*P in projective coordinates (Z = 0 for infinity).
-Proj double_mul(const U256& u1, const U256& u2, const Proj& p) {
-    if (!g_tables_ready) {
-        build_table(g_tg, kG);
-        for (int i = 0; i < 15; ++i) g_tlg.p[i] = endo(g_tg.p[i]);
-        make_neg(g_tg_neg, g_tg);
-        make_neg(g_tlg_neg, g_tlg);
-        g_tables_ready = true;
+// Odd multiples and width-five signed non-adjacent digits for the two variable bases.
+static void signed_digits(const U256& value, bool negate, int8_t (&digits)[129]) {
+    u128 k = (static_cast<u128>(value.v[1]) << 64) | value.v[0];
+    int bit = 0;
+    while (k) {
+        if ((k & 1) == 0) {
+            k >>= 1;
+            ++bit;
+            continue;
+        }
+        int d = static_cast<unsigned>(k) & 31;
+        if (d >= 16) d -= 32;
+        digits[bit] = static_cast<int8_t>(negate ? -d : d);
+        // Shift before adding the carry, including at 2^128 - 1.
+        k = (k >> 5) + (d < 0);
+        bit += 5;
     }
-    Table tp;
-    build_table(tp, p);
-    U256 a1, a2, b1, b2;
-    bool na1, na2, nb1, nb2;
-    if (!split_lambda(u1, a1, na1, a2, na2) || !split_lambda(u2, b1, nb1, b2, nb2)) {
+}
+Proj double_mul(const U256& u1, const U256& u2, const Proj& p) {
+    U256 b1, b2;
+    bool nb1, nb2;
+    if (!split_lambda(u2, b1, nb1, b2, nb2)) {
+        if (!g_tables_ready) {
+            build_table(g_tg, kG);
+            g_tables_ready = true;
+        }
+        Table tp;
+        build_table(tp, p);
         return double_mul_plain(u1, u2, tp);
     }
-    Table tlp;
-    for (int i = 0; i < 15; ++i) tlp.p[i] = endo(tp.p[i]);
-    if (nb1) for (auto& q : tp.p) q = neg_point(q);
-    if (nb2) for (auto& q : tlp.p) q = neg_point(q);
-    const Table& ta = na1 ? g_tg_neg : g_tg;
-    const Table& tla = na2 ? g_tlg_neg : g_tlg;
-    acc_set(Proj{{{0, 0, 0, 0}}, {{1, 0, 0, 0}}, {{0, 0, 0, 0}}});
-    bool started = false;
-    for (int i = 31; i >= 0; --i) {
-        if (started) { acc_double(); acc_double(); acc_double(); acc_double(); }
-        unsigned d;
-        if ((d = nibble_at(a1, i))) { acc_add(ta.p[d - 1]); started = true; }
-        if ((d = nibble_at(a2, i))) { acc_add(tla.p[d - 1]); started = true; }
-        if ((d = nibble_at(b1, i))) { acc_add(tp.p[d - 1]); started = true; }
-        if ((d = nibble_at(b2, i))) { acc_add(tlp.p[d - 1]); started = true; }
+    Proj odd[8], phi[8];
+    odd[0] = p;
+    acc_set(p);
+    acc_double();
+    const Proj twice = acc_get();
+    acc_set(p);
+    for (int j = 1; j < 8; ++j) {
+        acc_add(twice);
+        odd[j] = acc_get();
     }
+    for (int j = 0; j < 8; ++j) phi[j] = endo(odd[j]);
+    int8_t d1[129]{}, d2[129]{};
+    signed_digits(b1, nb1, d1);
+    signed_digits(b2, nb2, d2);
+    auto window = [&](int bit) {
+        const int word = bit >> 6, lo = bit & 63;
+        uint64_t v = u1.v[word] >> lo;
+        if (lo > 59 && word < 3) v |= u1.v[word + 1] << (64 - lo);
+        return static_cast<unsigned>(v) & 31U;
+    };
+    // Each scheduled digit adds low*G + high*(2^130 G). Running to
+    // bit 128 also handles a carry from either signed variable-point digit.
+    uint16_t fixed[129]{};
+    for (int bit = 0; bit < 130; bit += 5) {
+        unsigned high = bit + 130 < 256 ? window(bit + 130) : 0;
+        fixed[bit] = static_cast<uint16_t>(window(bit) * 32 + high);
+    }
+    bool started = false;
+    auto add_point = [&](const U256& x, const U256& y, const U256& z, bool negate) {
+        uint64_t* w = g_acc.w + (started ? 12 : 0);
+        __builtin_memcpy_inline(w, x.v, 32);
+        if (negate) {
+            U256 v = y;
+            if (!is_zero(v)) sub_to(v, P, y);
+            __builtin_memcpy_inline(w + 4, v.v, 32);
+        } else {
+            __builtin_memcpy_inline(w + 4, y.v, 32);
+        }
+        __builtin_memcpy_inline(w + 8, z.v, 32);
+        if (started) stwo::ecall(stwo::kSecpAddWords, g_acc.w);
+        started = true;
+    };
+    for (int i = 128; i >= 0; --i) {
+        if (started) acc_double();
+        if (unsigned index = fixed[i]) {
+            const auto& g = kFixed[index];
+            add_point(g.x, g.y, U256{{1, 0, 0, 0}}, false);
+        }
+        auto add_digit = [&](const Proj* table, int d) {
+            if (d) {
+                const auto& q = table[(d < 0 ? -d : d) >> 1];
+                add_point(q.x, q.y, q.z, d < 0);
+            }
+        };
+        add_digit(odd, d1[i]);
+        add_digit(phi, d2[i]);
+    }
+    if (!started) return Proj{{{0, 0, 0, 0}}, {{1, 0, 0, 0}}, {{0, 0, 0, 0}}};
     return acc_get();
 }
 

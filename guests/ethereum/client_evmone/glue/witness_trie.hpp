@@ -57,6 +57,7 @@ public:
     size_t size() const noexcept { return count_; }
 
 private:
+    DNode* spare_dense_ = nullptr;
     Slot* slots_ = nullptr;
     size_t mask_ = 0;
     size_t count_ = 0;

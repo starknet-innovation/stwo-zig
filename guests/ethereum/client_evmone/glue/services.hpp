@@ -46,6 +46,14 @@ inline void ecall(uint64_t tag, void* packet) noexcept {
 }
 #endif
 
+// The admitted V3 sponge and the candidate packet have the same tag and framing.
+inline constexpr uint64_t kKeccakSponge = 0x00030130;
+inline constexpr uint64_t kSpongeFinalize = 1, kSpongeFresh = 2;
+inline void keccak_sponge(uint64_t state[25], const uint8_t* input, size_t len, uint64_t flags) noexcept {
+    alignas(8) uint64_t packet[] = {reinterpret_cast<uintptr_t>(state), reinterpret_cast<uintptr_t>(input), len, flags};
+    ecall(kKeccakSponge, packet);
+}
+
 inline void keccak_f(uint64_t* state25) noexcept { ecall(kKeccakF, state25); }
 
 struct alignas(32) SecpAddPacket { uint64_t w[24]; };

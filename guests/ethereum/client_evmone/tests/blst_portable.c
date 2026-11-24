@@ -18,6 +18,10 @@
 
 #include "blst.h"
 
+extern void stwo_miller_two_prepared(blst_fp12*, const blst_fp6*, const blst_p1_affine*,
+                                     const blst_fp6*, const blst_p1_affine*);
+
+
 static uint64_t rng = 0x9e3779b97f4a7c15ull;
 static uint64_t next(void) {
     rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17;
@@ -119,6 +123,21 @@ int main(void) {
         blst_miller_loop(&f1, &qa, &pa); blst_final_exp(&e1, &f1);
         blst_miller_loop(&f2, &qb, &pb); blst_final_exp(&e2, &f2);
         printf("pairing.%d %d\n", i, blst_fp12_is_equal(&e1, &e2));
+        // Compare the entire Fp12 product before exponentiation, including degenerate inputs.
+        blst_fp6 first[68], second[68];
+        blst_precompute_lines(first, &qa);
+        blst_precompute_lines(second, &qb);
+        for (unsigned sample = 0; sample < 4; ++sample) {
+            blst_p1_affine left = pa, right = pb;
+            if (sample & 1) memset(&left, 0, sizeof left);
+            if (sample & 2) right = left;
+            blst_miller_loop_lines(&f1, first, &left);
+            blst_miller_loop_lines(&f2, second, &right);
+            blst_fp12_conjugate(&f1);
+            blst_fp12_mul(&f1, &f1, &f2);
+            stwo_miller_two_prepared(&f2, first, &left, second, &right);
+            if (!blst_fp12_is_equal(&f1, &f2)) return 1;
+        }
         hex("pairing.val", (const byte*)&e1, sizeof e1 < 64 ? sizeof e1 : 64);
     }
     return 0;
