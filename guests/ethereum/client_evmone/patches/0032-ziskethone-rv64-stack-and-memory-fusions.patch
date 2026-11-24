@@ -1,0 +1,131 @@
+--- a/cpp-guest/zisk/evm/fused_dispatch.inl
++++ b/cpp-guest/zisk/evm/fused_dispatch.inl
+@@ -54,15 +54,23 @@
+ static_assert(zeg_gas_fixed<OP_GT, 3>());
+ static_assert(zeg_gas_fixed<OP_SLT, 3>());
+ static_assert(zeg_gas_fixed<OP_SGT, 3>());
++static_assert(zeg_gas_fixed<OP_PUSH1, 3>() && zeg_gas_fixed<OP_DUP1, 3>());
++static_assert(zeg_gas_fixed<OP_SHL, 3, EVMC_PETERSBURG>() && zeg_gas_fixed<OP_SUB, 3>() &&
++              zeg_gas_fixed<OP_AND, 3>());
++static_assert(
++    zeg_gas_fixed<OP_DUP2, 3>() && zeg_gas_fixed<OP_DUP3, 3>() && zeg_gas_fixed<OP_DUP4, 3>());
++static_assert(
++    zeg_gas_fixed<OP_ADD, 3>() && zeg_gas_fixed<OP_MLOAD, 3>() && zeg_gas_fixed<OP_MSTORE, 3>());
+
+ // Entry opcodes with a fused fast path; every other opcode pays nothing.
+ template <Opcode Op>
+-constexpr bool zeg_fusable = Op == OP_JUMP || Op == OP_PUSH2 || Op == OP_PUSH4 ||
+-                             Op == OP_ISZERO || Op == OP_EQ
++constexpr bool zeg_fusable =
++    Op == OP_JUMP || Op == OP_PUSH2 || Op == OP_PUSH4 || Op == OP_ISZERO || Op == OP_EQ
+ #if defined(ZEG_STWO)
+-                             || Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT
++    || Op == OP_PUSH1 || Op == OP_DUP1 || Op == OP_DUP4 || Op == OP_LT || Op == OP_GT ||
++    Op == OP_SLT || Op == OP_SGT
+ #endif
+-                             ;
++    ;
+
+ // Attempt the fusion for OPCODE; on success re-dispatch directly. Expanded
+ // inside dispatch_cgoto's ON_OPCODE, where position/gas/... are in scope.
+@@ -151,6 +159,100 @@
+     // computed on every entry, including the common no-fusion exit.
+     const auto* const top = pos.stack_end;
+
++    if constexpr (Op == OP_DUP4)
++    {
++        // Compile only this exact, side-effect-free loop header and word-copy body.
++        // PUSH data and both dynamic destinations stay part of the original EVM code.
++        if (p[1] != OP_DUP2 || p[2] != OP_LT || p[3] != OP_ISZERO || p[4] != OP_PUSH2 ||
++            p[7] != OP_JUMPI || p[8] != OP_DUP2 || p[9] != OP_DUP2 || p[10] != OP_ADD ||
++            p[11] != OP_MLOAD || p[12] != OP_DUP4 || p[13] != OP_DUP3 || p[14] != OP_ADD ||
++            p[15] != OP_MSTORE || p[16] != OP_PUSH1 || p[17] != 32 || p[18] != OP_ADD ||
++            p[19] != OP_PUSH2 || p[22] != OP_JUMP || top < stack_bottom + 4 ||
++            top > stack_bottom + StackSpace::limit - 3)
++            return false;
++        const size_t back = (size_t(p[20]) << 8) | p[21];
++        const size_t exit = (size_t(p[5]) << 8) | p[6];
++        if (back + 1 != size_t(p - code) || !state.analysis.baseline->check_jumpdest(back) ||
++            !state.analysis.baseline->check_jumpdest(exit))
++            return false;
++        uint64_t upper = 0;
++        for (unsigned i = 1; i <= 4; ++i)
++            upper |= top[-int(i)][1] | top[-int(i)][2] | top[-int(i)][3];
++        const auto off = top[-1][0], end = top[-4][0];
++        if (upper || end <= off || end > ::evmone::max_buffer_size)
++            return false;
++        const uint64_t words = (end - off + 31) / 32, bytes = words * 32;
++        const uint64_t src_base = top[-2][0], dst_base = top[-3][0];
++        if (src_base > ::evmone::max_buffer_size || dst_base > ::evmone::max_buffer_size)
++            return false;
++        const uint64_t a = src_base + off, b = dst_base + off, extent = std::max(a, b) + bytes;
++        if (extent > ::evmone::max_buffer_size || (a != b && a < b + bytes && b < a + bytes))
++            return false;
++        // 25 base gas for the conditional and 42 for a word + the validated back-edge;
++        // final taken test costs 26 including its JUMPDEST. Gas never increases in the loop.
++        const int64_t charge = int64_t(words * 67 + 26);
++        if (gas < charge)
++            return false;
++        int64_t left = gas - charge;
++        if (extent > state.memory.size())
++        {
++            left = ::evmone::grow_memory(left, state.memory, extent);
++            if (left < 0)
++                return false;  // grow_memory leaves the memory intact on underfunding.
++        }
++        if (a != b)
++            std::memcpy(&state.memory[size_t(b)], &state.memory[size_t(a)], size_t(bytes));
++        pos.stack_end[-1] = off + bytes;
++        gas = left;
++        pos.code_it = code + exit + 1;
++        return true;
++    }
++    else if constexpr (Op == OP_DUP1)
++    {
++        // DUP1 PUSH4 selector EQ PUSH2 target JUMPI keeps the selector word live.
++        if (p[1] != OP_PUSH4 || p[6] != OP_EQ || p[7] != OP_PUSH2 || p[10] != OP_JUMPI ||
++            top <= stack_bottom || top > stack_bottom + StackSpace::limit - 2)
++            return false;
++        return zeg_branch(pos, gas, state, code, p + 7, zeg_test<OP_PUSH4>(top, p + 1), 22);
++    }
++    else if constexpr (Op == OP_PUSH1)
++    {
++        // Solidity emits (1 << width) - 1. Fuse the whole constant expression.
++        if (p[1] != 1 || p[2] != OP_PUSH1 || p[3] != 1 || p[4] != OP_PUSH1 || p[6] != OP_SHL ||
++            p[7] != OP_SUB || state.rev < EVMC_PETERSBURG ||
++            top > stack_bottom + StackSpace::limit - 3)
++            return false;
++        const bool consume_word = p[8] == OP_AND && top != stack_bottom;
++        if (!zeg_charge(gas, consume_word ? 18 : 15))
++            return false;
++        const unsigned width = p[5];
++        const uint64_t part = (uint64_t{1} << (width & 63)) - 1;
++        const auto limb = [&](unsigned i) {
++            return i < width / 64 ? ~uint64_t{0} : i == width / 64 ? part : uint64_t{0};
++        };
++        uint256 mask;
++        if (width == 160)
++            mask = uint256{~uint64_t{0}, ~uint64_t{0}, 0xffffffffu, 0};
++        else
++            mask = uint256{limb(0), limb(1), limb(2), limb(3)};
++        if (consume_word)
++            pos.stack_end[-1] &= mask;
++        else
++            *pos.stack_end++ = mask;
++        pos.code_it += consume_word ? 9 : 8;
++        return true;
++    }
++    else if constexpr (Op == OP_LT || Op == OP_GT || Op == OP_SLT || Op == OP_SGT)
++    {
++        if (p[1] == OP_ISZERO && p[2] == OP_PUSH2 && p[5] == OP_JUMPI && top >= stack_bottom + 2)
++        {
++            if (!zeg_branch(pos, gas, state, code, p + 2, !zeg_test<Op>(top, p), 19))
++                return false;
++            pos.stack_end -= 2;
++            return true;
++        }
++    }
++
+     // JUMP lands on a validated JUMPDEST by definition: charge both (8+1) and
+     // skip the JUMPDEST dispatch entirely.
+     if constexpr (Op == OP_JUMP)

@@ -155,6 +155,36 @@ struct Witness {
 
 stwo::H256 to_h(const Bytes& b) { stwo::H256 h; std::memcpy(h.b, b.data(), 32); return h; }
 
+// Force every root child to be a digest. Child 8 straddles the 272-byte
+// checkpoint, child 9 starts past it, and removal changes the list header.
+void check_dense_branch() {
+    std::map<Key, Bytes> original;
+    for (unsigned i = 0; i < 16; ++i) {
+        Key key(32, '\0');
+        key[0] = char(i << 4);
+        original[key] = Bytes(64, char(1 + i));
+    }
+    Witness w;
+    const auto root = to_h(reference_root(original, &w.nodes));
+    w.index();
+    for (const auto& raw : w.nodes)
+        w.store.add(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+    for (unsigned i : {0u, 8u, 9u, 15u}) {
+        Key key(32, '\0');
+        key[0] = char(i << 4);
+        const auto* bytes = reinterpret_cast<const uint8_t*>(key.data());
+        auto expected = original;
+        stwo::MutableTrie trie(w.store, root);
+        auto& value = expected[key];
+        value[0] ^= 1;
+        trie.put(bytes, reinterpret_cast<const uint8_t*>(value.data()), value.size());
+        if (!(trie.root_hash() == to_h(reference_root(expected, nullptr)))) fail("dense branch replacement", i);
+        expected.erase(key);
+        trie.remove(bytes);
+        if (!(trie.root_hash() == to_h(reference_root(expected, nullptr)))) fail("dense branch removal", i);
+    }
+}
+
 int run_case(int cs) {
     std::map<Key, Bytes> m;
     const int n = 1 + int(rng() % (cs % 7 == 0 ? 400 : 60));
@@ -267,6 +297,7 @@ void run_partial(int cs) {
 
 int main(int argc, char** argv) {
     const int cases = argc > 1 ? std::atoi(argv[1]) : 600;
+    check_dense_branch();
     long keys = 0;
     for (int c = 0; c < cases; ++c) keys += run_case(c);
     for (int c = 0; c < cases / 3; ++c) run_partial(c);

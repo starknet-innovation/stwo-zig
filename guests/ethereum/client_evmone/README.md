@@ -53,6 +53,11 @@ Toolchain: `zig c++` 0.15.2 only (bundled libc++ headers and compiler-rt,
 `linker-wide-cxx.ld`). `--jobs` defaults to 4. Writes `build-manifest-*.json`
 (commits, applied patches, defines, ELF sha256).
 
+The RV64IM v3 guest uses ThinLTO across translation units and RISC-V linker
+relaxation to shorten calls. The manifest records these flags in
+`guest_link_optimization`. Use the ELF digest, terminal PC and linker symbols
+from the same build when preparing a proving request.
+
 ## Score
 
 The scoring harness behind this README's numbers is archived as
@@ -75,9 +80,9 @@ The adapter is optional (the guest also accepts the plain canonical SSZ).
 | Output | 43 bytes at `__output_data` (request root, 1, chain id LE, schema id LE), `__output_len = 43`, `__halt_flag = 1`, then spin |
 | Failure | illegal instruction (`.word 0`), no output (the Rust guest panics the same way) |
 | Linker | `linker-wide-cxx.ld` = `rv64/linker-wide.ld` plus `.init_array` inside `.data`; memory map and symbols unchanged |
-| Patches | 0001 ziskethone (SSZ witness state, lazy rows, RV64 word paths), 0002 blst 64-bit limbs, 0003 intx byte-wise big-endian, 0004 candidate arith256_mod, 0005 evmc word compares and copy-free host trampolines; 0006-0017 interpreter; 0020/0021 candidate curves; 0023 v3 modexp; 0025 code digest in the ZEG0 contract record; 0026 blst constant-limb Montgomery product; 0027 ziskethone word copies; 0028/0029 JUMPDEST analysis on the jumpdest_bitmap service (admitted v3 default `jumpdest` group; `--candidate-jumpdest` for the execution-only candidate); 0030 deferred gas test for pure stack opcodes in `dispatch_cgoto` (the switch dispatch keeps per-opcode checks and is the fuzzer's reference) and PUSH1..7 with one store of limb 0; `wip/0024` translated segments (parked, not applied: measured slower) |
+| Patches | 0001 ziskethone (SSZ witness state, lazy rows, RV64 word paths), 0002 blst 64-bit limbs, 0003 intx byte-wise big-endian, 0004 candidate arith256_mod, 0005 evmc word compares and copy-free host trampolines; 0006-0017 interpreter; 0020/0021 candidate curves; 0023 v3 modexp; 0025 code digest in the ZEG0 contract record; 0026 blst constant-limb Montgomery product; 0027 ziskethone word copies; 0028/0029 JUMPDEST analysis on the jumpdest_bitmap service (admitted v3 default `jumpdest` group; `--candidate-jumpdest` for the execution-only candidate); 0030 deferred gas test for pure stack opcodes in `dispatch_cgoto` (the switch dispatch keeps per-opcode checks and is the fuzzer's reference) and PUSH1..7 with one store of limb 0; 0031 aligned EVM memory words; 0032 guarded stack and word-copy fusions; 0033/0034 shared prepared Miller loop for KZG; `wip/0024` translated segments (parked, not applied: measured slower) |
 | Keccak-f | `0x0001_0001` in `glue/keccak_stwo.cpp` (replaces evmone's `keccak.c`) |
-| secp256k1 | `0x0002_0011/0012` word packets, complete RCB formulas, in `glue/secp256k1_stwo.cpp` |
+| secp256k1 | Complete RCB ADD word packets (`0x0002_0011`) cover additions and doublings in `glue/secp256k1_stwo.cpp`. |
 | Candidate | `0x0003_0001-0003` bulk memory (runtime), `0x0003_0010` SHA-256 compress, `0x0003_0021` arith256_mod (MULMOD, ADDMOD, 256-bit `ModArith` in plain form), optional `0x0003_0020` arith256 for MUL |
 | Candidate curves | groups `bn` (needs `arith`): `0x0003_0100/0101` BN254 affine add/double for ecAdd/ecMul, `0x0003_0102` Fq2 product in ecPairing; `bls`: `0x0003_0121` arith384_mont for blst's 384-bit Montgomery products and `0x0003_0112` BLS12-381 Fp2 product (KZG, EIP-2537); `keccak`: `0x0003_0130` Keccak-256 sponge for inputs over 64 bytes. Glue `glue/curves_stwo.cpp`, `glue/candidate_curves.hpp`, patches 0020/0021; ABI [`../abi/candidate-curves-abi.md`](../abi/candidate-curves-abi.md) |
 
@@ -106,7 +111,11 @@ The adapter is optional (the guest also accepts the plain canonical SSZ).
   allocation), owned nodes are modified in place, only dirty paths are
   re-hashed. A branch owned from the witness records the positions assigned
   since and re-encodes by copying the runs of unchanged items from its
-  original encoding.
+  original encoding. A full branch has sixteen digest references and a
+  532-byte canonical encoding. The v3 sponge guest retains the Keccak state
+  after its first two rate blocks (272 bytes). Re-encoding can resume there
+  when the length is unchanged and all nine child items touching the prefix
+  are unmodified. Other shapes and earlier edits hash the complete encoding.
 - **State tables.** ziskethone's account and storage row indexes are
   open-addressing tables of key words (`zeg/stwo_flat_index.hpp`, patch 0001)
   with the same seeded hash; the seeded hash, fixed-size compares/copies and
@@ -114,7 +123,7 @@ The adapter is optional (the guest also accepts the plain canonical SSZ).
   accesses instead of the byte loops RV64IM gets for alignment-1 arrays.
 - **Senders.** The SSZ public key of each transaction gives the sender at
   once; all signatures are checked in one batch (batched inversions, GLV
-  endomorphism, 4-bit Straus over the secp services). Verification with the
+  endomorphism, a fixed generator comb and signed width-five digits). Verification with the
   y-parity check pins the unique recovered key, so it equals recovery.
 - **Adapter (`adapter.py`).** Untrusted: runs the native host build and appends
   hints for every full recovery (key, `R.y`, `s^-1`). The guest checks
@@ -154,6 +163,14 @@ The adapter is optional (the guest also accepts the plain canonical SSZ).
   defines both patches are inert (v3 per-block instruction counts identical).
   Proposal and measurements:
   [`proposals/jumpdest-bitmap.md`](https://github.com/starknet-innovation/stwo-zig/tree/archive/pre-restructure-20261108/autoresearch/guest_efficiency/proposals/jumpdest-bitmap.md) (archived).
+
+## Ethereum guest execution qualification
+
+Across 15 Ethereum blocks, patches 0032–0034 reduced the previous qualified guest from 1,285,147,794 to 1,267,505,327 retired instructions and from 315 to 310 CPU shards. Block 26,235,168 fell from 101,193,870 to 99,260,098 instructions and from 25 to 24 shards. All 15 host executions and all 15 physical RV64IM executions reproduced the expected 43-byte outputs. The receipt includes the input and ELF hashes, per-block steps, shard counts and service RAM traffic. [Execution qualification](../../../vectors/reports/rv64-productionisation/ethereum-guest-execution-20261123.json)
+
+The interpreter fuses Solidity selector tests, width masks, negated comparisons and a bounded forward word-copy loop. Before consuming the loop it validates both jump destinations, stack limits, memory extent, aliasing and the full gas charge. Unmatched cases return to ordinary opcode dispatch. The KZG verifier combines the two prepared Miller loops in one field accumulator and shares their 62 doubling squares. Its regression compares the full Fp12 product before final exponentiation with two separate Miller loops.
+
+Rebuild the RV64IM guest with `build.py --profile v3 --isa im` and a fresh output directory. Read its ELF digest from `build-manifest-v3.json` and its `__input_*`, `__output_*`, `__heap_*`, `__stack_*` and `__halt_flag` symbols from that exact ELF. Run the Ethereum execution driver with `engine=fast`, `execution_profile=ethereum_services_v3`, the input digest and expected output in the receipt. Run `build.py --host --tests` for the independent switch interpreter and cryptographic regression tests. The live GPU service binds its own ELF, ROM and derived proof classes. Promotion of a rebuilt guest requires a freshly verified recursive root for that identity.
 
 ## Tests
 

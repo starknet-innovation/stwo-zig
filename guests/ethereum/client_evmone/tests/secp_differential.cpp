@@ -17,6 +17,7 @@
 
 #include <evmone_precompiles/secp256k1.hpp>
 
+extern "C" uint64_t stwo_host_secp_add_calls, stwo_host_secp_double_calls;
 extern "C" int secp256k1_ecdsa_recover(const uint64_t* z, const uint64_t* r, const uint64_t* s, unsigned recid,
                                        uint64_t* pubkey);
 extern "C" bool stwo_secp_hint_sender(const uint8_t z_be[32], const uint8_t r_be[32], const uint8_t s_be[32],
@@ -135,5 +136,11 @@ int main(int argc, char** argv) {
     }
     std::printf("recover agree ok=%d agree-fail=%d; hinted accept=%d reject=%d; mismatches=%d\n", agree_ok,
                 agree_fail, hint_ok, hint_bad, mismatches);
+    if (stwo_host_secp_double_calls || (agree_ok && !stwo_host_secp_add_calls)) {
+        std::fprintf(stderr, "unexpected secp truth requests: ADD=%llu DOUBLE=%llu\n",
+                     static_cast<unsigned long long>(stwo_host_secp_add_calls),
+                     static_cast<unsigned long long>(stwo_host_secp_double_calls));
+        return 1;
+    }
     return mismatches == 0 ? 0 : 1;
 }

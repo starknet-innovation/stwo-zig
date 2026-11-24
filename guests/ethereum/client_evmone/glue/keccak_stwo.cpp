@@ -99,16 +99,70 @@ inline uint64_t tail_word(const uint8_t* p, size_t n) {
 // call; the digest is recomputed exactly on a miss.
 constexpr size_t kMemoSlots = 4096;
 struct MemoEntry {
-    uint64_t key[9];
+    uint64_t key[8];
+    uint64_t size_plus_one;
     uint64_t out[4];
 };
 MemoEntry* g_memo = nullptr;
+
+// The nine-lane hash remains identical to the padded representation. Multiplication
+// by the precomputed power appends the zero suffix without materializing it.
+constexpr uint64_t kMemoPrime = 0x9E3779B97F4A7C15ull;
+struct MemoPowers {
+    uint64_t zero[9]{1};
+    constexpr MemoPowers() {
+        for (size_t i = 1; i < 9; ++i) zero[i] = zero[i - 1] * kMemoPrime;
+    }
+};
+constexpr MemoPowers kMemoPowers{};
+
+template <size_t FixedSize = size_t(-1)>
+inline union ethash_hash256 memoized_short(const uint8_t* data, size_t size) noexcept {
+    if constexpr (FixedSize != size_t(-1)) size = FixedSize;
+    const size_t words = size / 8, rem = size % 8;
+    alignas(32) uint64_t state[25];
+    if (words != 0) absorb_words<true>(state, data, words);
+    state[words] = uint64_t(1) << (8 * rem);
+    if (rem != 0) state[words] |= tail_word(data + 8 * words, rem);
+
+    if (!g_memo) g_memo = static_cast<MemoEntry*>(std::calloc(kMemoSlots, sizeof(MemoEntry)));
+    uint64_t h = 0;
+    for (size_t i = 0; i <= words; ++i) h = (h ^ state[i]) * kMemoPrime;
+    h *= kMemoPowers.zero[8 - words];
+    MemoEntry& entry = g_memo[(h >> 52) & (kMemoSlots - 1)];
+    union ethash_hash256 out;
+    // Full limbs and the masked final limb determine every byte; the stored
+    // length distinguishes padding and uses the ninth slot in the original key.
+    const size_t key_words = (size + 7) / 8;
+    if (entry.size_plus_one == size + 1) {
+        uint64_t difference = 0;
+        for (size_t i = 0; i < key_words; ++i) difference |= entry.key[i] ^ state[i];
+        if (difference == 0) {
+            __builtin_memcpy_inline(out.word64s, entry.out, sizeof(entry.out));
+            return out;
+        }
+    }
+    entry.size_plus_one = size + 1;
+    for (size_t i = 0; i < key_words; ++i) entry.key[i] = state[i];
+    zero_lanes_from(state, words + 1);
+    state[kRateWords - 1] = uint64_t(0x80) << 56;
+    stwo::keccak_f(state);
+    __builtin_memcpy_inline(out.word64s, state, sizeof(entry.out));
+    __builtin_memcpy_inline(entry.out, state, sizeof(entry.out));
+    return out;
+}
 }  // namespace
 
 // no_builtin("memcpy"): the aligned first-block absorb (st[i] = word i) would
 // otherwise become a 136-byte memcpy call.
 extern "C" __attribute__((no_builtin("memcpy"))) union ethash_hash256 ethash_keccak256(const uint8_t* data,
                                                                                         size_t size) noexcept {
+    if (size <= 64) {
+        if (size == 32) return memoized_short<32>(data, size);
+        if (size == 64) return memoized_short<64>(data, size);
+        if (size == 20) return memoized_short<20>(data, size);
+        return memoized_short(data, size);
+    }
     alignas(32) uint64_t st[25];
 #if defined(ADMITTED_KECCAK)
     // Admitted Keccak-256 sponge (ethereum_services_v3, tag 0x0003_0130):
@@ -118,16 +172,14 @@ extern "C" __attribute__((no_builtin("memcpy"))) union ethash_hash256 ethash_kec
     // tail with finalize. st and the packet are word-disjoint from the input.
     if (size > 64) {
         constexpr uint64_t kChunk = 7710 * kRate;  // < 2^20, whole blocks
-        uint64_t flags = 2;                         // fresh
+        uint64_t flags = stwo::kSpongeFresh;                         // fresh
         while (size > kChunk) {
-            alignas(8) uint64_t pk[4] = {reinterpret_cast<uintptr_t>(st), reinterpret_cast<uintptr_t>(data), kChunk, flags};
-            stwo::ecall(0x00030130, pk);
+            stwo::keccak_sponge(st, data, kChunk, flags);
             data += kChunk;
             size -= kChunk;
             flags = 0;
         }
-        alignas(8) uint64_t pk[4] = {reinterpret_cast<uintptr_t>(st), reinterpret_cast<uintptr_t>(data), size, flags | 1};
-        stwo::ecall(0x00030130, pk);
+        stwo::keccak_sponge(st, data, size, flags | stwo::kSpongeFinalize);
         union ethash_hash256 out;
         for (int i = 0; i < 4; ++i) out.word64s[i] = st[i];
         return out;
@@ -165,24 +217,7 @@ extern "C" __attribute__((no_builtin("memcpy"))) union ethash_hash256 ethash_kec
         absorb_words<true>(st, data, words);
         st[words] = last;
         zero_lanes_from(st, words + 1);
-        if (size <= 64) {
-            if (!g_memo) g_memo = static_cast<MemoEntry*>(std::calloc(kMemoSlots, sizeof(MemoEntry)));
-            uint64_t h = 0;
-            for (int i = 0; i < 9; ++i) h = (h ^ st[i]) * 0x9E3779B97F4A7C15ull;
-            MemoEntry& m = g_memo[(h >> 52) & (kMemoSlots - 1)];
-            uint64_t diff = 0;
-            for (int i = 0; i < 9; ++i) diff |= m.key[i] ^ st[i];
-            union ethash_hash256 out;
-            if (diff == 0 && (m.key[0] | m.key[1] | m.key[8] | m.out[0])) {
-                for (int i = 0; i < 4; ++i) out.word64s[i] = m.out[i];
-                return out;
-            }
-            for (int i = 0; i < 9; ++i) m.key[i] = st[i];
-            st[kRateWords - 1] ^= uint64_t(0x80) << 56;
-            stwo::keccak_f(st);
-            for (int i = 0; i < 4; ++i) out.word64s[i] = m.out[i] = st[i];
-            return out;
-        }
+
     } else {
         absorb_words<false>(st, data, words);
         st[words] ^= last;

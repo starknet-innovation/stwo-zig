@@ -137,6 +137,8 @@ uint64_t* at(uint64_t v) { return reinterpret_cast<uint64_t*>(v); }
 }  // namespace
 // Calls per candidate curve tag (low byte), so host tests can assert that a hook is live.
 extern "C" { uint64_t stwo_host_curve_calls[256]; }
+// Separate from the candidate curve tags, whose low bytes overlap secp.
+extern "C" { uint64_t stwo_host_secp_add_calls, stwo_host_secp_double_calls; }
 namespace {
 void emu_candidate_curve(uint64_t tag, uint64_t* w) {
     ++stwo_host_curve_calls[tag & 0xff];
@@ -189,7 +191,7 @@ void emu_candidate_curve(uint64_t tag, uint64_t* w) {
             st6(at(w[4]), r);
             return;
         }
-        case stwo::kCandKeccakSponge: {
+        case stwo::kKeccakSponge: {
             uint64_t* s = at(w[0]);
             const uint8_t* in = reinterpret_cast<const uint8_t*>(w[1]);
             const uint64_t len = w[2], flags = w[3];
@@ -225,8 +227,8 @@ void host_service(uint64_t tag, void* packet) noexcept {
     uint64_t* w = static_cast<uint64_t*>(packet);
     switch (tag) {
         case kKeccakF: keccakf(w); return;
-        case kSecpAddWords: emu_secp_add(w); return;
-        case kSecpDoubleWords: emu_secp_double(w); return;
+        case kSecpAddWords: ++stwo_host_secp_add_calls; emu_secp_add(w); return;
+        case kSecpDoubleWords: ++stwo_host_secp_double_calls; emu_secp_double(w); return;
         case kCandMemcpy: std::memmove(reinterpret_cast<void*>(w[0]), reinterpret_cast<void*>(w[1]), w[2]); return;
         case kCandMemset: std::memset(reinterpret_cast<void*>(w[0]), int(w[1] & 0xff), w[2]); return;
         case kCandMemcmp: {

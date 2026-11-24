@@ -14,6 +14,7 @@
 //     the original node encoding; only modified positions are rebuilt.
 //   * Decoded and mutable nodes come from a bump arena (never freed).
 #include "witness_trie.hpp"
+#include "services.hpp"
 
 #include <cstdlib>
 #include <new>
@@ -177,6 +178,9 @@ inline size_t child_item_len(uint8_t b) { return kChildLen.len[b]; }
 // at the flag byte, nibble i of the path is hp_nibble(hp, i + skip) with
 // skip = 1 for odd lengths and 2 for even ones.
 struct DNode {
+#if defined(ADMITTED_KECCAK)
+    uint64_t* sponge_prefix;  // only materialized dense branches own a checkpoint
+#endif
     const uint8_t* raw;
     uint32_t raw_len;
     uint8_t kind;  // 0 leaf, 1 extension, 2 branch
@@ -254,6 +258,9 @@ DNode* decode_dnode(const uint8_t* p, size_t n) {
         d->raw = p;
         d->raw_len = static_cast<uint32_t>(n);
         d->kind = 2;
+#if defined(ADMITTED_KECCAK)
+        d->sponge_prefix = nullptr;
+#endif
         d->plen = 0;
         d->resolved = 0;
         d->scanned = 0;
@@ -346,15 +353,81 @@ void NodeStore::init(size_t expected) {
 
 static inline size_t slot_index(uint64_t first_word) { return static_cast<size_t>(first_word); }
 
+// Canonical RLP of sixteen 32-byte digest references and an empty branch value.
+constexpr unsigned dense_header = 3, digest_item = 33;
+constexpr unsigned dense_size = dense_header + 16 * digest_item + 1;
+constexpr unsigned checkpoint_size = 2 * 136;
+constexpr unsigned prefix_children = (checkpoint_size - dense_header + digest_item - 1) / digest_item;
+
+struct DenseBranch {
+    DNode decoded;
+#if defined(ADMITTED_KECCAK)
+    uint64_t checkpoint[25];
+#endif
+};
+
+static DNode* full_digest_branch(const uint8_t* p, size_t n, DNode*& spare) {
+    if (n != dense_size || p[0] != 0xf9 || p[1] != 2 || p[2] != 17 || p[n - 1] != 0x80) return nullptr;
+    unsigned tags = 0;
+    for (unsigned i = 0; i < 16; ++i) tags |= p[dense_header + digest_item * i] ^ 0xa0;
+    if (tags != 0) return nullptr;
+
+    // Hold one unclaimed slot across duplicate preimages; ownership transfers
+    // to the hash index only on its first insertion of this digest.
+    if (!spare) {
+        auto* dense = static_cast<DenseBranch*>(arena_alloc(sizeof(DenseBranch)));
+        spare = &dense->decoded;
+#if defined(ADMITTED_KECCAK)
+        spare->sponge_prefix = dense->checkpoint;
+#endif
+    }
+    DNode* d = spare;
+    d->raw = p;
+    d->raw_len = dense_size;
+    d->kind = 2;
+    d->plen = 0;
+    d->resolved = 0;
+    d->scanned = 16;
+    for (unsigned i = 0; i <= 16; ++i) d->off[i] = dense_header + i * digest_item;
+    return d;
+}
+
+#if defined(ADMITTED_KECCAK)
+static H256 finish_dense(const uint64_t* prefix, const uint8_t* data) {
+    alignas(8) uint64_t state[25];
+#if defined(ADMITTED_MEM)
+    // The internal state and its copy are disjoint, word-aligned and exactly 200 bytes.
+    alignas(8) uint64_t copy[] = {reinterpret_cast<uintptr_t>(state), reinterpret_cast<uintptr_t>(prefix), sizeof(state)};
+    ecall(kV3Memcpy, copy);
+#else
+    __builtin_memcpy_inline(state, prefix, sizeof(state));
+#endif
+    keccak_sponge(state, data + checkpoint_size, dense_size - checkpoint_size, kSpongeFinalize);
+    H256 h;
+    __builtin_memcpy_inline(h.b, state, sizeof(h.b));
+    return h;
+}
+#endif
+
 void NodeStore::add(const uint8_t* rlp, size_t len) {
     if (count_ * 2 >= mask_) stwo_fatal("node store overflow");
-    const H256 h = keccak(rlp, len);
+    DNode* dense = full_digest_branch(rlp, len, spare_dense_);
+    const H256 h = [&] {
+#if defined(ADMITTED_KECCAK)
+        if (dense) {
+            keccak_sponge(dense->sponge_prefix, rlp, checkpoint_size, kSpongeFresh);
+            return finish_dense(dense->sponge_prefix, rlp);
+        }
+#endif
+        return keccak(rlp, len);
+    }();
     size_t i = slot_index(*reinterpret_cast<const uint64_t*>(h.b)) & mask_;
     while (slots_[i].p != nullptr) {
         if (slots_[i].key == h) return;  // duplicate node
         i = (i + 1) & mask_;
     }
-    slots_[i] = Slot{h, rlp, len, nullptr};
+    slots_[i] = Slot{h, rlp, len, dense};
+    if (dense) spare_dense_ = nullptr;
     ++count_;
 }
 
@@ -751,6 +824,18 @@ struct ItemRef {
     size_t size() const { return len ? len : 33; }
 };
 
+H256 hash_encoded_node(const Node* node, const uint8_t* data, size_t len) {
+#if defined(ADMITTED_KECCAK)
+    // encode() copies the unmodified child items verbatim. Equal encoded length
+    // fixes the canonical three-byte header. Every child overlapping [3,272)
+    // must still be original, including child 8 which crosses the checkpoint.
+    if (len == dense_size && node->src && node->src->sponge_prefix &&
+        !(node->mod & ((1u << prefix_children) - 1)))
+        return finish_dense(node->src->sponge_prefix, data);
+#endif
+    return keccak(data, len);
+}
+
 ItemRef child_ref(Node* n, uint8_t emb[32], const NodeStore& store) {
     if (is_ref(n)) {
         const uint8_t* c = ref_of(n);
@@ -764,7 +849,7 @@ ItemRef child_ref(Node* n, uint8_t emb[32], const NodeStore& store) {
             for (size_t i = 0; i < len; ++i) emb[i] = buf[i];
             return ItemRef{emb, len};
         }
-        n->hash = keccak(buf, len);
+        n->hash = hash_encoded_node(n, buf, len);
         n->has_hash = true;
         n->dirty = false;
     }
@@ -914,7 +999,7 @@ H256 MutableTrie::root_hash() {
     Node* r = own(root_, store_);
     alignas(8) uint8_t buf[600];
     const size_t len = encode(r, buf, store_);
-    return keccak(buf, len);
+    return hash_encoded_node(r, buf, len);
 }
 
 }  // namespace stwo
