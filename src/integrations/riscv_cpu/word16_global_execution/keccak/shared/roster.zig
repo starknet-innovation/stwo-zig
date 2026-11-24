@@ -127,6 +127,9 @@ pub const TruthSetup = struct {
         return initPolicy(a, log, suite, .triple_v2);
     }
     pub fn initPolicy(a: std.mem.Allocator, log: u32, suite: Key.Suite, policy: Policy) !TruthSetup {
+        return initWithFixedMode(a, log, suite, policy, .committed);
+    }
+    pub fn initWithFixedMode(a: std.mem.Allocator, log: u32, suite: Key.Suite, policy: Policy, mode: Key.FixedMode) !TruthSetup {
         try suite.validate();
         if (policy == .quartet_v3) return error.UnsupportedSharedTruthPolicy;
         if (log > 21) return error.SharedTruthGeometryBudget;
@@ -143,7 +146,7 @@ pub const TruthSetup = struct {
         var self = TruthSetup{ .allocator = a, .log = log, .fixed = fixed, .chi = chi, .xor5 = xor, .key = undefined, .policy = policy };
         const cols = try self.fixedColumns(a);
         defer a.free(cols);
-        self.key = try Key.sealWithSuite(a, cols, suite);
+        self.key = try Key.prepare(a, cols, suite, mode);
         return self;
     }
     pub fn deinit(self: *TruthSetup) void {

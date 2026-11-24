@@ -59,29 +59,41 @@ pub const Planned = struct {
     }
 };
 
-pub fn plan(in: Inputs) !Planned {
+fn fixedWords(in: Inputs) !struct { main: u64, slab: u64, slabs: u64, total: u64 } {
     const main = try Regions.alignedWords(in.main_resident_words);
     const slab = try Regions.alignedWords(in.slab_words);
     const slabs = try Regions.addWords(slab, slab);
     var fixed: u64 = 0;
     for ([_]u64{ in.class_cache_words, in.graph_exec_words, main, slabs, in.reserve_words }) |w| fixed = try Regions.addWords(fixed, w);
-    if (fixed >= in.capacity_words) return error.GpuNativeMemoryPlanExceedsDevice;
-    var arena = std.mem.alignBackward(u64, in.capacity_words - fixed, granule);
+    return .{ .main = main, .slab = slab, .slabs = slabs, .total = fixed };
+}
+
+pub fn minimumCapacity(in: Inputs) !u64 {
+    const fixed = try fixedWords(in);
+    const peak = @max(granule, in.phase_a_peak_words, in.phase_b_peak_words -| fixed.main);
+    const arena = try Regions.alignedWords(peak);
+    return Regions.addWords(fixed.total, arena);
+}
+
+pub fn plan(in: Inputs) !Planned {
+    const fixed = try fixedWords(in);
+    if (fixed.total >= in.capacity_words) return error.GpuNativeMemoryPlanExceedsDevice;
+    var arena = std.mem.alignBackward(u64, in.capacity_words - fixed.total, granule);
     if (in.arena_cap_words != 0) arena = @min(arena, std.mem.alignBackward(u64, in.arena_cap_words, granule));
     if (arena == 0) return error.GpuNativeMemoryPlanNoArena;
     if (in.phase_a_peak_words > arena) return error.GpuNativeMemoryPlanPhaseA;
-    const phase_b = try Regions.addWords(arena, main);
+    const phase_b = try Regions.addWords(arena, fixed.main);
     if (in.phase_b_peak_words > phase_b) return error.GpuNativeMemoryPlanPhaseB;
     var m = Regions.MemoryPlan{ .device = in.device, .capacity_words = in.capacity_words };
     m.set(.class_cache, in.class_cache_words);
     m.set(.graph_exec, in.graph_exec_words);
-    m.set(.main_resident, main);
+    m.set(.main_resident, fixed.main);
     m.set(.arena, arena);
     m.set(.truth, 0); // truth jobs are arena classes with measured peaks
-    m.set(.exchange_slab, slabs);
+    m.set(.exchange_slab, fixed.slabs);
     m.set(.reserve, in.reserve_words);
     try m.validate();
-    return .{ .memory = m, .phase_a_words = arena, .phase_b_words = phase_b, .slab_words = slab };
+    return .{ .memory = m, .phase_a_words = arena, .phase_b_words = phase_b, .slab_words = fixed.slab };
 }
 
 /// Sequential main_resident views per segment on one GPU (segment order).
@@ -98,6 +110,20 @@ pub fn mainViews(region_words: u64, segment_main_words: []const u64, out_offsets
 
 const testing = std.testing;
 const GiB: u64 = (1 << 30) / 4;
+
+/// Repartition the existing allocation only when both phases still fit.
+/// This optional optimization never evicts capture or increases the allocation.
+pub fn withMainNodes(in: Inputs, base: Planned, preferred: u64) !?Planned {
+    if (preferred <= in.main_resident_words) return null;
+    var proposed = in;
+    proposed.capacity_words = base.memory.capacity_words;
+    proposed.main_resident_words = preferred;
+    const result = plan(proposed) catch |err| switch (err) {
+        error.GpuNativeMemoryPlanExceedsDevice, error.GpuNativeMemoryPlanNoArena, error.GpuNativeMemoryPlanPhaseA, error.GpuNativeMemoryPlanPhaseB => return null,
+        else => return err,
+    };
+    return if (result.phase_b_words <= base.phase_b_words) result else null;
+}
 
 test "plan: fixed carve excludes CUDA free bytes; growing pool includes them" {
     // Gate 10: a 27.28 GB carve plus 2.17 GB outside it was treated as one
@@ -146,4 +172,46 @@ test "plan: fails closed on each region" {
     try mainViews(192, &.{ 64, 64, 64 }, &offsets);
     try testing.expectEqual(@as(u64, 128), offsets[2]);
     try testing.expectError(error.GpuNativeMainResidentOverflow, mainViews(190, &.{ 64, 64, 64 }, &offsets));
+}
+
+test "minimum capacity is the exact admission boundary for both phases" {
+    var in: Inputs = .{
+        .device = 0,
+        .capacity_words = 0,
+        .class_cache_words = 31,
+        .graph_exec_words = 17,
+        .main_resident_words = 191,
+        .slab_words = 65,
+        .reserve_words = 81,
+        .phase_a_peak_words = 249,
+        .phase_b_peak_words = 0,
+    };
+    for ([_]u64{ 0, 448, 449 }) |peak_b| {
+        in.phase_b_peak_words = peak_b;
+        in.capacity_words = try minimumCapacity(in);
+        const exact = try plan(in);
+        try testing.expectEqual(in.capacity_words, try exact.memory.total());
+        in.capacity_words -= 1;
+        try testing.expectError(if (peak_b == 449) error.GpuNativeMemoryPlanPhaseB else error.GpuNativeMemoryPlanPhaseA, plan(in));
+    }
+}
+
+test "optional MAIN nodes repartition the arena only if both phases fit" {
+    var in: Inputs = .{
+        .device = 0,
+        .capacity_words = 1024,
+        .graph_exec_words = 0,
+        .main_resident_words = 128,
+        .phase_a_peak_words = 448,
+        .phase_b_peak_words = 768,
+        .slab_words = 64,
+        .reserve_words = 64,
+    };
+    const base = try plan(in);
+    const retained = (try withMainNodes(in, base, 256)).?;
+    try std.testing.expectEqual(@as(u64, 256), retained.mainResidentWords());
+    try std.testing.expectEqual(base.phase_b_words, retained.phase_b_words);
+    try std.testing.expectEqual(@as(?Planned, null), try withMainNodes(in, base, 448));
+    in.arena_cap_words = 640;
+    try std.testing.expectEqual(@as(?Planned, null), try withMainNodes(in, try plan(in), 256));
 }

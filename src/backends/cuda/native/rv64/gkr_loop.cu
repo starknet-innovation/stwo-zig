@@ -401,7 +401,7 @@ stwo_rv64_gkr_binding_metadata_on(void *ctx, uint32_t lane,
   if (!input || input->reserved || !input->count ||
       input->count > max_oracles || input->instance >= input->count ||
       !input->layers || input->layers > 28 || !input->row_log ||
-      input->row_log > 22 || input->lane_log > 8 ||
+      input->row_log > STWO_RV64_BINDING_MAX_ROW_LOG || input->lane_log > 8 ||
       input->row_log + input->lane_log > input->layers ||
       reinterpret_cast<uintptr_t>(input->state) % alignof(GkrState))
     return int(cudaErrorInvalidValue);

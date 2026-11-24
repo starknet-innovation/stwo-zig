@@ -19,6 +19,7 @@ pub const Authority = struct {
     profile_identity: [32]u8,
     rung_table_identity: [32]u8,
     config: Worker.PcsConfig,
+    envelope: Hash.ExecutionEnvelope = .admitted,
     table: *const Table.Table,
     index: usize,
 };
@@ -49,7 +50,7 @@ pub fn constrain(ctx: *C.Context, authority: Authority, node: Summary.Wires, exp
     try same(ctx, node.raw[Summary.Index.image..][0..8], &expected.admission.image_identity);
     const base = try Hash.executionIdentity(ctx, authority.config, expected);
     try same(ctx, node.raw[Summary.Index.expected..][0..8], &base);
-    const execution = try Hash.gkrExecutionIdentity(ctx, authority.config, base);
+    const execution = try Hash.gkrExecutionIdentityFor(authority.envelope, ctx, authority.config, base);
     try same(ctx, &native.execution, &execution);
 
     const root = try Table.guessHash(ctx, authority.table.root());

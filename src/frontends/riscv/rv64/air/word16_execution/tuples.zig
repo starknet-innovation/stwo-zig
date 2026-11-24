@@ -132,6 +132,9 @@ pub const compact = struct {
     /// OWNER19 with IMM = (low16, sign, sign, sign) and B_store = B: affine,
     /// so the OWNER+U16 fraction keeps degree 3.
     pub fn owner(comptime F: type, fixed: []const F, row: []const F, epoch: F) [19]F {
+        return ownerForClock(F, fixed, row, epoch, false);
+    }
+    pub fn ownerForClock(comptime F: type, fixed: []const F, row: []const F, epoch: F, wide: bool) [19]F {
         var out: [19]F = undefined;
         out[0] = row[k.operation];
         @memcpy(out[1..5], row[k.a..][0..4]);
@@ -140,7 +143,7 @@ pub const compact = struct {
         @memcpy(out[9..13], row[k.b..][0..4]);
         @memcpy(out[13..17], row[k.c..][0..4]);
         out[17] = epoch;
-        out[18] = tick(F, fixed[0], 3);
+        out[18] = ownerTick(F, fixed[0], wide);
         return out;
     }
 };

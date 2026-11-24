@@ -556,7 +556,7 @@ pub fn Commands(comptime Context: type, comptime Api: type) type {
             try self.result(self.callApi("stwo_rv64_gkr_init_on", .{ owner, self.lane_index, try self.context.deviceSlicePointer(u32, state, abi.gkr_state_words), try self.context.deviceSlicePointer(u32, seed, 9), variables.ptr, @intCast(variables.len), layers, chain }), 1);
         }
         pub fn buildBindingEq(self: *Self, point: Slice, row_log: u32, output: Plane, verdict: Slice) !void {
-            if (row_log == 0 or row_log > 22) return error.InvalidGeometry;
+            if (row_log == 0 or row_log > abi.binding_max_row_log) return error.InvalidGeometry;
             try output.shape(@as(u32, 1) << @intCast(row_log), 8);
             const owner = try self.handle();
             try self.result(self.callApi("stwo_rv64_binding_eq_on", .{ owner, self.lane_index, try self.context.deviceSlicePointer(u32, point, row_log * 8), row_log, try output.bind(self.context), try self.context.deviceSlicePointer(u32, verdict, 1) }), 1 + (row_log + 3) / 4);
@@ -650,7 +650,7 @@ pub fn Commands(comptime Context: type, comptime Api: type) type {
             try self.result(self.callApi("stwo_rv64_ls_dword_witness_on", .{ owner, self.lane_index, input, j.count, j.log, try self.context.deviceSlicePointer(u32, j.output, p.main_words), try self.context.deviceSlicePointer(u32, j.verdict, 1) }), 1);
         }
         pub fn projectBinding(self: *Self, input: Fraction, eq_column: Plane, prefix_column: Plane, metadata: Slice, verdict: Slice, row_log: u32, lane_log: u32) !void {
-            if (row_log == 0 or row_log > 22 or lane_log > 8 or row_log + lane_log > 28) return error.InvalidGeometry;
+            if (row_log == 0 or row_log > abi.binding_max_row_log or lane_log > 8 or row_log + lane_log > 28) return error.InvalidGeometry;
             const rows = @as(u32, 1) << @intCast(row_log);
             if (input.count != rows << @intCast(lane_log)) return error.InvalidGeometry;
             try input.validate();
@@ -721,7 +721,7 @@ pub fn Commands(comptime Context: type, comptime Api: type) type {
             try self.result(self.callApi("stwo_rv64_prefix_scan_on", .{ owner, self.lane_index, &job }), plan.dispatches(center));
         }
         pub fn deriveBindingMetadata(self: *Self, state: Slice, reservoir: Slice, row_point: Slice, carry: Slice, seed: Slice, verdict: Slice, instance: u32, row_log: u32, lane_log: u32, count: u32, layers: u32, chain: u64) !void {
-            if (count == 0 or count > abi.batch_max_oracles or instance >= count or layers == 0 or layers > 28 or row_log == 0 or row_log > 22 or lane_log > 8 or row_log + lane_log > layers or state.address % 8 != 0) return error.InvalidGeometry;
+            if (count == 0 or count > abi.batch_max_oracles or instance >= count or layers == 0 or layers > 28 or row_log == 0 or row_log > abi.binding_max_row_log or lane_log > 8 or row_log + lane_log > layers or state.address % 8 != 0) return error.InvalidGeometry;
             const owner = try self.handle();
             const job = abi.BindingMetadata{
                 .state = try self.context.deviceSlicePointer(u32, state, abi.gkr_state_words),

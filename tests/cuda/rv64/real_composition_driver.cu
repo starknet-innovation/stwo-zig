@@ -24,7 +24,10 @@ static void execute(const char *input, const char *output) {
     const auto h = f.take(12);
     const uint32_t id = h[0], trace_log = h[1], log = h[2],
                    columns = h[3] + h[4] + h[5];
-    if (id >= 49 || !real_kernels[id] || trace_log < 5 ||
+    const size_t role_count = sizeof(real_kernels) / sizeof(real_kernels[0]);
+    // Wide roles first shipped with the canonical auxiliary order.
+    if (id >= role_count || !real_kernels[id] || (head[3] == 0 && id >= 49) ||
+        trace_log < 5 ||
         log != trace_log + 1 || log > 24 || !columns || columns > 8192 ||
         h[6] > 65536 || h[7] > 1024 || !h[8] || h[8] > 8192 || h[11])
       throw std::runtime_error("real composition shape");

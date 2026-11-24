@@ -60,6 +60,8 @@ pub const Init = enum(u32) {
     persistent = 2,
     /// Device scratch fully written by a kernel before it is read.
     scratch = 3,
+    /// CPU and RAM inputs supplied by a live same-device slot.
+    compact_loan = 4,
 };
 
 pub fn isV2(words: []const u32) bool {
@@ -101,6 +103,34 @@ pub const FamilyJob = extern struct {
     reserved: u32 = 0,
     pub const refs = .{ "facts", "main", "range16", "and_", "shift", "status" };
     pub const symbol = "stwo_rv64_family_witness_on";
+};
+pub const FamilyFactJob = extern struct {
+    metadata: Ref,
+    rom: Ref,
+    facts: Ref,
+    workspace: Ref,
+    result: Ref,
+    workspace_words: u64,
+    count: u32,
+    rom_log: u32,
+    capacity: u32,
+    kind: u32,
+    status: Ref,
+    expected_mass: u32,
+    unweighted: u32,
+    head_rows: u32,
+    head_mass: u32,
+
+    pub const refs = .{ "metadata", "rom", "facts", "workspace", "result", "status" };
+    pub const symbol = "stwo_rv64_family_fact_on";
+    pub const fact_words = 8;
+    pub const result_words = 4;
+
+    pub const workspaceWords = @import("../guest_ingress.zig").FamilyCensus.rankWorkspaceWords;
+
+    fn minimumWorkspaceWords(self: FamilyFactJob) !usize {
+        return workspaceWords(self.count, if (self.kind <= 3 and self.unweighted == 0) self.capacity else 0);
+    }
 };
 pub const MemoryJob = extern struct {
     events: Ref,
@@ -280,9 +310,11 @@ pub const Op = enum(u32) {
     bulk_analyze = 11,
     sponge_outputs = 12,
     copy = 13,
+    family_facts = 14,
     pub fn Type(comptime op: Op) type {
         return switch (op) {
             .family => FamilyJob,
+            .family_facts => FamilyFactJob,
             .memory => MemoryJob,
             .arithmetic => ArithmeticJob,
             .bridge => BridgeJob,
@@ -300,7 +332,7 @@ pub const Op = enum(u32) {
 };
 
 comptime {
-    const sizes = .{ .{ FamilyJob, 64 }, .{ MemoryJob, 72 }, .{ ArithmeticJob, 72 }, .{ BridgeJob, 80 }, .{ BulkJob, 88 }, .{ SpongeJob, 104 }, .{ CpuUnpack, 56 }, .{ CpuWitness, 80 } };
+    const sizes = .{ .{ FamilyJob, 64 }, .{ FamilyFactJob, 88 }, .{ MemoryJob, 72 }, .{ ArithmeticJob, 72 }, .{ BridgeJob, 80 }, .{ BulkJob, 88 }, .{ SpongeJob, 104 }, .{ CpuUnpack, 56 }, .{ CpuWitness, 80 } };
     for (sizes) |s| if (@sizeOf(s[0]) != s[1]) @compileError("gn-pack launch ABI changed: " ++ @typeName(s[0]));
     for (std.enums.values(Op)) |op| if (@sizeOf(op.Type()) % 4 != 0) @compileError("gn-pack launch struct not word sized");
 }
@@ -336,12 +368,18 @@ pub const Program = struct {
     launches: std.ArrayListUnmanaged(Launch) = .empty,
     status: [max_status]Ref = @splat(0),
     status_len: usize = 0,
+    status_buffers: std.StaticBitSet(max_buffers) = .initEmpty(),
+    retained_words: usize = 0,
     columns: u32 = 0,
     // An auxiliary image reference can span columns outside a single output group.
     relocatable_columns: bool = true,
     rows: u64 = 0,
     data_words: u64 = 0,
     chunk_words: u64 = 0,
+    loan: ?@import("../guest_ingress.zig").CompactLoan = null,
+    loan_id: u16 = 0,
+    decoded_launch: ?usize = null,
+    decoded_buffer: u16 = 0,
 
     pub fn deinit(self: *Program) void {
         self.pieces.deinit(self.a);
@@ -350,7 +388,7 @@ pub const Program = struct {
     /// Device words the program's arena buffers take (64-word aligned each).
     pub fn arenaWords(self: *const Program) usize {
         var n: usize = 0;
-        for (self.buffers) |b| if (b.declared and b.init != .persistent) {
+        for (self.buffers, 0..) |b, id| if (b.declared and b.init != .persistent and id != self.decoded_buffer) {
             n += std.mem.alignForward(usize, @intCast(b.words), 64);
         };
         return n;
@@ -365,6 +403,10 @@ pub const Program = struct {
         var end_launches: u32 = 0;
         var end_buffers: u32 = 0;
         for (chunks, 0..) |ch, ci| {
+            if (ch.compact_loan) |loan| {
+                if (ci != 0) return error.GnPackCompactLoanFraming;
+                p.loan = loan;
+            }
             const w = ch.words;
             if (ended) return error.GnPackRecordAfterEnd;
             if (w.len < chunk_header_words or w[0] != magic or w[1] != version) return error.GnPackChunkFormat;
@@ -395,7 +437,7 @@ pub const Program = struct {
                     },
                     .data => {
                         const b = try p.declared(ra);
-                        if (b.init == .persistent or b.init == .scratch) return error.GnPackDataIntoDeviceBuffer;
+                        if (b.init == .persistent or b.init == .scratch or b.init == .compact_loan) return error.GnPackDataIntoDeviceBuffer;
                         if (body.len == 0 or rb > b.words or body.len > b.words - rb) return error.GnPackDataOutOfRange;
                         b.covered += body.len;
                         p.data_words += body.len;
@@ -433,8 +475,234 @@ pub const Program = struct {
         for (p.buffers) |b| n_declared += @intFromBool(b.declared);
         if (n_declared != end_buffers) return error.GnPackTruncated;
         try p.validate();
+        try p.validateCompactLoan();
         return p;
     }
+
+    fn validateCompactLoan(self: *Program) !void {
+        for (self.buffers, 0..) |b, id| if (b.declared and b.init == .compact_loan) {
+            if (self.loan_id != 0) return error.GnPackCompactLoanFraming;
+            self.loan_id = @intCast(id);
+        };
+        const loan = self.loan orelse {
+            if (self.loan_id != 0) return error.GnPackCompactLoanMissing;
+            return;
+        };
+        const Guest = @import("../guest_ingress.zig");
+        const id = self.loan_id;
+        const rows = @as(usize, loan.count);
+        if (id == 0 or rows == 0 or rows > Guest.max_proof_steps) return error.GnPackCompactLoanFraming;
+        const record_words = rows * Guest.record_words;
+        const seed_words = (rows + Guest.chunk_rows - 1) / Guest.chunk_rows * Guest.seed_words;
+        if (loan.records.words != record_words or loan.seeds.words != seed_words)
+            return error.GnPackCompactLoanFraming;
+        if (loan.ram) |ram| {
+            if (ram.general.words > rows * Guest.load_store_words or ram.dword.words > rows * Guest.load_store_words or
+                ram.general.words + ram.dword.words > rows * Guest.load_store_words or
+                ram.terminal.words >= (1 << 23) * Guest.boundary_cell_words)
+                return error.GnPackCompactLoanFraming;
+        }
+        if (loan.bulk) |bulk| bulk.validate() catch return error.GnPackCompactLoanFraming;
+        if (self.buffers[id].words != loan.words()) return error.GnPackCompactLoanFraming;
+        var consumers: usize = 0;
+        var ram_consumed: [3]usize = @splat(0);
+        var service_consumers: [Guest.Service.Parts]u32 = @splat(0);
+        var bulk_consumers: [Guest.Bulk.parts]u16 = @splat(0);
+        for (self.launches.items, 0..) |launch, index| switch (launch.op) {
+            inline else => |op| {
+                const T = op.Type();
+                const job = std.mem.bytesToValue(T, std.mem.sliceAsBytes(launch.body));
+                if (op == .cpu_unpack and (refBuffer(job.records) == id or refBuffer(job.seeds) == id)) {
+                    if (job.records != ref(id, 0) or job.seeds != ref(id, record_words) or
+                        job.count != loan.count or job.chunk_rows != Guest.chunk_rows)
+                        return error.GnPackCompactLoanFraming;
+                    if (loan.decoded) |data| {
+                        const target = refBuffer(job.metadata);
+                        const rom = self.buffers[refBuffer(job.rom)];
+                        if (index != 0 or job.reserved != 0 or job.rom_log < 5 or job.rom_log > 22 or
+                            data.metadata.words != rows * 14 or refOffset(job.metadata) != 0 or refOffset(job.rom) != 0 or
+                            self.buffers[target].init != .scratch or self.buffers[target].words != data.metadata.words or
+                            rom.init != .persistent or rom.words != @as(u64, 32) << @intCast(job.rom_log) or !std.mem.eql(u32, &data.rom, &rom.key))
+                            return error.GnPackCompactLoanFraming;
+                        self.decoded_launch = index;
+                        self.decoded_buffer = target;
+                    }
+                    consumers += 1;
+                }
+                inline for (T.refs) |name| {
+                    if (comptime op == .cpu_unpack and (std.mem.eql(u8, name, "records") or std.mem.eql(u8, name, "seeds"))) continue;
+                    const r = @field(job, name);
+                    if (refBuffer(r) == id and
+                        !try validateServiceLoan(loan, id, op, job, name, r, &service_consumers) and
+                        !try validateBulkLoan(loan, id, op, job, name, r, &bulk_consumers))
+                    {
+                        const ram = loan.ram orelse return error.GnPackCompactLoanFraming;
+                        if (op == .memory and std.mem.eql(u8, name, "events")) {
+                            if (job.count == 0 or job.dword > 1) return error.GnPackCompactLoanFraming;
+                            const route = job.dword;
+                            const start = loan.wordOffset(if (route == 0) .general else .dword);
+                            const total = if (route == 0) ram.general.words else ram.dword.words;
+                            const words = @as(usize, job.count) * Guest.load_store_words;
+                            if (r != ref(id, start + ram_consumed[route]) or words > total - ram_consumed[route])
+                                return error.GnPackCompactLoanFraming;
+                            ram_consumed[route] += words;
+                        } else if (op == .boundary and std.mem.eql(u8, name, "cells")) {
+                            if (job.count == 0 or ram_consumed[2] != 0 or
+                                r != ref(id, loan.wordOffset(.terminal)) or
+                                @as(usize, job.count) * Guest.boundary_cell_words != ram.terminal.words)
+                                return error.GnPackCompactLoanFraming;
+                            ram_consumed[2] = ram.terminal.words;
+                        } else return error.GnPackCompactLoanFraming;
+                    }
+                }
+            },
+        };
+        if (consumers != 1) return error.GnPackCompactLoanFraming;
+        if (self.decoded_launch != null) {
+            // The tape owns this plane through request drain. Its only users
+            // may be the two read-only metadata inputs of the native witness.
+            for (self.launches.items[1..]) |launch| switch (launch.op) {
+                inline else => |op| {
+                    const T = op.Type();
+                    const job = std.mem.bytesToValue(T, std.mem.sliceAsBytes(launch.body));
+                    inline for (T.refs) |name| {
+                        const r = @field(job, name);
+                        if (refBuffer(r) == self.decoded_buffer) {
+                            if (comptime (op == .cpu_witness or op == .family_facts) and std.mem.eql(u8, name, "metadata")) {
+                                if (refOffset(r) != 0 or job.count != rows) return error.GnPackCompactLoanFraming;
+                            } else return error.GnPackCompactLoanFraming;
+                        }
+                    }
+                },
+            };
+        }
+        if (loan.ram) |ram| {
+            if (!std.mem.eql(usize, &ram_consumed, &.{ ram.general.words, ram.dword.words, ram.terminal.words }))
+                return error.GnPackCompactLoanFraming;
+        }
+        try finishServiceLoan(loan, service_consumers);
+        try finishBulkLoan(loan, bulk_consumers);
+        for (self.status[0..self.status_len]) |status| {
+            if (refBuffer(status) == id) return error.GnPackCompactLoanFraming;
+        }
+    }
+
+    fn validateBulkLoan(
+        loan: @import("../guest_ingress.zig").CompactLoan,
+        id: u16,
+        comptime op: Op,
+        job: op.Type(),
+        comptime name: []const u8,
+        source: Ref,
+        used: *[@import("../guest_ingress.zig").Bulk.parts]u16,
+    ) !bool {
+        if (comptime op != .bulk and op != .bulk_analyze) return false;
+        const Bulk = @import("../guest_ingress.zig").Bulk;
+        const bulk = loan.bulk orelse return false;
+        const kind: u32 = if (op == .bulk) job.kind else Bulk.row_kinds + 1;
+        if (kind > @as(u32, Bulk.row_kinds) + @intFromBool(op == .bulk_analyze) or
+            job.call_count != bulk.counts.calls or job.word_count != bulk.counts.words or
+            job.pending_count != bulk.counts.scans)
+            return error.GnPackCompactLoanFraming;
+        if (op == .bulk and kind < Bulk.row_kinds and job.count != bulk.counts.rows[kind])
+            return error.GnPackCompactLoanFraming;
+        const part: Bulk.Part = if (std.mem.eql(u8, name, "calls")) .calls else if (std.mem.eql(u8, name, "words")) .words else blk: {
+            if (op != .bulk or !std.mem.eql(u8, name, "rows") or kind >= Bulk.row_kinds) return false;
+            break :blk @enumFromInt(kind + 2);
+        };
+        const p = @intFromEnum(part);
+        const bit = @as(u16, 1) << @intCast(kind);
+        if (bulk.buffers[p].words == 0 or source != ref(id, loan.bulkOffset(part)) or used[p] & bit != 0)
+            return error.GnPackCompactLoanFraming;
+        used[p] |= bit;
+        return true;
+    }
+
+    fn finishBulkLoan(
+        loan: @import("../guest_ingress.zig").CompactLoan,
+        used: [@import("../guest_ingress.zig").Bulk.parts]u16,
+    ) !void {
+        const Bulk = @import("../guest_ingress.zig").Bulk;
+        const bulk = loan.bulk orelse return;
+        var required: u16 = if (bulk.counts.calls == 0) 0 else 1 << (Bulk.row_kinds + 1);
+        if (bulk.counts.scans != 0) required |= 1 << Bulk.row_kinds;
+        for (bulk.counts.rows, used[2..], 0..) |rows, consumers, index| {
+            const expected: u16 = if (rows == 0) 0 else @as(u16, 1) << @intCast(index);
+            if (consumers != expected) return error.GnPackCompactLoanFraming;
+            required |= expected;
+        }
+        if (used[0] & required != required or used[0] != used[1]) return error.GnPackCompactLoanFraming;
+    }
+    fn validateServiceLoan(
+        loan: @import("../guest_ingress.zig").CompactLoan,
+        id: u16,
+        comptime op: Op,
+        job: op.Type(),
+        comptime name: []const u8,
+        source: Ref,
+        counts: *[@import("../guest_ingress.zig").Service.Parts]u32,
+    ) !bool {
+        const Service = @import("../guest_ingress.zig").Service;
+        const services = loan.services orelse return false;
+        if (op == .bridge and std.mem.eql(u8, name, "inputs")) {
+            for (0..Service.wire_count) |index| {
+                const part = Service.Part.wire(index);
+                const span = services.span(part) orelse continue;
+                if (source != ref(id, loan.serviceOffset(part))) continue;
+                if (counts[index] != 0 or job.calls != services.shape.wire[index] or job.input_words != span.words or
+                    job.kind != @as(u32, @intFromBool(index != 0)) or job.coordinates != Service.coordinates[index] or
+                    job.write_mask != Service.write_masks[index]) return error.GnPackCompactLoanFraming;
+                counts[index] = 1;
+                return true;
+            }
+            return error.GnPackCompactLoanFraming;
+        }
+        const part: Service.Part = switch (op) {
+            .sponge_outputs => if (std.mem.eql(u8, name, "inputs")) .sponge_inputs else return false,
+            .sponge => blk: {
+                if (job.kind > 1 or job.call_count != services.shape.calls or job.word_count != services.shape.words or
+                    job.permutation_count != services.shape.perms or
+                    job.count != (if (job.kind == 0) services.shape.calls else services.shape.perms))
+                    return error.GnPackCompactLoanFraming;
+                if (std.mem.eql(u8, name, "calls")) break :blk .sponge_calls;
+                if (std.mem.eql(u8, name, "words")) break :blk .sponge_words;
+                if (std.mem.eql(u8, name, "rows")) break :blk if (job.kind == 0) .sponge_call_rows else .sponge_perm_rows;
+                return false;
+            },
+            else => return false,
+        };
+        if (op == .sponge_outputs and job.count != services.shape.perms) return error.GnPackCompactLoanFraming;
+        _ = services.span(part) orelse return error.GnPackCompactLoanFraming;
+        if (source != ref(id, loan.serviceOffset(part))) return error.GnPackCompactLoanFraming;
+        const i = @intFromEnum(part);
+        const bit: u32 = if (op == .sponge) @as(u32, 1) << @intCast(job.kind) else 1;
+        if (counts[i] & bit != 0) return error.GnPackCompactLoanFraming;
+        counts[i] |= bit;
+        return true;
+    }
+
+    fn finishServiceLoan(
+        loan: @import("../guest_ingress.zig").CompactLoan,
+        counts: [@import("../guest_ingress.zig").Service.Parts]u32,
+    ) !void {
+        const Service = @import("../guest_ingress.zig").Service;
+        const services = loan.services orelse return;
+        for (services.parts, counts, 0..) |span, used, index| {
+            const part: Service.Part = @enumFromInt(index);
+            const words = services.shape.partWords(part);
+            if (words == 0) {
+                if (span != null or used != 0) return error.GnPackCompactLoanFraming;
+                continue;
+            }
+            const expected: u32 = switch (part) {
+                .sponge_calls, .sponge_words => 1 | (@as(u32, @intFromBool(services.shape.perms != 0)) << 1),
+                .sponge_perm_rows => 2,
+                else => 1,
+            };
+            if (span == null or span.?.words != words or used != expected) return error.GnPackCompactLoanFraming;
+        }
+    }
+
     fn declared(self: *Program, id: u32) !*Buffer {
         if (id < first_buffer or id >= max_buffers or !self.buffers[id].declared) return error.GnPackBufferNotDeclared;
         return &self.buffers[id];
@@ -451,6 +719,34 @@ pub const Program = struct {
         }
         const b = try self.declared(id);
         if (refOffset(r) >= b.words) return error.GnPackRefOutOfRange;
+    }
+    fn checkFactBuffer(self: *Program, r: Ref, words: u64, init: Init) !void {
+        const b = try self.declared(refBuffer(r));
+        if (b.init != init or refOffset(r) != 0 or words > b.words) return error.InvalidFamilyFactShape;
+    }
+    fn validateFactProjection(self: *Program, job: FamilyFactJob, unpack: ?CpuUnpack) !void {
+        const source = unpack orelse return error.InvalidFamilyFactShape;
+        if (self.loan == null) return error.GnPackCompactLoanMissing;
+        if (job.metadata != source.metadata or job.rom != source.rom or
+            job.count != source.count or job.rom_log != source.rom_log or job.kind > 6 or job.rom_log < 5 or job.rom_log > 22 or
+            job.capacity > job.expected_mass or job.expected_mass > job.count or job.unweighted > 1 or
+            (job.capacity == 0) != (job.expected_mass == 0) or
+            (job.kind > 3 and (job.capacity != job.expected_mass or job.head_rows != 0)) or
+            (job.unweighted != 0 and job.capacity != job.expected_mass) or
+            (job.head_rows != 0 and job.head_rows >= job.capacity) or
+            (job.head_rows == 0 and job.head_mass != 0) or job.head_mass > job.expected_mass or
+            (job.capacity == 0) != (job.facts == 0) or
+            job.workspace_words < try job.minimumWorkspaceWords() or
+            job.workspace_words > try FamilyFactJob.workspaceWords(job.count, job.count)) return error.InvalidFamilyFactShape;
+        try self.checkFactBuffer(job.metadata, @as(u64, job.count) * 14, .scratch);
+        try self.checkFactBuffer(job.rom, @as(u64, 32) << @intCast(job.rom_log), .persistent);
+        try self.checkFactBuffer(job.workspace, job.workspace_words, .scratch);
+        try self.checkFactBuffer(job.result, FamilyFactJob.result_words, .scratch);
+        if (job.workspace == job.result or job.workspace == job.metadata or job.result == job.metadata) return error.InvalidFamilyFactShape;
+        if (job.facts != 0) {
+            if (refBuffer(job.facts) == refBuffer(job.status)) return error.InvalidFamilyFactShape;
+            try self.checkFactBuffer(job.facts, @as(u64, job.capacity) * FamilyFactJob.fact_words, .zero);
+        }
     }
     fn validate(self: *Program) !void {
         // Upload buffers: data tiles them exactly (no gap: stale arena words;
@@ -484,6 +780,7 @@ pub const Program = struct {
         const cover = try self.a.alloc(u8, self.columns);
         defer self.a.free(cover);
         @memset(cover, 0);
+        var unpack: ?CpuUnpack = null;
         for (self.launches.items) |l| {
             switch (l.op) {
                 inline else => |op| {
@@ -502,6 +799,8 @@ pub const Program = struct {
                             if (words == 0 or words > self.buffers[refBuffer(r)].words - refOffset(r)) return error.GnPackRefOutOfRange;
                         }
                     }
+                    if (op == .cpu_unpack) unpack = job;
+                    if (op == .family_facts) try self.validateFactProjection(job, unpack);
                     if (@hasField(T, "main")) {
                         const m: Ref = job.main;
                         if (refBuffer(m) == image_buffer) {
@@ -521,10 +820,15 @@ pub const Program = struct {
         for (cover) |c| if (c == 0) return error.GnPackMainCoverage;
         for (self.status[0..self.status_len]) |s| {
             try self.checkRef(s, false);
-            if (refBuffer(s) == image_buffer) return error.GnPackStatusInImage;
+            const id = refBuffer(s);
+            if (id == image_buffer) return error.GnPackStatusInImage;
             // A status word starts at 0 on device (a stale arena word or an
             // uploaded value would decide the verdict, not the kernels).
-            if (self.buffers[refBuffer(s)].init != .zero) return error.GnPackStatusNotZeroed;
+            if (self.buffers[id].init != .zero) return error.GnPackStatusNotZeroed;
+            if (!self.status_buffers.isSet(id)) {
+                self.status_buffers.set(id);
+                self.retained_words += std.mem.alignForward(usize, @intCast(self.buffers[id].words), 64);
+            }
         }
         if (self.status_len == 0) return error.GnPackNoStatus;
         // Every kernel's status word is one `witness_status` checks: a launch
@@ -563,11 +867,11 @@ pub const Program = struct {
 /// Refs the legacy orchestration passes as null when the input is empty.
 fn nullableRef(comptime op: Op, comptime name: []const u8) bool {
     return switch (op) {
-        .family => std.mem.eql(u8, name, "facts"),
+        .family, .family_facts => std.mem.eql(u8, name, "facts"),
         .memory => std.mem.eql(u8, name, "events"),
         .arithmetic => std.mem.eql(u8, name, "requests") or std.mem.eql(u8, name, "mul_support"),
         .bridge => std.mem.eql(u8, name, "inputs"),
-        .cpu_witness => std.mem.eql(u8, name, "metadata") or std.mem.eql(u8, name, "pair_counts"),
+        .cpu_witness => std.mem.eql(u8, name, "metadata") or std.mem.eql(u8, name, "counts8") or std.mem.eql(u8, name, "pair_counts"),
         .boundary => std.mem.eql(u8, name, "cells"),
         .table => std.mem.eql(u8, name, "pairs"),
         else => false,
@@ -590,6 +894,7 @@ pub const H2dFn = *const fn (*anyopaque, *const anyopaque, usize, u32, *anyopaqu
 
 pub const Symbols = struct {
     family: KernelFn,
+    family_facts: KernelFn,
     memory: KernelFn,
     arithmetic: KernelFn,
     bridge: KernelFn,
@@ -607,6 +912,7 @@ pub const Symbols = struct {
     pub fn load(base: *std.DynLib, addon: *std.DynLib) !Symbols {
         return .{
             .family = try lookup(KernelFn, base, FamilyJob.symbol),
+            .family_facts = try lookup(KernelFn, base, FamilyFactJob.symbol),
             .memory = try lookup(KernelFn, base, MemoryJob.symbol),
             .arithmetic = try lookup(KernelFn, base, ArithmeticJob.symbol),
             .bridge = try lookup(KernelFn, base, BridgeJob.symbol),
@@ -704,27 +1010,25 @@ fn cuda(status: c_int) !void {
     if (status != 0) return error.CudaEnqueueFailed;
 }
 
-/// Device buffers of one program run (stage: allocated; enqueue: filled).
+/// Persistent inputs and two contiguous workspace spans per program run.
 pub const Bound = struct {
     devices: [max_buffers]?api.DeviceBuffer = @splat(null),
     /// Fresh persistent regions this job fills in enqueue (host source words).
     fill: [max_buffers]?[]const u32 = @splat(null),
 
-    /// Phase 1 (Stager): arena buffers + persistent regions (ROM filled once
-    /// per GPU from `roms`; a missing host copy fails closed).
+    /// Phase 1 only adopts persistent inputs. The exec stream allocates
+    /// private witness workspace when it is ready to consume it.
     pub fn stage(self: *Bound, p: *const Program, s: *api.Stager, roms: ?*Roms) !void {
         for (p.buffers, 0..) |b, id| {
-            if (!b.declared) continue;
+            if (!b.declared or b.init != .persistent) continue;
             const words: usize = @intCast(b.words);
-            if (b.init == .persistent) {
-                const r = try s.persistent(persistentKey(b.key), words);
-                if (r.fresh) {
-                    const host = (roms orelse return error.GnPackRomNotHeld).get(b.key) orelse return error.GnPackRomNotHeld;
-                    if (host.len != words) return error.GnPackRomShape;
-                    self.fill[id] = host;
-                }
-                self.devices[id] = r.buffer;
-            } else self.devices[id] = try s.alloc(words);
+            const r = try s.persistent(persistentKey(b.key), words);
+            if (r.fresh) {
+                const host = (roms orelse return error.GnPackRomNotHeld).get(b.key) orelse return error.GnPackRomNotHeld;
+                if (host.len != words) return error.GnPackRomShape;
+                self.fill[id] = host;
+            }
+            self.devices[id] = r.buffer;
         }
     }
 
@@ -739,10 +1043,21 @@ pub const Bound = struct {
     /// Phase 2, on `e`'s exec stream (lane 0): zero buffers, h2d of every
     /// data record from the pinned ring, then the launches in order. `image`
     /// is the MAIN evaluation image (class `image_offsets`, original order).
-    pub fn enqueue(self: *const Bound, p: *const Program, sym: *const Symbols, e: *api.Enqueue, image: api.DeviceBuffer, offsets: []const usize) !void {
+    pub fn enqueue(self: *Bound, p: *const Program, sym: *const Symbols, e: *api.Enqueue, image: api.DeviceBuffer, offsets: []const usize) !void {
         const ectx = e.ctx();
         const stream = e.stream();
         if (offsets.len != p.columns) return error.GnPackColumnCount;
+        const retained = try e.alloc(p.retained_words);
+        const temporary_words = p.arenaWords() - p.retained_words;
+        const temporary = if (temporary_words != 0) try e.alloc(temporary_words) else null;
+        defer if (temporary) |span| e.free(span);
+        try self.bindWorkspace(p, retained, temporary);
+        if (p.loan) |loan| {
+            if (loan.device != e.device()) return error.GnPackCompactLoanDevice;
+            const d = self.devices[p.loan_id] orelse return error.GnPackNotStaged;
+            try copyLoanInputs(loan, d, sym.d2d, ectx);
+            try e.hostFn(.{ .call = releaseCompact, .user = loan.release, .purpose = .capture_release });
+        }
         for (self.fill, 0..) |f, id| if (f) |host| {
             const d = self.devices[id] orelse return error.GnPackNotStaged;
             try cuda(sym.h2d(@ptrCast(d.ptr), @ptrCast(host.ptr), host.len * 4, 1, stream));
@@ -759,6 +1074,7 @@ pub const Bound = struct {
         for (p.launches.items, 0..) |l, index| switch (l.op) {
             inline else => |op| {
                 const T = op.Type();
+                if (p.decoded_launch == index) continue;
                 var job = std.mem.bytesToValue(T, std.mem.sliceAsBytes(l.body));
                 inline for (T.refs) |name| @field(job, name) = self.resolve(image.ptr, offsets, @field(job, name));
                 self.call(op, sym, ectx, &job) catch |err| {
@@ -768,8 +1084,41 @@ pub const Bound = struct {
             },
         };
     }
+
+    fn copyLoanInputs(loan: @import("../guest_ingress.zig").CompactLoan, compact: api.DeviceBuffer, copy: D2dFn, ctx: *anyopaque) !void {
+        var at: usize = 0;
+        for (loan.buffers(), 0..) |entry, part| if (entry) |span| {
+            const dst = try compact.slice(at, span.words);
+            // Only the unpack launch consumes compact records and seeds.
+            // Every following memory/service input keeps its original offset.
+            if (span.words != 0 and (loan.decoded == null or part >= 2))
+                try cuda(copy(ctx, @ptrCast(dst.ptr), @ptrCast(span.ptr), span.bytes()));
+            at += span.words;
+        };
+        if (at != compact.words) return error.GnPackCompactLoanFraming;
+    }
+
+    fn bindWorkspace(self: *Bound, p: *const Program, retained: api.DeviceBuffer, temporary: ?api.DeviceBuffer) !void {
+        const spans = [2]?api.DeviceBuffer{ temporary, retained };
+        var cursor: [2]usize = @splat(0);
+        for (p.buffers, 0..) |b, id| {
+            if (!b.declared or b.init == .persistent) continue;
+            if (id == p.decoded_buffer) {
+                self.devices[id] = p.loan.?.decoded.?.metadata;
+                continue;
+            }
+            const k = @intFromBool(p.status_buffers.isSet(id));
+            const words: usize = @intCast(b.words);
+            self.devices[id] = try (spans[k] orelse return error.GnPackNotStaged).slice(cursor[k], words);
+            cursor[k] += std.mem.alignForward(usize, words, 64);
+        }
+    }
     fn ptr(comptime P: type, v: u64) P {
         return @ptrFromInt(v);
+    }
+    fn releaseCompact(raw: ?*anyopaque) callconv(.c) void {
+        const slot: *std.Thread.ResetEvent = @ptrCast(@alignCast(raw.?));
+        slot.set();
     }
     fn optPtr(comptime P: type, v: u64) ?P {
         return if (v == 0) null else @ptrFromInt(v);
@@ -777,6 +1126,7 @@ pub const Bound = struct {
     fn call(_: *const Bound, comptime op: Op, sym: *const Symbols, ectx: *anyopaque, job: *const op.Type()) !void {
         switch (op) {
             .family => try cuda(sym.family(ectx, 0, job)),
+            .family_facts => try cuda(sym.family_facts(ectx, 0, job)),
             .memory => try cuda(sym.memory(ectx, 0, job)),
             .arithmetic => try cuda(sym.arithmetic(ectx, 0, job)),
             .bridge => try cuda(sym.bridge(ectx, 0, job)),
@@ -800,6 +1150,44 @@ pub const Bound = struct {
         return out[0..p.status_len];
     }
 };
+
+test "gn-pack v2: a retained unpack replaces only its two compact inputs" {
+    const Gpu = @import("../guest_ingress.zig");
+    const Copies = struct {
+        count: usize = 0,
+        fn copy(raw: *anyopaque, dst: *anyopaque, src: *const anyopaque, bytes: usize) callconv(.c) c_int {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            @memcpy(@as([*]u8, @ptrCast(dst))[0..bytes], @as([*]const u8, @ptrCast(src))[0..bytes]);
+            self.count += 1;
+            return 0;
+        }
+    };
+    var source = [_]u32{ 12, 15, 21 };
+    var compact = [_]u32{0} ** 3;
+    var metadata = [_]u32{19} ** 14;
+    var released: std.Thread.ResetEvent = .{};
+    const all = api.DeviceBuffer{ .ptr = &source, .words = source.len };
+    const empty = try all.slice(0, 0);
+    var loan = Gpu.CompactLoan{ .count = 1, .device = 0, .release = &released, .records = try all.slice(0, 1), .seeds = try all.slice(1, 1), .ram = .{ .general = try all.slice(2, 1), .dword = empty, .terminal = empty } };
+    const compact_dst = api.DeviceBuffer{ .ptr = &compact, .words = compact.len };
+    var copies = Copies{};
+    try Bound.copyLoanInputs(loan, compact_dst, Copies.copy, &copies);
+    try std.testing.expectEqualSlices(u32, &source, &compact);
+    try std.testing.expectEqual(@as(usize, 3), copies.count);
+    loan.decoded = .{ .metadata = .{ .ptr = &metadata, .words = metadata.len }, .rom = @splat(9) };
+    compact = @splat(0);
+    copies.count = 0;
+    try Bound.copyLoanInputs(loan, compact_dst, Copies.copy, &copies);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 21 }, &compact);
+    try std.testing.expectEqual(@as(usize, 1), copies.count);
+    var program: Program = .{ .a = std.testing.allocator, .loan = loan, .decoded_launch = 0, .decoded_buffer = 2 };
+    defer program.deinit();
+    program.buffers[2] = .{ .declared = true, .init = .scratch, .words = metadata.len };
+    try std.testing.expectEqual(@as(usize, 0), program.arenaWords());
+    var bound = Bound{};
+    try bound.bindWorkspace(&program, empty, null);
+    try std.testing.expectEqual(@intFromPtr(&metadata), @intFromPtr(bound.devices[2].?.ptr));
+}
 
 test {
     _ = @import("native_pack_test.zig");

@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 import heapq
 
+TRUTH_ROLE_COUNT = 17
+
 
 def bound_ssa_module(source: Path, operations_per_slice: int = 192):
     """Cairo-style private register banks and bounded noinline instruction slices.
@@ -137,8 +139,8 @@ def truth_catalog(source: Path, destination: Path, groups_per_module: int, max_m
     catalogs = []
     roles = sorted(int(match[1]) for path in source.glob("case-*-domain.cu")
                    if (match := re.fullmatch(r"case-(\d+)-domain\.cu", path.name)))
-    if roles not in [list(range(7)), list(range(10)), list(range(15))]:
-        raise ValueError("truth catalogue must contain the admitted seven, ten or fifteen contiguous cases")
+    if roles not in [list(range(count)) for count in (7, 10, 15, TRUTH_ROLE_COUNT)]:
+        raise ValueError("truth catalogue has an unsupported contiguous role count")
     for role in roles:
         original = source / f"case-{role}-domain.cu"
         if role in (0, 5, 6, 7) or role >= 10:
@@ -186,8 +188,8 @@ def extend_catalog(base: str, generated: str, first_new_role: int = 10):
         raise ValueError("expected terminal truth catalogue")
     entries = lambda match: re.findall(r"\{truth_parts_(\d+),\d+u\}", match[1])
     old_ids, new_ids = list(map(int, entries(old))), list(map(int, entries(new)))
-    if old_ids != list(range(first_new_role)) or new_ids != list(range(15)):
-        raise ValueError("catalogue extension requires exact original ten and new fifteen roles")
+    if old_ids != list(range(first_new_role)) or new_ids not in (list(range(15)), list(range(TRUTH_ROLE_COUNT))):
+        raise ValueError("catalogue extension requires exact base and curve role coverage")
     additions = []
     for line in generated[:new.start()].splitlines():
         role = re.search(r"(?:rv64_truth_domain_|truth_parts_)(\d+)", line)

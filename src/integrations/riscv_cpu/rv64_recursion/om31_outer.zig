@@ -88,6 +88,8 @@ pub fn verifyChild(ctx: *C.Context, child: Child) !Authenticated {
 pub const Graph = struct {
     ctx: C.Context,
     output_digest: [32]u8,
+    child_proof_starts: [max_arity]u32 = @splat(0),
+    child_proof_count: usize = 0,
     pub fn deinit(self: *Graph) void {
         self.ctx.deinit();
         self.* = undefined;
@@ -287,28 +289,42 @@ pub fn expectedDigest(children: []const Child) ![32]u8 {
 /// each child's geometry in child order. Folds of different arity therefore
 /// never share a class, and same-arity folds share one exactly when every
 /// child position has the same geometry class.
+pub fn mixArithmeticClass(hash: *std.crypto.hash.sha2.Sha256, plan_hash: u64) void {
+    hash.update("qm31/mixed-arithmetic/v1\x00");
+    var schedule: [8]u8 = undefined;
+    std.mem.writeInt(u64, &schedule, plan_hash, .little);
+    hash.update(&schedule);
+}
 pub fn classKey(children: []const Child) ![32]u8 {
+    return foldClassKey(.{ .observed = children });
+}
+
+pub fn setupClassKey(children: []const *const Outer.prove.Authority) ![32]u8 {
+    if (Outer.protocol.active().hybrid()) return error.UnsupportedOm31CircuitProfile;
+    return foldClassKey(.{ .setup = children });
+}
+
+fn foldClassKey(children: FoldChildren) ![32]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update(if (foldDomain(children) == domain) "rv64-om31-fold-class/v2\x00" else "rv64-om31-hybrid-fold-class/v2\x00");
+    const native = children.messageDomain() == domain;
+    h.update(if (native) "rv64-om31-fold-class/v2\x00" else "rv64-om31-hybrid-fold-class/v2\x00");
     h.update(Outer.protocol.domainName());
     var bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &bytes, try versionWord(children.len), .little);
+    std.mem.writeInt(u32, &bytes, try versionWord(children.count()), .little);
     h.update(&bytes);
-    if (foldDomain(children) != domain) h.update(&Hybrid.CODE_ID);
-    for (children) |child| {
-        _ = try child.effectiveIdentity();
-        const key = child.authority;
-        if (key.pp.mixed_arithmetic) {
-            h.update("qm31/mixed-arithmetic/v1\x00");
-            var schedule: [8]u8 = undefined;
-            std.mem.writeInt(u64, &schedule, key.bound.plan_hash, .little);
-            h.update(&schedule);
+    if (!native) h.update(&Hybrid.CODE_ID);
+    for (0..children.count()) |i| {
+        const child = if (children == .observed) children.observed[i] else null;
+        const key = if (child) |value| value.authority else children.setup[i];
+        if (key.pp.mixed_arithmetic) mixArithmeticClass(&h, key.bound.plan_hash);
+        if (child) |value| {
+            _ = try value.effectiveIdentity();
+            if (value.hybrid) |extra| {
+                h.update(extra.key.profile.domainName());
+                for (extra.key.artifacts) |artifact| h.update(&artifact.program.identity);
+            }
+            if (value.produced.outputs.len != key.pp.n_outputs) return error.InvalidOm31CircuitOutputCount;
         }
-        if (child.hybrid) |extra| {
-            h.update(extra.key.profile.domainName());
-            for (extra.key.artifacts) |artifact| h.update(&artifact.program.identity);
-        }
-        if (child.produced.outputs.len != key.pp.n_outputs) return error.InvalidOm31CircuitOutputCount;
         for (key.logs.toArray()) |log| {
             std.mem.writeInt(u32, &bytes, log, .little);
             h.update(&bytes);
@@ -338,15 +354,41 @@ pub fn classKey(children: []const Child) ![32]u8 {
     return h.finalResult();
 }
 pub fn buildFold(a: std.mem.Allocator, children: []const Child) !Graph {
-    return buildFoldMode(a, children, false);
+    return buildFoldMode(a, .{ .observed = children }, false);
 }
 pub fn buildFoldTraceOnly(a: std.mem.Allocator, children: []const Child) !Graph {
-    return buildFoldMode(a, children, true);
+    return buildFoldMode(a, .{ .observed = children }, true);
 }
-fn buildFoldMode(a: std.mem.Allocator, children: []const Child, trace_only: bool) !Graph {
+
+/// The same ordered fold verifier over setup-derived child authorities.
+/// Placeholder proof values can only be used to record a trace-only graph.
+pub fn buildFoldRecipe(a: std.mem.Allocator, children: []const *const Outer.prove.Authority) !Graph {
+    if (Outer.protocol.active().hybrid()) return error.UnsupportedOm31CircuitProfile;
+    return buildFoldMode(a, .{ .setup = children }, true);
+}
+
+pub fn setupMessage(count: usize) !struct { domain: u32, version: u32 } {
+    if (Outer.protocol.active().hybrid()) return error.UnsupportedOm31CircuitProfile;
+    return .{ .domain = domain, .version = try versionWord(count) };
+}
+
+const FoldChildren = union(enum) {
+    observed: []const Child,
+    setup: []const *const Outer.prove.Authority,
+
+    fn count(self: FoldChildren) usize {
+        return if (self == .observed) self.observed.len else self.setup.len;
+    }
+    fn messageDomain(self: FoldChildren) u32 {
+        return if (self == .observed) foldDomain(self.observed) else domain;
+    }
+};
+
+fn buildFoldMode(a: std.mem.Allocator, children: FoldChildren, trace_only: bool) !Graph {
     const products = C.productScope();
     defer products.deinit();
-    const version_word = try versionWord(children.len);
+    const count = children.count();
+    const version_word = try versionWord(count);
     var ctx = if (trace_only) try C.Context.initTraceOnly(a, 8) else try C.Context.init(a, 8);
     errdefer ctx.deinit();
     ctx.assert_eq_on_eval = !trace_only;
@@ -354,35 +396,43 @@ fn buildFoldMode(a: std.mem.Allocator, children: []const Child, trace_only: bool
     defer C.lane.finish() catch {};
     var message: std.ArrayList(Word) = .empty;
     defer message.deinit(a);
-    try message.appendSlice(a, &.{ try word(&ctx, foldDomain(children)), try word(&ctx, version_word) });
-    for (children) |child| {
-        if (child.hybrid != null) {
-            const authenticated = try verifyChild(&ctx, child);
+    try message.appendSlice(a, &.{ try word(&ctx, children.messageDomain()), try word(&ctx, version_word) });
+    var proof_starts: [max_arity]u32 = @splat(0);
+    const cap_log = Outer.protocol.active().foldMerkleCapLog();
+    for (0..count) |index| {
+        const child = if (children == .observed) children.observed[index] else null;
+        const authority = if (child) |value| value.authority else children.setup[index];
+        proof_starts[index] = ctx.circuit.n_vars;
+        if (child) |value| if (value.hybrid != null) {
+            const authenticated = try verifyChild(&ctx, value);
             try message.appendSlice(a, &authenticated.identity);
             try message.appendSlice(a, &authenticated.fixed_root.words);
             try message.append(a, try word(&ctx, @intCast(authenticated.outputs.len)));
             try message.appendSlice(a, authenticated.output_words);
             continue;
-        }
-        try Outer.protocol.validateConfig(child.produced.proof.proof.commitment_scheme_proof.config);
-        const geometry = try shape(ctx.scratch(), child.authority);
-        // M6 diet-wire: the fold's child verifier may stop at a Merkle cap (profile constant; 0 = full paths).
-        const captured = try V.proof.fromNativeCapped(ctx.scratch(), &child.produced.proof.proof, child.capture, &geometry, Outer.protocol.active().foldMerkleCapLog());
+        };
+        if (child) |value| try Outer.protocol.validateConfig(value.produced.proof.proof.commitment_scheme_proof.config);
+        const geometry = try shape(ctx.scratch(), authority);
+        const captured = if (child) |value|
+            try V.proof.fromNativeCapped(ctx.scratch(), &value.produced.proof.proof, value.capture, &geometry, cap_log)
+        else
+            try @import("om31_native/leaf_recipe.zig").physicalCapped(ctx.scratch(), &geometry, cap_log);
         const guessed = try V.proof.guess(&ctx, &captured, &geometry);
         // The cap shape is a profile constant (profiles DW-R6 b): never read it from the child proof.
         // `validateProof` (in guess) then pins every tree's cap to 2^capLogFor(height, cap_log).
-        if (guessed.cap_log != Outer.protocol.active().foldMerkleCapLog()) return error.Om31FoldMerkleCapProfileMismatch;
+        if (guessed.cap_log != cap_log) return error.Om31FoldMerkleCapProfileMismatch;
         // v2: no constant child key. Guess the identity; the FIXED root is the
         // child's guessed commitments[0] wire. Both are digest-bound below.
         var identity: [8]Word = undefined;
-        for (&identity, 0..) |*out, i| out.* = try B.wrappers.guessU32(Q, &ctx, B.wrappers.u32Value(Q, std.mem.readInt(u32, child.authority.identity[4 * i ..][0..4], .little)));
-        const outputs = try ctx.scratch().alloc(C.Var, child.produced.outputs.len);
-        for (outputs, child.produced.outputs) |*out, value| out.* = try ctx.guess(value);
+        for (&identity, 0..) |*out, i| out.* = try B.wrappers.guessU32(Q, &ctx, B.wrappers.u32Value(Q, std.mem.readInt(u32, authority.identity[4 * i ..][0..4], .little)));
+        const outputs = try ctx.scratch().alloc(C.Var, if (child) |value| value.produced.outputs.len else authority.pp.n_outputs);
+        for (outputs, 0..) |*out, i| out.* = try ctx.guess(if (child) |value| value.produced.outputs[i] else Q.zero());
         const output_words = try B.blake.unpackQm31sToU32Words(Q, &ctx, outputs);
         var claims: [List.N_COMPONENTS]F = undefined;
-        for (&claims, child.produced.claims.toArray()) |*out, value| out.* = try F.guess(&ctx, value);
+        const supplies = if (child) |value| value.produced.claims.toArray() else @as([List.N_COMPONENTS]Outer.protocol.O, @splat(Outer.protocol.O.zero()));
+        for (&claims, supplies) |*out, value| out.* = try F.guess(&ctx, value);
         var challenges: Statement.Challenges = undefined;
-        _ = try V.verify(&ctx, &geometry, &guessed, Statement{ .key = child.authority, .identity = identity, .outputs = outputs, .output_words = output_words, .claims = claims, .challenges = &challenges });
+        _ = try V.verify(&ctx, &geometry, &guessed, Statement{ .key = authority, .identity = identity, .outputs = outputs, .output_words = output_words, .claims = claims, .challenges = &challenges });
         try message.appendSlice(a, &identity);
         try message.appendSlice(a, &guessed.commitments[0].words);
         try message.append(a, try word(&ctx, @intCast(outputs.len)));
@@ -398,5 +448,5 @@ fn buildFoldMode(a: std.mem.Allocator, children: []const Child, trace_only: bool
     // guessed-input yield gates are retained, as in the native PCS fixtures.
 
     try ctx.finalize(false);
-    return .{ .ctx = ctx, .output_digest = try expectedDigest(children) };
+    return .{ .ctx = ctx, .output_digest = if (children == .observed) try expectedDigest(children.observed) else @splat(0), .child_proof_starts = proof_starts, .child_proof_count = count };
 }

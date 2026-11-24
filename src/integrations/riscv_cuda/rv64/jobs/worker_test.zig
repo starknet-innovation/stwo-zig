@@ -203,6 +203,38 @@ fn submit(w: *W.Worker, job: api.Job, sink: W.Sink) void {
     }
 }
 
+test "serial setup jobs can reuse the retired side of a tight arena" {
+    const Job = struct {
+        pub fn classKey(_: *@This()) [32]u8 {
+            return @splat(1);
+        }
+        pub fn footprint(_: *@This()) api.Footprint {
+            return .{ .device_words = 3 * Arena.granule, .staged_words = 3 * Arena.granule };
+        }
+        pub fn stage(_: *@This(), s: *api.Stager) !void {
+            _ = try s.alloc(3 * Arena.granule);
+        }
+        pub fn enqueue(_: *@This(), _: *api.Enqueue) !void {}
+        pub fn finish(_: *@This(), _: api.SlabView) !void {}
+        pub fn abort(_: *@This()) void {}
+    };
+    fake.reset();
+    const worker = try W.Worker.create(std.testing.allocator, &fake.ops, .{
+        .plan_from_env = false,
+        .device = 0,
+        .arena_words = 4 * Arena.granule,
+        .pinned_slot_words = Arena.granule,
+    });
+    defer worker.destroy();
+    var collector = Collector{};
+    var job = Job{};
+    for (1..3) |completion| {
+        try worker.submit(api.Job.from(Job, &job), collector.sink());
+        collector.wait(completion);
+        try std.testing.expectEqual(@as(usize, 0), collector.errors);
+    }
+}
+
 test "device-published jobs retain private device scratch without host mirrors or readbacks" {
     fake.reset();
     const w = try W.Worker.create(std.testing.allocator, &fake.ops, .{ .plan_from_env = false, .device = 0, .arena_words = 1024, .pinned_slot_words = 64 });
@@ -325,6 +357,10 @@ test "worker startup failure is reported to the creator" {
 
 const Filler = struct {
     fail: bool,
+    tag: u8 = 0xfe,
+    key: ?[32]u8 = null,
+    twiddles: bool = false,
+    region: ?api.DeviceBuffer = null,
     fresh: ?bool = null,
     pub fn classKey(_: *Filler) [32]u8 {
         return @splat(1);
@@ -333,22 +369,99 @@ const Filler = struct {
         return .{ .device_words = 64 };
     }
     pub fn stage(self: *Filler, s: *api.Stager) !void {
-        const p = try s.persistent(@splat(0xfe), 64);
+        const p = try s.persistent(self.key orelse @splat(self.tag), 64);
         self.fresh = p.fresh;
+        if (self.twiddles) {
+            self.region = p.buffer;
+            if (p.fresh) try std.testing.expect(try s.circleTwiddles(p.buffer, 6, .both));
+        }
         if (self.fail) return error.InjectedFillFailure;
     }
-    pub fn enqueue(_: *Filler, _: *api.Enqueue) !void {}
+    pub fn enqueue(self: *Filler, _: *api.Enqueue) !void {
+        if (self.region) |region| try std.testing.expectEqual(@as(u32, 31), region.ptr[63]);
+    }
     pub fn finish(_: *Filler, _: api.SlabView) !void {}
     pub fn abort(_: *Filler) void {}
 };
 
-test "a failed fill never leaves a persistent entry that later jobs see as warm" {
+test "class switch keeps named immutable regions within budget and evicts unused regions on pressure" {
+    const a = std.testing.allocator;
     fake.reset();
-    const w = try W.Worker.create(std.testing.allocator, &fake.ops, .{ .plan_from_env = false, .device = 0, .arena_words = 1 << 12, .pinned_slot_words = 64 });
+    const w = try W.Worker.create(a, &fake.ops, .{ .plan_from_env = false, .device = 0, .arena_words = 1 << 12, .pinned_slot_words = 64 });
+    defer w.destroy();
+    var c = Collector{};
+    var input = [_]Filler{ .{ .fail = false, .tag = 1 }, .{ .fail = false, .tag = 2 }, .{ .fail = false, .tag = 3 } };
+    for (&input, 1..) |*item, n| {
+        submit(w, api.Job.from(Filler, item), c.sink());
+        c.wait(n);
+    }
+    const epoch = w.persistentEpoch();
+    _ = try w.park(.{});
+    try w.replaceClassEpoch(1 << 12, .{ .keys = &.{ @splat(1), @splat(2), @splat(3) }, .words = 128 });
+    try std.testing.expectEqual(epoch + 1, w.persistentEpoch());
+    try std.testing.expectError(error.PersistentGeometryMismatch, w.claimCarried(@splat(1), 128));
+    try std.testing.expect(try w.claimCarried(@splat(1), 64));
+    try std.testing.expect(!try w.claimCarried(@splat(3), 64));
+    // Only key 2 can be reclaimed. Key 1 belongs to the newly installed scope.
+    try w.admitSetupArena(.{ .device_words = 0 }, 0, (1 << 12) + 64);
+    try std.testing.expect(!try w.claimCarried(@splat(2), 64));
+    var reused: Filler = .{ .fail = false, .tag = 1 };
+    submit(w, api.Job.from(Filler, &reused), c.sink());
+    c.wait(4);
+    try std.testing.expectEqual(false, reused.fresh.?);
+    try std.testing.expectEqual(@as(usize, 0), c.errors);
+    try std.testing.expectEqual(@as(usize, 0), fake.counters.bad_frees);
+}
+
+test "canonical FFT tables carry across bookended proof classes and unclaimed shapes are released" {
+    const twiddles = @import("circle_twiddles.zig");
+    const a = std.testing.allocator;
+    fake.reset();
+    const w = try W.Worker.create(a, &fake.ops, .{ .plan_from_env = false, .device = 0, .arena_words = 1 << 12, .pinned_slot_words = 64 });
+    defer w.destroy();
+    const pair = twiddles.pairKey(6);
+    const forward = twiddles.tableKey(7, .forward);
+    const inverse = twiddles.tableKey(7, .inverse);
+    var inputs = [_]Filler{ .{ .fail = false, .key = pair }, .{ .fail = false, .key = forward }, .{ .fail = false, .key = inverse }, .{ .fail = false, .tag = 42 } };
+    var c = Collector{};
+    for (&inputs, 1..) |*item, n| {
+        submit(w, api.Job.from(Filler, item), c.sink());
+        c.wait(n);
+        try std.testing.expect(item.fresh.?);
+    }
+    _ = try w.park(.{});
+    try w.replaceClassEpoch(1 << 12, .{ .words = 3 * 64, .canonical_tables = true });
+    try std.testing.expect(!try w.claimCarried(@splat(42), 64));
+    var reuse: Filler = .{ .fail = false, .key = pair };
+    submit(w, api.Job.from(Filler, &reuse), c.sink());
+    c.wait(5);
+    try std.testing.expect(!reuse.fresh.?);
+    try std.testing.expect(try w.claimCarried(forward, 64));
+    try std.testing.expectEqual(@as(usize, 64), try w.releaseUnclaimed());
+    try std.testing.expect(!try w.claimCarried(inverse, 64));
+    try std.testing.expectEqual(@as(usize, 0), c.errors);
+    try std.testing.expectEqual(@as(usize, 0), fake.counters.bad_frees);
+}
+
+test "a failed fill never leaves a persistent entry that later jobs see as warm" {
+    const Generate = struct {
+        var calls: usize = 0;
+        fn run(_: *anyopaque, out: [*]u32, log: u32, kind: u32, _: *anyopaque) callconv(.c) c_int {
+            if (log != 6 or kind != @intFromEnum(api.CircleTwiddle.both)) return 1;
+            @memset(out[0..64], 31);
+            calls += 1;
+            return 0;
+        }
+    };
+    Generate.calls = 0;
+    fake.reset();
+    var ops = fake.ops;
+    ops.exec.circle_twiddles = Generate.run;
+    const w = try W.Worker.create(std.testing.allocator, &ops, .{ .plan_from_env = false, .device = 0, .arena_words = 1 << 12, .pinned_slot_words = 64 });
     var c: Collector = .{};
-    var first = Filler{ .fail = true };
-    var second = Filler{ .fail = false };
-    var third = Filler{ .fail = false };
+    var first = Filler{ .fail = true, .twiddles = true };
+    var second = Filler{ .fail = false, .twiddles = true };
+    var third = Filler{ .fail = false, .twiddles = true };
     submit(w, api.Job.from(Filler, &first), c.sink());
     c.wait(1);
     submit(w, api.Job.from(Filler, &second), c.sink());
@@ -358,6 +471,8 @@ test "a failed fill never leaves a persistent entry that later jobs see as warm"
     w.destroy();
     try std.testing.expectEqual(@as(usize, 1), c.errors);
     try std.testing.expect(first.fresh.? and second.fresh.? and !third.fresh.?);
+    try std.testing.expectEqual(@as(usize, 2), Generate.calls);
+    try std.testing.expectEqual(@as(usize, 0), fake.counters.h2d);
     // arena + two persistent buffers (the retired one included); frees also count the 3 pinned slots
     try std.testing.expectEqual(@as(usize, 3), fake.counters.allocations);
     try std.testing.expectEqual(fake.counters.allocations + 3, fake.counters.frees);
@@ -372,8 +487,28 @@ test "persistent census counts a shared key once and survives install arena repl
     var second = Filler{ .fail = false };
     submit(w, api.Job.from(Filler, &first), c.sink());
     c.wait(1);
-    _ = try w.park(.{});
-    _ = try w.unpark(1 << 14);
+    const layout: api.Footprint = .{ .device_words = (1 << 14) - 2 * Arena.granule, .slab_words = 8 };
+    const epoch = w.persistentEpoch();
+    const capacity = (1 << 14) + 2 * Arena.granule;
+    try std.testing.expectError(error.GpuNativeFixedSealExceedsCapacity, w.admitSetupArena(layout, Arena.granule, capacity - 1));
+    try std.testing.expectEqual(@as(usize, 1 << 12), w.arenaWords());
+    const Release = struct {
+        fn run(raw: *anyopaque) !void {
+            const calls: *usize = @ptrCast(@alignCast(raw));
+            calls.* += 1;
+        }
+    };
+    var calls: usize = 0;
+    var replay: @import("resources.zig").Reclaimable = .{ .ctx = &calls, .words = Arena.granule, .release = Release.run };
+    const budget: api.SetupCapacity = .{ .words = capacity - Arena.granule, .reclaimable = &replay };
+    try w.admitInstallArena(layout, 0, budget);
+    try std.testing.expectEqual(@as(usize, 0), calls);
+    try w.admitInstallArena(layout, Arena.granule, budget);
+    try w.admitInstallArena(layout, Arena.granule, budget);
+    try std.testing.expectEqual(@as(u64, capacity), try budget.available());
+    try std.testing.expectEqual(@as(usize, 1), calls);
+    try std.testing.expectEqual(@as(usize, 1 << 14), w.arenaWords());
+    try std.testing.expectEqual(epoch, w.persistentEpoch());
     submit(w, api.Job.from(Filler, &second), c.sink());
     c.wait(2);
     const Census = struct {

@@ -186,7 +186,7 @@ pub fn forCpuWithRetention(a: std.mem.Allocator, setup: *const R.CpuSetup, confi
     var role_coset_bytes: u64 = 0;
     var sample_upper: u64 = 0;
     for (plan.slots) |slot| {
-        const descriptor = try @import("shape_metadata.zig").forOrigin(slot.origin);
+        const descriptor = try @import("shape_metadata.zig").forGeometry(slot.origin, setup.materials.geometry);
         var width: u64 = 0;
         for (descriptor.widths) |count| width = try add(width, count);
         role_coset_bytes = @max(role_coset_bytes, try mul(try mul(width, try power(slot.log)), BASE_BYTES));

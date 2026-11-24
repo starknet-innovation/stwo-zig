@@ -105,8 +105,17 @@ fn hasV3(cpus: []const Cpu, truths: []const Truth) bool {
 fn canonical(values: []const [8]u32) !void {
     for (values) |value| for (value) |coordinate| if (coordinate >= core.fields.m31.Modulus) return error.NoncanonicalWideBundleClaim;
 }
+fn schemaFor(envelope: Scope.Envelope) u32 {
+    return switch (envelope) {
+        .admitted => 1,
+        .compact_wide => 2,
+    };
+}
 pub fn validate(metadata: Metadata, limits: Limits) !void {
-    if (metadata.schema != 1 or metadata.core_schema != @import("../../../word16_execution/protocol.zig").SCHEMA or metadata.field_degree != 8) return error.WideBundleProfile;
+    return validateFor(.admitted, metadata, limits);
+}
+pub fn validateFor(envelope: Scope.Envelope, metadata: Metadata, limits: Limits) !void {
+    if (metadata.schema != schemaFor(envelope) or metadata.core_schema != @import("../../../word16_execution/protocol.zig").SCHEMA or metadata.field_degree != 8) return error.WideBundleProfile;
     if (std.mem.eql(u8, metadata.profile, Manifest.PROFILE)) {
         // Preserve the legacy admission contract; profile is never upgraded
         // implicitly from producer-declared extra fields.
@@ -123,11 +132,15 @@ pub fn validate(metadata: Metadata, limits: Limits) !void {
     } else if (!std.mem.eql(u8, metadata.profile, Manifest.V3_PROFILE) or !hasV3(metadata.cpus, metadata.truths)) return error.WideBundleProfile;
     // Reject unsupported families/layouts before shared declaration preflight.
     for (metadata.cpus) |cpu| {
-        try Scope.declaration(cpu.declaration);
+        try envelope.validateGeometry(cpu.declaration.geometry);
+        try Scope.bridges(cpu.declaration.bridges);
+        // The extended CPU row cap does not apply to the MUL component,
+        // whose generic geometry also has a log-23 representation.
+        if (envelope == .compact_wide and cpu.declaration.geometry.multiplication_log > @import("../../../word16_execution/om31_security_candidate.zig").MAX_TRACE_LOG) return error.CandidateSourceShapeExceeded;
         try Scope.calls(cpu.request.all(), cpu.request.bulk, cpu.request.sponge, cpu.request.ls_dword);
     }
     for (metadata.truths) |truth| try Scope.truthDeclaration(truth.declaration);
-    try Legacy.validateDeclarations(metadata.cpus, metadata.truths, metadata.memory_words, limits);
+    try Legacy.validateDeclarationsFor(envelope.projection(), metadata.cpus, metadata.truths, metadata.memory_words, limits);
     var total: u64 = metadata.stage_one.bytes;
     if (total == 0 or total > StageWire.MAX_BYTES) return error.WideBundleStageLimit;
     for (metadata.cpus) |cpu| {
@@ -164,6 +177,9 @@ fn fromWire(a: std.mem.Allocator, values: []const [8]u32) ![]O {
 /// Output directory must be new. Metadata is written last; no overwrite or
 /// producer-declared acceptance substitutes for the independent receiver.
 pub fn write(a: std.mem.Allocator, dir: std.fs.Dir, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const C.Bundle) !void {
+    return writeFor(.admitted, a, dir, setups, truths, bundle);
+}
+pub fn writeFor(envelope: Scope.Envelope, a: std.mem.Allocator, dir: std.fs.Dir, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const C.Bundle) !void {
     if (setups.len == 0 or bundle.requests.len != setups.len or bundle.cpus.len != setups.len or bundle.truths.len != truths.len) return error.InvalidWideServicesProofInventory;
     const initial = bundle.requests[0].base.memory.initial;
     const terminal = bundle.requests[bundle.requests.len - 1].base.memory.terminal;
@@ -178,8 +194,8 @@ pub fn write(a: std.mem.Allocator, dir: std.fs.Dir, setups: []const *const R.Cpu
     }
     const tt = try scratch.alloc(Truth, truths.len);
     for (truths, bundle.truths, tt) |truth, proof, *out| out.* = .{ .declaration = TruthDeclaration.from(truth), .claims = try toWire(scratch, proof.claims), .proof = fileInfo(proof.bytes) };
-    var metadata = Metadata{ .profile = if (hasV3(cpus, tt)) Manifest.V3_PROFILE else if (hasBulk(cpus)) Manifest.BULK_PROFILE else Manifest.PROFILE, .cpus = cpus, .truths = tt, .stage_one = fileInfo(bundle.stage_one_bytes), .memory_words = @intCast(initial.len), .cells_sha256 = @splat(0) };
-    try validate(metadata, .{});
+    var metadata = Metadata{ .schema = schemaFor(envelope), .profile = if (hasV3(cpus, tt)) Manifest.V3_PROFILE else if (hasBulk(cpus)) Manifest.BULK_PROFILE else Manifest.PROFILE, .cpus = cpus, .truths = tt, .stage_one = fileInfo(bundle.stage_one_bytes), .memory_words = @intCast(initial.len), .cells_sha256 = @splat(0) };
+    try validateFor(envelope, metadata, .{});
     try Cells.write(dir, initial, terminal);
     metadata.cells_sha256 = try hashCells(dir, metadata.memory_words);
     const json = try std.json.Stringify.valueAlloc(scratch, metadata, .{ .whitespace = .indent_2 });
@@ -206,12 +222,15 @@ fn readFile(a: std.mem.Allocator, dir: std.fs.Dir, name: []const u8, expected: F
     return bytes;
 }
 pub fn read(a: std.mem.Allocator, dir: std.fs.Dir, limits: Limits) !Loaded {
+    return readFor(.admitted, a, dir, limits);
+}
+pub fn readFor(envelope: Scope.Envelope, a: std.mem.Allocator, dir: std.fs.Dir, limits: Limits) !Loaded {
     const bytes = try dir.readFileAlloc(a, "bundle.json", limits.max_metadata_bytes);
     defer a.free(bytes);
     var parsed = try std.json.parseFromSlice(Metadata, a, bytes, .{ .ignore_unknown_fields = false });
     defer parsed.deinit();
     const metadata = parsed.value;
-    try validate(metadata, limits);
+    try validateFor(envelope, metadata, limits);
     if (!std.mem.eql(u8, &try hashCells(dir, metadata.memory_words), &metadata.cells_sha256)) return error.WideBundleCellsChanged;
     const cells = try Cells.read(a, dir, metadata.memory_words);
     var owns_cells = true;

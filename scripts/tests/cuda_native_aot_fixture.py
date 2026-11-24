@@ -156,9 +156,9 @@ EXPECTED_NATIVE_IMPLEMENTATION_SOURCES = {
         rv64/bulk_witness.cu rv64/channel.cu rv64/circuit_assignment.cu
         rv64/circuit_fill_chain.cu rv64/circuit_interaction.cu rv64/closure.cu
         rv64/composition_finalize.cu rv64/cpu_witness.cu rv64/curve_witness.cu
-        rv64/deep.cu rv64/events.cu rv64/family_witness.cu
+        rv64/deep.cu rv64/events.cu rv64/family_facts.cu rv64/family_witness.cu
         rv64/fri.cu rv64/fused_blake2s.cu rv64/gkr.cu
-        rv64/gkr_loop.cu rv64/global.cu rv64/jobs/channel_ops.cu
+        rv64/gkr_loop.cu rv64/global.cu rv64/guest_execution/guest.cu rv64/jobs/channel_ops.cu
         rv64/jobs/native_composition.cu rv64/jobs/native_encode_checks.cu rv64/jobs/native_encode_oods.cu
         rv64/jobs/native_encode_proof.cu rv64/jobs/native_gkr_wire.cu rv64/jobs/native_leaf_wire.cu
         rv64/jobs/native_manifest_wire.cu rv64/jobs/native_parity.cu rv64/jobs/native_seal_chi.cu

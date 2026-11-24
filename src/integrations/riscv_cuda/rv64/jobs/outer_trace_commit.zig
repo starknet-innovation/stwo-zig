@@ -99,8 +99,8 @@ pub fn enqueue(device: *K.Device, plan: *const Plan.TreePlan, commit: Commit) !v
 // independent of the column count, and the tree is built in the bank that is
 // dead after the final absorption. Only the root survives: it is copied to
 // `root_out` (8 words) before the banks are freed, so nothing tree-sized
-// outlives the commit (the PCS rebuilds every tree it opens and finish
-// checks the rebuilt roots against these).
+// outlives a root-only commit. When an opening image is supplied the final
+// absorption writes its permanent nodes directly; PCS checks the same root.
 
 const StreamPlan = @import("../trace_stream_plan.zig");
 
@@ -140,13 +140,14 @@ pub const Stream = struct {
         self.* = undefined;
     }
     /// Device words the commit allocates (chunk + both banks, granule rounded).
-    pub fn scratchWords(self: *const Stream) u64 {
+    pub fn scratchWords(self: *const Stream, retained_lde: bool) u64 {
         const g = struct {
             fn r(w: usize) u64 {
                 return std.mem.alignForward(u64, @max(w, 1), 64);
             }
         }.r;
-        return g(self.plan.chunk_words) + g(self.plan.bank_words[0]) + g(self.plan.bank_words[1]);
+        const chunk: u64 = if (retained_lde) 0 else g(self.plan.chunk_words);
+        return chunk + g(self.plan.bank_words[0]) + g(self.plan.bank_words[1]);
     }
 };
 
@@ -155,7 +156,68 @@ pub const Stream = struct {
 /// `.whole` = the tree as staged with an explicit domain size (RC commit).
 pub const TwiddleMode = enum { tail, whole };
 
+/// Exact leaf-to-root Merkle nodes, optionally preceded by the sorted LDE.
+pub const OpeningImage = struct {
+    evaluations: ?[*]u32,
+    nodes: [*]u32,
+
+    pub fn init(tree: *const Plan.TreePlan, buffer: K.Buffer) !OpeningImage {
+        if (buffer.words == tree.tree_words) return .{ .evaluations = null, .nodes = buffer.ptr };
+        if (buffer.words != retainedWords(tree)) return error.OuterTreeBufferTooSmall;
+        return .{ .evaluations = buffer.ptr, .nodes = buffer.at(tree.evaluation_words) };
+    }
+};
+
+pub fn retainedWords(tree: *const Plan.TreePlan) usize {
+    return @intCast(tree.evaluation_words + tree.tree_words);
+}
+
+/// Spend residual capacity on Merkle nodes only after retaining every full
+/// source selected by the existing schedule. Zero node sizes disable that option.
+pub fn openingReservations(words: [2]usize, node_words: [2]usize) [2]usize {
+    var remaining: usize = Plan.max_indexable_words - 1;
+    var sizes = [_]usize{ 0, 0 };
+    for ([2][2]usize{ words, node_words }) |candidates| for (candidates, &sizes) |count, *size| {
+        if (size.* != 0 or count > remaining) continue;
+        size.* = count;
+        remaining -= count;
+    };
+    return sizes;
+}
+
+test "residual opening budget preserves full sources before admitting Merkle nodes" {
+    const limit: usize = Plan.max_indexable_words;
+    const nodes: [2]usize = .{ 31, 29 };
+    try testing.expectEqual([2]usize{ 41, 59 }, openingReservations(.{ 41, 59 }, nodes));
+    try testing.expectEqual([2]usize{ 31, 59 }, openingReservations(.{ limit, 59 }, nodes));
+    try testing.expectEqual([2]usize{ limit - 1, 0 }, openingReservations(.{ limit - 1, 59 }, nodes));
+    try testing.expectEqual(nodes, openingReservations(.{ limit, limit + 1 }, nodes));
+    // Never displace a full INTER image to keep only MAIN nodes.
+    try testing.expectEqual([2]usize{ 0, limit - 16 }, openingReservations(.{ limit, limit - 16 }, nodes));
+    try testing.expectEqual([2]usize{ 0, 59 }, openingReservations(.{ limit, 59 }, .{ 0, 0 }));
+}
+
+/// Composition is considered only after both trace reservations. It can still
+/// retain nodes alone when its sorted LDE falls outside the remaining window.
+pub fn compositionReservation(trace: [2]usize, tree: *const Plan.TreePlan) usize {
+    const remaining = Plan.max_indexable_words - 1 - trace[0] - trace[1];
+    if (retainedWords(tree) <= remaining) return retainedWords(tree);
+    return if (tree.tree_words <= remaining) @intCast(tree.tree_words) else 0;
+}
+
+test "composition stays within the residual opening window" {
+    var tree = try Plan.TreePlan.init(testing.allocator, &.{ 5, 5 }, 1);
+    defer tree.deinit(testing.allocator);
+    const budget = Plan.max_indexable_words - 1;
+    const full = retainedWords(&tree);
+    const nodes = tree.tree_words;
+    try testing.expectEqual(full, compositionReservation(.{ budget - full - 1, 1 }, &tree));
+    try testing.expectEqual(nodes, compositionReservation(.{ budget - nodes - 1, 1 }, &tree));
+    try testing.expectEqual(@as(usize, 0), compositionReservation(.{ budget - nodes, 1 }, &tree));
+}
+
 pub const StreamCommit = struct {
+    opening: ?OpeningImage = null,
     evaluations: [*]const u32,
     coefficients: [*]u32,
     /// 8 device words that receive the root (e.g. a slab section field).
@@ -179,8 +241,9 @@ pub fn enqueueStreamed(device: *K.Device, plan: *const Plan.TreePlan, stream: *c
     if (commit.interpolate) try interpolate(device, plan, commit.evaluations, commit.coefficients, s);
     const p = &stream.plan;
     // Chunk first, then the banks: the last-allocated bank (1) is freed first.
-    const chunk = try device.alloc(@max(p.chunk_words, 1));
-    defer device.free(chunk);
+    const evaluations = if (commit.opening) |opening| opening.evaluations else null;
+    const scratch = if (evaluations == null) try device.alloc(@max(p.chunk_words, 1)) else null;
+    defer if (scratch) |b| device.free(b);
     var banks: [2]K.Buffer = undefined;
     banks[0] = try device.alloc(@max(p.bank_words[0], 1));
     defer device.free(banks[0]);
@@ -200,7 +263,10 @@ pub fn enqueueStreamed(device: *K.Device, plan: *const Plan.TreePlan, stream: *c
             const lde_rows: usize = stream.rows[i];
             const n = lde_rows >> @intCast(plan.beta);
             const log: u32 = @intCast(std.math.log2_int(usize, lde_rows));
-            const destination = chunk.ptr + cursor;
+            const destination = if (evaluations) |retained|
+                retained + (@as(usize, @intCast(plan.offsets[plan.order[i]])) << @intCast(plan.beta))
+            else
+                scratch.?.ptr + cursor;
             const tw: [*]const u32, const tw_words: u32 = switch (commit.twiddle_mode) {
                 .tail => blk: {
                     if (lde_rows / 2 > s.twiddle_words) return error.InvalidOuterTwiddles;
@@ -230,17 +296,19 @@ pub fn enqueueStreamed(device: *K.Device, plan: *const Plan.TreePlan, stream: *c
             cursor += lde_rows * (j - i);
             i = j;
         }
-        if (cursor > chunk.words) return error.InvalidOuterTreePlan;
+        if (cursor > p.chunk_words) return error.InvalidOuterTreePlan;
         const seed: ?*const anyopaque = if (c.seed_bank) |bank| @ptrCast(banks[bank].ptr) else null;
-        const out: *anyopaque = @ptrCast(banks[c.out_bank].ptr);
+        // The final absorption writes digests in the PCS-owned image, still on this stream.
+        const output = if (c.final and commit.opening != null) commit.opening.?.nodes else banks[c.out_bank].ptr;
+        const out: *anyopaque = @ptrCast(output);
         if (stream.compact) {
             const seed_words: u64 = if (c.seed_bank) |bank| p.bank_words[bank] else 0;
-            const out_words: u64 = p.bank_words[c.out_bank];
+            const out_words: u64 = if (c.final and commit.opening != null) plan.tree_words else p.bank_words[c.out_bank];
             try device.check(device.kernels.mixed_compact.?(c.size, count, &segments, c.absorbed, c.seed_size, seed, seed_words, if (c.final) null else out, if (c.final) 0 else out_words, if (c.final) out else null, if (c.final) out_words else 0, device.stream));
         } else {
             try device.check(device.kernels.mixed_seeded.?(c.size, count, &segments, c.absorbed, c.seed_size, seed, if (c.final) null else out, if (c.final) out else null, device.stream));
         }
-        if (c.final) hashes = banks[c.out_bank].ptr;
+        if (c.final) hashes = output;
     }
     if (p.leaves > 1) {
         if (device.kernels.layers) |layers| {
@@ -461,7 +529,8 @@ test "streamed commit: seeded and compact calls, both twiddle modes, layer offse
     var coefficients: [160]u32 = undefined;
     var root: [8]u32 = undefined;
     const statics = Statics{ .sorted_logs = &logs, .twiddles = &tw, .twiddle_words = 256, .itwiddles = &tw, .itwiddle_words = 256 };
-    for ([_]bool{ false, true }) |fused| for ([_]bool{ false, true }) |compact| for ([_]TwiddleMode{ .tail, .whole }) |mode| {
+    var image: [4096]u32 = undefined;
+    for ([_]usize{ 0, plan.tree_words, retainedWords(&plan) }) |image_words| for ([_]bool{ false, true }) |fused| for ([_]bool{ false, true }) |compact| for ([_]TwiddleMode{ .tail, .whole }) |mode| {
         kernels.layer = if (fused) null else Rec.layer;
         kernels.layers = if (fused) Rec.tree else null;
         Rec.reset();
@@ -470,13 +539,17 @@ test "streamed commit: seeded and compact calls, both twiddle modes, layer offse
         defer stream.deinit(a);
         try testing.expect(stream.plan.calls.len > 1);
         var device = K.Device{ .ctx = &dummy, .stream = &dummy, .impl = &dummy, .vtable = &vtable, .kernels = &kernels };
-        try enqueueStreamed(&device, &plan, &stream, .{ .evaluations = &coefficients, .coefficients = &coefficients, .root_out = &root, .statics = statics, .twiddle_mode = mode, .interpolate = mode == .tail });
+        const retained = image_words != 0;
+        const full = image_words == retainedWords(&plan);
+        const opening: ?OpeningImage = if (retained) try OpeningImage.init(&plan, .{ .ptr = &image, .words = image_words }) else null;
+        try enqueueStreamed(&device, &plan, &stream, .{ .opening = opening, .evaluations = &coefficients, .coefficients = &coefficients, .root_out = &root, .statics = statics, .twiddle_mode = mode, .interpolate = mode == .tail });
         // Interpolation only when requested (one B2N per height group).
         try testing.expectEqual(@as(u32, if (mode == .tail) @intCast(plan.groups.len) else 0), Rec.b2ns);
-        // Allocation order: chunk, bank 0, bank 1.
-        try testing.expectEqual(@as(usize, 3), Rec.n_allocs);
+        // Retention writes into the original LDE allocation across chunk boundaries.
+        const first_bank: usize = @intFromBool(!full);
+        try testing.expectEqual(first_bank + 2, Rec.n_allocs);
         const chunk = Rec.allocs[0];
-        const banks = [2]K.Buffer{ Rec.allocs[1], Rec.allocs[2] };
+        const banks = Rec.allocs[first_bank..][0..2];
         // Every sorted column is expanded exactly once, in order, from its
         // packed coefficient offset, into the chunk.
         var column: usize = 0;
@@ -484,7 +557,9 @@ test "streamed commit: seeded and compact calls, both twiddle modes, layer offse
             try testing.expectEqual(Rec.addr(&coefficients) + 4 * @as(usize, @intCast(plan.offsets[plan.order[column]])), l.coefficients);
             try testing.expectEqual(Rec.addr(&logs) + 4 * column, l.logs);
             try testing.expectEqual(l.rows >> 1, l.n);
-            try testing.expect(l.out >= Rec.addr(chunk.ptr) and l.out + 4 * l.rows * l.count <= Rec.addr(chunk.ptr) + 4 * chunk.words);
+            if (full) {
+                try testing.expectEqual(Rec.addr(opening.?.evaluations.?) + 4 * (plan.offsets[plan.order[column]] << @intCast(plan.beta)), l.out);
+            } else try testing.expect(l.out >= Rec.addr(chunk.ptr) and l.out + 4 * l.rows * l.count <= Rec.addr(chunk.ptr) + 4 * chunk.words);
             switch (mode) {
                 .tail => {
                     try testing.expectEqual(Rec.addr(&tw) + 4 * (256 - l.rows / 2), l.tw);
@@ -509,18 +584,18 @@ test "streamed commit: seeded and compact calls, both twiddle modes, layer offse
             try testing.expectEqual(c.absorbed, m.absorbed);
             try testing.expectEqual(c.seed_size, m.seed_size);
             try testing.expectEqual(if (c.seed_bank) |b| Rec.addr(banks[b].ptr) else 0, m.seed);
-            const out = Rec.addr(banks[c.out_bank].ptr);
+            const out = if (retained and c.final) Rec.addr(opening.?.nodes) else Rec.addr(banks[c.out_bank].ptr);
             try testing.expectEqual(if (c.final) 0 else out, m.out);
             try testing.expectEqual(if (c.final) out else 0, m.final_out);
             if (compact) {
                 try testing.expectEqual(if (c.seed_bank) |b| @as(u64, stream.plan.bank_words[b]) else 0, m.seed_words);
                 try testing.expectEqual(if (c.final) 0 else @as(u64, stream.plan.bank_words[c.out_bank]), m.out_words);
-                try testing.expectEqual(if (c.final) @as(u64, stream.plan.bank_words[c.out_bank]) else 0, m.final_words);
+                try testing.expectEqual(if (c.final) (if (retained) plan.tree_words else @as(u64, stream.plan.bank_words[c.out_bank])) else 0, m.final_words);
             }
             if (c.final) final_bank = c.out_bank;
         }
         // Merkle layers in the final bank: leaves, leaves/2, ... at 8-word nodes.
-        const hashes = Rec.addr(banks[final_bank].ptr);
+        const hashes = if (opening) |v| Rec.addr(v.nodes) else Rec.addr(banks[final_bank].ptr);
         if (fused) {
             const call = Rec.tree_call orelse return error.MissingFusedTreeCall;
             try testing.expectEqual(hashes, call.src);
@@ -545,4 +620,21 @@ test "streamed commit: seeded and compact calls, both twiddle modes, layer offse
         try testing.expectEqual(Rec.addr(&root), Rec.copy_to);
         try testing.expectEqual(@as(usize, 32), Rec.copy_bytes);
     };
+}
+
+test "opening image keeps the sorted LDE and the exact Merkle nodes until PCS" {
+    const a = testing.allocator;
+    var tree = try Plan.TreePlan.init(a, &.{ 5, 4, 5, 4, 6 }, 1);
+    defer tree.deinit(a);
+    var image: [4096]u32 = undefined;
+    const words = retainedWords(&tree);
+    try testing.expectEqual(tree.evaluation_words + tree.tree_words, words);
+    const retained = try OpeningImage.init(&tree, .{ .ptr = &image, .words = words });
+    try testing.expectEqual(@intFromPtr(&image), @intFromPtr(retained.evaluations.?));
+    try testing.expectEqual(@intFromPtr(&image) + tree.evaluation_words * 4, @intFromPtr(retained.nodes));
+    const nodes_only = try OpeningImage.init(&tree, .{ .ptr = &image, .words = tree.tree_words });
+    try testing.expect(nodes_only.evaluations == null);
+    try testing.expectEqual(@intFromPtr(&image), @intFromPtr(nodes_only.nodes));
+    for ([_]usize{ tree.tree_words - 1, tree.tree_words + 1, words - 1, words + 1 }) |bad|
+        try testing.expectError(error.OuterTreeBufferTooSmall, OpeningImage.init(&tree, .{ .ptr = &image, .words = bad }));
 }

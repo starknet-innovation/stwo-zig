@@ -149,23 +149,28 @@ pub fn reduceHashValue(comptime V: type, ctx: *context_mod.Context(V), hash: Has
 /// per word, zero-padded to whole 64-byte blocks) over `n_bytes` bytes.
 /// Unused bytes of the last word must be zero.
 pub fn blake2sU32s(comptime V: type, ctx: *context_mod.Context(V), message: []const U32Wrapper(Var), n_bytes: usize) Error!HashValue(Var) {
-    const block_bytes = 64;
-    const words_per_block = 16;
-    const n_blocks = @max(1, std.math.divCeil(usize, n_bytes, block_bytes) catch unreachable);
-    const total_words = n_blocks * words_per_block;
+    var initial = blake2s_iv;
+    initial[0] ^= 0x01010020;
+    return blake2sU32sFrom(V, ctx, initial, 0, message, n_bytes);
+}
 
+/// Continues compression from an already absorbed, block-aligned prefix.
+pub fn blake2sU32sFrom(comptime V: type, ctx: *context_mod.Context(V), initial: [8]u32, bytes_before: u32, message: []const U32Wrapper(Var), n_bytes: usize) Error!HashValue(Var) {
+    const n_blocks = @max(1, std.math.divCeil(usize, n_bytes, 64) catch unreachable);
     const zero_word = try wrappers.constU32(V, ctx, 0);
-    const padded = try ctx.scratch().alloc(U32Wrapper(Var), @max(total_words, message.len));
-    @memcpy(padded[0..message.len], message);
-    @memset(padded[message.len..], zero_word);
-
-    // `h`: the IV XORed with the parameter block (depth 1, fanout 1, digest length 32).
     var h: [8]U32Wrapper(Var) = undefined;
-    for (&h, 0..) |*word, i| word.* = try wrappers.constU32(V, ctx, if (i == 0) blake2s_iv[0] ^ 0x01010020 else blake2s_iv[i]);
+    for (&h, initial) |*word, value| word.* = try wrappers.constU32(V, ctx, value);
 
     for (0..n_blocks) |block_idx| {
-        const block = padded[block_idx * words_per_block ..][0..words_per_block];
-        const t0: u32 = @intCast(@min(n_bytes, (block_idx + 1) * block_bytes));
+        const remaining = message[@min(block_idx * 16, message.len)..];
+        var tail: [16]U32Wrapper(Var) = undefined;
+        const block = if (remaining.len >= 16) remaining[0..16] else blk: {
+            @memcpy(tail[0..remaining.len], remaining);
+            @memset(tail[remaining.len..], zero_word);
+            break :blk &tail;
+        };
+        const absorbed: u32 = @intCast(@min(n_bytes, (block_idx + 1) * 64));
+        const t0 = bytes_before +% absorbed;
         const last = block_idx == n_blocks - 1;
 
         var v: [16]U32Wrapper(Var) = undefined;
@@ -178,7 +183,9 @@ pub fn blake2sU32s(comptime V: type, ctx: *context_mod.Context(V), message: []co
             v[i] = try wrappers.constU32(V, ctx, iv);
         }
 
-        for (BLAKE_SIGMA) |permutation| {
+        if (ctx.trace_only and ctx.record_gates) {
+            try recordCompression(V, ctx, &v, block);
+        } else for (BLAKE_SIGMA) |permutation| {
             for (g_state_indices, 0..) |indices, g| {
                 const out = try blakeGGate(V, ctx, v[indices[0]], v[indices[1]], v[indices[2]], v[indices[3]], block[permutation[2 * g]], block[permutation[2 * g + 1]]);
                 for (indices, out) |index, word| v[index] = word;
@@ -191,6 +198,50 @@ pub fn blake2sU32s(comptime V: type, ctx: *context_mod.Context(V), message: []co
 
     ctx.stats.blake_updates += n_blocks;
     return .{ .words = h };
+}
+
+// After the first four G gates every state input is an output of this block.
+// Resolve those edges once, then relocate the graph at its first output wire.
+const CompressionGate = struct { inputs: [4]u16, message: [2]u8 };
+const compression: struct { gates: [BLAKE_SIGMA.len * 8]CompressionGate, final: [16]u16 } = blk: {
+    @setEvalBranchQuota(10000);
+    var gates: [BLAKE_SIGMA.len * 8]CompressionGate = undefined;
+    var state: [16]u16 = undefined;
+    for (&state, 0..) |*wire, i| wire.* = i;
+    for (BLAKE_SIGMA, 0..) |permutation, r| {
+        for (g_state_indices, 0..) |indices, g| {
+            const i = r * 8 + g;
+            gates[i].message = .{ permutation[g * 2], permutation[g * 2 + 1] };
+            for (indices, 0..) |index, j| {
+                gates[i].inputs[j] = state[index];
+                state[index] = 16 + 4 * i + j;
+            }
+        }
+    }
+    break :blk .{ .gates = gates, .final = state };
+};
+
+fn recordCompression(comptime V: type, ctx: *context_mod.Context(V), state: *[16]U32Wrapper(Var), message: *const [16]U32Wrapper(Var)) Error!void {
+    const first = ctx.circuit.n_vars;
+    const outputs = 4 * compression.gates.len;
+    if (first >= @import("circuit.zig").max_vars - outputs) return error.TooManyVars;
+    const rows = try ctx.circuit.blake_g_gate.addManyAsSlice(ctx.gpa, compression.gates.len);
+    for (rows, &compression.gates, 0..) |*row, gate, i| {
+        var inputs: [4]u32 = undefined;
+        for (&inputs, gate.inputs) |*input, wire| input.* = if (i < 4) state[wire].get().idx else first + (wire - 16);
+        row.* = .{
+            .input_a = inputs[0],
+            .input_b = inputs[1],
+            .input_c = inputs[2],
+            .input_d = inputs[3],
+            .input_f0 = message[gate.message[0]].get().idx,
+            .input_f1 = message[gate.message[1]].get().idx,
+            .out_base = first + @as(u32, @intCast(i * 4)),
+        };
+    }
+    ctx.circuit.n_vars += outputs;
+    ctx.gate_counts.blake_g_gate += compression.gates.len;
+    for (state, compression.final) |*word, wire| word.* = .newUnsafe(.{ .idx = first + (wire - 16) });
 }
 
 /// Adds a TripleXor gate: `a ^ b ^ c` over `u32` wires.

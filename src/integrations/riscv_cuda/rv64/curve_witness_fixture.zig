@@ -15,14 +15,15 @@ pub fn write(a: std.mem.Allocator, dir: std.fs.Dir, id: u32, comptime op: C.spec
     var rng = std.Random.DefaultPrng.init(0x917613 + id);
     for (packets, 0..) |*packet, j| {
         rng.random().bytes(packet);
-        if (op == .bn254_g1_add or op == .bn254_g1_double) {
+        if (d.nonzero != null) {
+            const modulus = d.modulus.constant;
             for (0..d.inputs) |i| {
-                var x = N.operand(packet, i) % C.spec.BN254_P;
+                var x = N.operand(packet, i) % modulus;
                 if (j == 0) x = i + 1;
-                if (op == .bn254_g1_double and i == 1 and x == 0) x = 1;
+                if (d.inputs == 2 and i == 1 and x == 0) x = 1;
                 for (0..d.limbs) |b| packet[i * d.limbs + b] = C.spec.limbOf(x, b);
             }
-            if (op == .bn254_g1_add and N.operand(packet, 0) == N.operand(packet, 2)) packet[64] ^= 1;
+            if (d.inputs == 4 and N.operand(packet, 0) == N.operand(packet, 2)) packet[2 * d.limbs] ^= 1;
         } else if (op == .arith384_mont) {
             packet[96] |= 1;
             if (j < 3) {

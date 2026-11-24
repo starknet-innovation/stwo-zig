@@ -54,3 +54,35 @@ pub fn forOrigin(origin: Frame.Origin) !Descriptor {
         },
     }
 }
+
+/// Count the committed CPU and AND widths from the same projection used in
+/// opening and GKR binding. Geometry-independent providers retain their shape.
+pub fn forGeometry(origin: Frame.Origin, geometry: @import("../../../word16_execution/geometry.zig").Geometry) !Descriptor {
+    var descriptor = try forOrigin(origin);
+    if (origin != .core or (origin.core != .cpu and origin.core != .and_table)) return descriptor;
+    const source = @import("source_authority.zig").Descriptor.forGeometry(origin, geometry);
+    descriptor.widths[1] = (try source.shape()).main;
+    descriptor.local_terms = try source.terms();
+    if (origin.core == .cpu and geometry.cpu_compact_decode)
+        descriptor.constraints = Role.constraintCount(.cpu_compact, origin);
+    return descriptor;
+}
+
+test "projection metadata follows opened CPU and table shapes at both clocks" {
+    const t = @import("std").testing;
+    const G = @import("../../../word16_execution/geometry.zig").Geometry;
+    const narrow = G{ .cpu_log = 22, .cpu_fused_tail = true, .cpu_u8_pairs = true, .cpu_compact_decode = true };
+    var wide = narrow;
+    wide.cpu_log = 23;
+    wide.cpu_u8_pairs = false;
+    for ([_]G{ narrow, wide }, [_]u32{ 14, 15 }, [_]usize{ 2, 1 }) |g, terms, and_width| {
+        const origin = Frame.Origin{ .core = .cpu };
+        const cpu = try forGeometry(origin, g);
+        try t.expectEqual(@as(usize, 37), cpu.widths[1]);
+        try t.expectEqual(terms, cpu.local_terms);
+        try t.expectEqual(Role.constraintCount(.cpu_compact, origin), cpu.constraints);
+        try t.expectEqual(and_width, (try forGeometry(.{ .core = .and_table }, g)).widths[1]);
+    }
+    wide.cpu_u8_pairs = true;
+    try t.expectError(error.InvalidSourceAuthorityLayout, forGeometry(.{ .core = .cpu }, wide));
+}

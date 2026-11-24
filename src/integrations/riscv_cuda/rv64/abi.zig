@@ -186,6 +186,8 @@ pub const BindingMetadata = extern struct {
 comptime {
     if (@sizeOf(BindingMetadata) != 80 or @offsetOf(BindingMetadata, "chain") != 48) @compileError("binding metadata ABI mismatch");
 }
+/// Numerical buffer ceiling; the admitted GKR frame separately restricts log 23 to the wide CPU.
+pub const binding_max_row_log = 23;
 pub extern "c" fn stwo_rv64_gkr_binding_metadata_on(*anyopaque, u32, *const BindingMetadata) c_int;
 
 pub const BindingProjection = extern struct {

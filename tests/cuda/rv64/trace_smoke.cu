@@ -125,6 +125,26 @@ static void exercise(const std::string &fixtures, const std::string &outputs,
   if (!std::equal(actual_tree.begin(), actual_tree.begin() + tree_words,
                   compatibility_tree.begin()))
     throw std::runtime_error("owned scratch changed native Merkle tree");
+  uint64_t prefix_words = 0;
+  CHECK(stwo_rv64_trace_prefix_workspace_words(input.data(), segments, &prefix_words));
+  const auto prefix = o.plane(prefix_words + 8, 1);
+  o.upload(prefix, std::vector<uint32_t>(prefix_words + 8, 0x1234567));
+  CHECK(stwo_exec_context_sync(o.ctx));
+  CHECK(stwo_rv64_trace_tree_separate_prefix_on(o.ctx, 1, input.data(), segments,
+      log, tree.words, tree_words, prefix.words, prefix_words));
+  const auto separate_tree = o.read(tree), separate_prefix = o.read(prefix);
+  if (!std::equal(actual_tree.begin(), actual_tree.begin() + tree_words, separate_tree.begin()) ||
+      !std::all_of(separate_prefix.begin() + prefix_words, separate_prefix.end(),
+                   [](uint32_t x) { return x == 0x1234567; }))
+    throw std::runtime_error("separate scratch changed the tree or exceeded its capacity");
+  if (prefix_words != 0) {
+    if (!stwo_rv64_trace_tree_separate_prefix_on(o.ctx, 1, input.data(), segments,
+          log, tree.words, tree_words, prefix.words, prefix_words - 1))
+      throw std::runtime_error("short separate prefix accepted");
+    if (!stwo_rv64_trace_tree_separate_prefix_on(o.ctx, 1, input.data(), segments,
+          log, tree.words, tree_words, tree.words, prefix_words))
+      throw std::runtime_error("separate prefix aliases the output tree");
+  }
   if (!stwo_rv64_trace_tree_on(o.ctx, 1, input.data(), segments, log,
                                tree.words, tree_words - 1))
     throw std::runtime_error("short tree accepted");

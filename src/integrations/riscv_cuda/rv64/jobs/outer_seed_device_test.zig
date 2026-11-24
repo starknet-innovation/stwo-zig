@@ -9,6 +9,80 @@ test "seed program: merkle hashes match the domain-prefixed convention" {
     try std.testing.expect(!std.mem.eql(u32, &l, &Schema.blakeWords(&.{&.{}})));
 }
 
+test "seed program: grouped service leaves preserve singletons' seeds and exact frame" {
+    const t = std.testing;
+    const a = t.allocator;
+    var memory = std.heap.ArenaAllocator.init(a);
+    defer memory.deinit();
+    const scratch = memory.allocator();
+    const n = Schema.service_group_members;
+    const tail = Schema.service_group_tail_seeds;
+    const cap_log = 3;
+    const first = 8;
+    var captured: Schema.Synthetic = undefined;
+    try captured.init(scratch, 17, 128);
+    const layout = try Schema.Layout.of(captured.shape);
+    const child = Schema.ChildClass{
+        .shape = captured.shape,
+        .wire_words = 128,
+        .n_outputs = 0,
+        .identity = @splat(0),
+        .fixed_root = captured.image[layout.roots..][0..8].*,
+    };
+    const per_child = try Schema.leafTapeLength(scratch, child, cap_log) + tail;
+    const vars = try scratch.alloc(u32, n * per_child);
+    for (vars, 0..) |*variable, i| variable.* = @intCast(i + 100);
+    const statement = Schema.Statement{
+        .domain = 0,
+        .version_word = 0,
+        .n_outputs = 8,
+        .prefix = @splat(2),
+        .identity = @splat(3),
+        .fixed_root = @splat(4),
+        .profile = @splat(5),
+    };
+    const group = try Schema.buildServiceGroup(scratch, @splat(child), first, cap_log, vars, &.{}, statement);
+    var regions: [n][]const u32 = undefined;
+    var messages: [n][35]u32 = undefined;
+    for (&regions, &messages, 0..) |*result, *frame, i| {
+        const region = try scratch.alloc(u32, captured.region.len + 4 * tail);
+        @memcpy(region[0..captured.region.len], captured.region);
+        const suffix = region[captured.region.len..];
+        for (frame[0..19], 0..) |*word, j| {
+            word.* = if (j == 0) first + @as(u32, @intCast(i)) else @as(u32, @intCast(i + j)) * 0x10001;
+            suffix[8 * j ..][0..8].* = .{ word.* & 0xffff, 0, 0, 0, word.* >> 16, 0, 0, 0 };
+        }
+        frame[19..27].* = captured.image[layout.roots + 8 ..][0..8].*;
+        frame[27..35].* = @splat(@intCast(i + 32));
+        suffix[152..160].* = frame[27..35].*;
+        result.* = region;
+    }
+    const grouped_out = try scratch.alloc(u32, 5 * vars.len);
+    const grouped_scratch = try scratch.alloc(u32, group.header(Schema.P.scratch_words) + 8);
+    try t.expectEqual(@as(u32, 0), Schema.fillHost(group, &regions, grouped_scratch, grouped_out));
+    for (regions, 0..) |region, i| {
+        const single = try Schema.buildLeaf(scratch, child, cap_log, tail, vars[per_child * i ..][0..per_child], &.{}, null);
+        const single_out = try scratch.alloc(u32, 5 * per_child);
+        const single_scratch = try scratch.alloc(u32, single.header(Schema.P.scratch_words) + 8);
+        try t.expectEqual(@as(u32, 0), Schema.fillHost(single, &.{region}, single_scratch, single_out));
+        try t.expectEqualSlices(u32, grouped_out[5 * per_child * i ..][0 .. 5 * per_child], single_out);
+    }
+    const digest = Schema.blakeWords(&.{ &.{ 0x47565253, 1, first, 3, first + 3 }, &messages[0], &messages[1], &messages[2] });
+    var outputs: [32]u32 = undefined;
+    var checkpoint: [9]u32 = undefined;
+    try t.expectEqual(@as(u32, 0), Schema.statementHost(group, &regions, &outputs, &checkpoint));
+    for (digest, 0..) |word, i| try t.expectEqual([4]u32{ word & 0xffff, word >> 16, 0, 0 }, outputs[4 * i ..][0..4].*);
+    const domain = @as(u32, 0x0306) << 16;
+    try t.expectEqual(domain | @intFromEnum(Schema.BindDetail.identity), Schema.statementHost(group, &.{ regions[1], regions[0], regions[2] }, &outputs, &checkpoint));
+    try t.expectEqual(domain | @intFromEnum(Schema.BindDetail.region), Schema.statementHost(group, &.{ regions[0], regions[1], regions[2][0 .. regions[2].len - 1] }, &outputs, &checkpoint));
+    const bad = try scratch.dupe(u32, regions[2]);
+    bad[bad.len - 1] = Schema.modulus;
+    try t.expectEqual(domain | @intFromEnum(Schema.BindDetail.noncanonical), Schema.statementHost(group, &.{ regions[0], regions[1], bad }, &outputs, &checkpoint));
+    bad[bad.len - 1] = regions[2][bad.len - 1];
+    bad[128 + layout.roots] ^= 1;
+    try t.expectEqual(domain | @intFromEnum(Schema.BindDetail.fixed_root), Schema.statementHost(group, &.{ regions[0], regions[1], bad }, &outputs, &checkpoint));
+}
+
 test "seed program: trace.position matches lifting" {
     try std.testing.expectEqual(@as(u32, 5), Schema.position(5, 4, 4));
     // from 5 to 3: drop 2 bits above bit 0
@@ -186,4 +260,69 @@ test "seed program: a sparse depth-four frontier binds every upper sibling" {
     const last = 128 + cap.paths + cap.path_stride + (cap.height - 1) * 8;
     child.region[last] ^= 1;
     try std.testing.expect(Schema.fillHost(prog, &.{child.region}, scratch, out) != 0);
+}
+
+test "seed program: direct native leaf equals the retained discovery version" {
+    const a = std.testing.allocator;
+    const Pcs = @import("../pcs_assembly.zig");
+    var captured: Schema.Synthetic = undefined;
+    try captured.init(a, 17, 128);
+    defer captured.deinit(a);
+    const observed = captured.shape;
+    var native_trees: [4]Pcs.Tree = undefined;
+    for (native_trees[0..observed.trees.len], observed.trees) |*out, tree| {
+        out.* = .{ .coefficient_logs = tree.logs, .sorted_to_original = tree.sorted_to_original, .sample_counts = tree.sample_counts };
+    }
+    const metadata = Pcs.Shape{
+        .config = .{
+            .pow_bits = observed.pow_bits,
+            .lifting_log_size = observed.lifting,
+            .fri_config = .{
+                .log_blowup_factor = observed.log_blowup,
+                .log_last_layer_degree_bound = observed.log_last,
+                .n_queries = observed.n_queries,
+                .fold_step = observed.fold_step,
+            },
+        },
+        .degree_log = observed.degree_log,
+        .trees = native_trees[0..observed.trees.len],
+    };
+    var recorded: std.ArrayListUnmanaged(u32) = .empty;
+    defer recorded.deinit(a);
+    try @import("../outer_seed_record.zig").appendShape(a, &recorded, metadata);
+    var cursor: usize = 0;
+    const parsed = try Schema.Shape.parse(a, recorded.items, &cursor);
+    defer a.free(parsed.trees);
+    try std.testing.expectEqual(recorded.items.len, cursor);
+    var storage: Schema.Shape.TreeStorage = undefined;
+    const direct = try Schema.Shape.fromPcs(metadata, &storage);
+    try std.testing.expect(parsed.eql(direct));
+    var setup_encoding: std.ArrayListUnmanaged(u32) = .empty;
+    defer setup_encoding.deinit(a);
+    try direct.append(a, &setup_encoding);
+    try std.testing.expectEqualSlices(u32, recorded.items, setup_encoding.items);
+    const child = Schema.ChildClass{ .shape = direct, .wire_words = 128, .n_outputs = 2, .identity = @splat(7), .fixed_root = @splat(0) };
+    var legacy = child;
+    legacy.shape = parsed;
+    const cap_log = 3;
+    const tape = try Schema.leafTapeLength(a, child, cap_log);
+    const vars = try a.alloc(u32, tape);
+    defer a.free(vars);
+    for (vars, 0..) |*variable, i| variable.* = @intCast(i);
+    const from_source = try Schema.buildLeaf(a, child, cap_log, 0, vars, &.{}, null);
+    defer from_source.deinit(a);
+    const from_archive = try Schema.buildLeaf(a, legacy, cap_log, 0, vars, &.{}, null);
+    defer from_archive.deinit(a);
+    try std.testing.expectEqualSlices(u32, from_archive.words, from_source.words);
+    const scratch = try a.alloc(u32, from_source.header(Schema.P.scratch_words) + 8);
+    defer a.free(scratch);
+    const out = try a.alloc(u32, 5 * vars.len);
+    defer a.free(out);
+    try std.testing.expectEqual(@as(u32, 0), Schema.fillHost(from_source, &.{captured.region}, scratch, out));
+
+    var altered = direct;
+    altered.n_queries += 1;
+    try std.testing.expect(!parsed.eql(altered));
+    native_trees[0].sample_counts = &.{};
+    try std.testing.expectError(error.GnSeedShapeInvalid, Schema.Shape.fromPcs(metadata, &storage));
 }

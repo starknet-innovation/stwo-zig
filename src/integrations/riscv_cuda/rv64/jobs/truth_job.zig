@@ -240,6 +240,24 @@ const placeholders = @import("truth_stage2_job.zig").placeholders;
 // Stage 1
 // ---------------------------------------------------------------------------
 
+const TruthSpan = @import("../guest_service_inputs.zig").TruthSpan;
+
+pub fn validateCompact(host: []const u32, device: ?TruthSpan, words: usize) !void {
+    if (device) |d| {
+        if (host.len != 0 or d.buffer.words != words) return error.TruthCompactShape;
+    } else if (host.len != words) return error.TruthCompactShape;
+}
+
+pub fn stageCompact(stager: *api.Stager, host: []const u32, device: ?TruthSpan) !api.DeviceBuffer {
+    if (device) |d| {
+        if (d.device != stager.device()) return error.TruthCompactDevice;
+        return try stager.alloc(d.buffer.words);
+    }
+    const buffer = try stager.alloc(host.len);
+    try stager.upload(buffer, host);
+    return buffer;
+}
+
 pub const Stage1 = struct {
     a: std.mem.Allocator,
     class: *const K.Class,
@@ -249,6 +267,7 @@ pub const Stage1 = struct {
     first_id: u32,
     /// Host compact inputs (K.packCompact); must outlive `stage`.
     compact: []const u32,
+    compact_device: ?@import("../guest_service_inputs.zig").TruthSpan = null,
     /// Device root destination (8 words; e.g. this GPU's Exchange.truthRoot
     /// slot); null = the job slab's root field only.
     root_out: ?api.DeviceBuffer = null,
@@ -270,7 +289,8 @@ pub const Stage1 = struct {
 
     pub fn init(self: *Stage1) !void {
         if (self.request_slab_only and (self.root_out == null or self.publish == null or self.verdicts.truth_root == null)) return error.TruthRequestVerdictsMissing;
-        if (self.compact.len != self.class.compactWords(self.calls) or self.calls == 0) return error.TruthCompactShape;
+        if (self.calls == 0) return error.TruthCompactShape;
+        try validateCompact(self.compact, self.compact_device, self.class.compactWords(self.calls));
         self.main_plan = try K.jobPlan(self.a, &self.class.main_plan);
         self.main_plan.require_warm = self.request_slab_only;
         self.plan_live = true;
@@ -294,8 +314,7 @@ pub const Stage1 = struct {
         return fp;
     }
     pub fn stage(self: *Stage1, s: *api.Stager) !void {
-        const b = try s.alloc(self.compact.len);
-        try s.upload(b, self.compact);
+        const b = try stageCompact(s, self.compact, self.compact_device);
         self.staged_compact = b;
         const inputs = try placeholders(self.a, self.class.main_logs.len);
         defer self.a.free(inputs);
@@ -312,6 +331,7 @@ pub const Stage1 = struct {
         try e.slab.bind(&self.layout);
         try self.span.mark(self.timing, false, e.stream());
         const compact = self.staged_compact orelse return error.TruthJobNotStaged;
+        if (self.compact_device) |d| try check(self.sym.copy_d2d(e.ctx(), compact.ptr, d.buffer.ptr, d.buffer.bytes()));
         const status = try e.slab.field(.status, 0);
         try check(self.sym.memset(e.ctx(), status.ptr, 0, 4));
         const main = try e.alloc(self.class.mainEvalWords());
@@ -409,17 +429,18 @@ pub fn stage2Footprint(c: *const K.Class, calls: u32, slab_words: usize, pcs_out
     }
     const main_coeffs = al(c.main_plan.coefficient_cells);
     const phase_witness = al(c.mainEvalWords()) + c.main_plan.deviceWords() + 256 + g;
-    const phase_interactions = main_coeffs + outputs + role_peak;
+    const phase_interactions = al(c.mainEvalWords()) + main_coeffs + outputs + role_peak;
     const phase_inter = main_coeffs + outputs + c.inter_plan.deviceWords();
     const phase_comp = main_coeffs + al(c.inter_plan.coefficient_cells) + c.composition.enqueueWords();
     const pcs_estimate = 2 * @max(c.main_plan.eval_cells, @max(c.inter_plan.eval_cells, c.fixed_plan.eval_cells)) + pcs_output;
-    const phase_pcs = main_coeffs + al(c.inter_plan.coefficient_cells) + al(c.composition.coefficientWords()) + pcs_estimate;
+    const opening = al(c.composition.retainedOpeningWords());
+    const phase_pcs = main_coeffs + al(c.inter_plan.coefficient_cells) + al(c.composition.coefficientWords()) + opening + pcs_estimate;
     const small = 4 * al(feltWords(X.shared_felts)) + @import("channel.zig").state_words + 16 * g;
     // gn-truth device encode. The arena is LIFO by default (worker
     // reuse_frees off): the tree coefficients are freed before the device
     // phase but sit beneath the PCS image (allocated after them in `.device`),
     // so they stay resident under the OODS node scratch and encoder scratch.
-    const phase_device = main_coeffs + al(c.inter_plan.coefficient_cells) + al(c.composition.coefficientWords()) + al(pcs_output) + al(c.oods.scratch_words) + al(NE.scratch_words) + 4 * g;
+    const phase_device = main_coeffs + al(c.inter_plan.coefficient_cells) + al(c.composition.coefficientWords()) + opening + al(pcs_output) + al(c.oods.scratch_words) + al(NE.scratch_words) + 4 * g;
     const peak = @max(@max(@max(phase_witness, phase_interactions), phase_device), @max(@max(phase_inter, phase_comp), phase_pcs));
     return .{ .device_words = staged + peak + small, .staged_words = staged, .slab_words = slab_words, .pinned_words = pcs_ingress + c.composition.pinnedWords() + t.words + c.compactWords(calls) + c.fixed_words + 2 * (@as(usize, 1) << @intCast(c.inter_plan.eval_log)) + 64 * g };
 }
@@ -429,6 +450,31 @@ pub fn stage2RequestFootprint(c: *const K.Class, calls: u32, pcs_output: usize, 
     var fp = stage2Footprint(c, calls, 0, pcs_output, pcs_ingress);
     fp.pinned_words = pcs_ingress + c.composition.table.len + tableOf(c).words + c.compactWords(calls) + 8 * (c.main_logs.len + c.inter_logs.len) + 2048;
     return fp;
+}
+
+/// First-use upper bound for a resident FIXED authority and a planned
+/// rolling PCS. Charge the sum of the phases before claiming any reuse
+/// between them. The device allocator still enforces the admitted window.
+pub fn stage2InstallBound(c: *const K.Class, calls: u32, shared_commit_evaluations: bool) !?usize {
+    if (c.source_fixed_root == null) return null;
+    const pcs = std.math.cast(usize, c.pcs.reserve_words orelse return null) orelse return error.ResourceSizeOverflow;
+    const output: usize = @intCast(c.pcs.outputWords());
+    const fp = stage2RequestFootprint(c, calls, output, @intCast(c.pcs.ingressWords()));
+    const alignWords = @import("resources.zig").aligned;
+    var total = fp.staged_words + 2048; // private fields, channel and granules
+    for ([_]usize{ c.mainEvalWords(), c.main_plan.deviceWords(), c.inter_plan.deviceWords(), c.composition.enqueueWords(), pcs, output, c.oods.scratch_words, NE.scratch_words }) |words| {
+        total = std.math.add(usize, total, try alignWords(words)) catch return error.ResourceSizeOverflow;
+    }
+    for (c.roles) |r| {
+        const p = r.interaction;
+        const words = (try alignWords(p.outputWords())) + p.enqueueWords() + (try alignWords(p.program.len * 8));
+        total = std.math.add(usize, total, words) catch return error.ResourceSizeOverflow;
+    }
+    // Both commit plans include their LDE allocation. The paired implementation
+    // reserves one buffer of the larger length and reuses it on the same stream.
+    // Take no credit for any other frees, allocator behaviour, or job overlap.
+    if (shared_commit_evaluations) total -= try alignWords(@min(c.main_plan.eval_cells, c.inter_plan.eval_cells));
+    return @max(fp.device_words, total);
 }
 
 /// The PCS output header words the class framing fixes (hybrid_pcs.decodeWords):

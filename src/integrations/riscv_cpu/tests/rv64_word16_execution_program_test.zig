@@ -52,6 +52,32 @@ test "full program reuses admitted immutable decoded authority without copying r
     defer plain.deinit();
     try std.testing.expectError(error.InvalidExecutionProgramWord, plain.lookup(1036));
 }
+test "direct compact fixed materialization matches conversion and shares exact ROM metadata" {
+    const words = [_]u32{ branch(8), AND, 0xff80b183, 0x00000073 };
+    var authority = try Full.ProgramAuthority.init(a, .{ .base = 1024, .words = &words }, .ethereum_services_v2);
+    defer authority.deinit();
+    const Cache = @import("../word16_execution/program.zig").Metadata.Cache;
+    var cache = try Cache.init(a, 1 << 20);
+    defer cache.deinit();
+    var converted = try Program.initWithAuthority(a, &authority);
+    defer converted.deinit();
+    try converted.makeCompact();
+    var miss = try Program.initFixedWithAuthority(a, &authority, &cache, true);
+    defer miss.deinit();
+    var hit = try Program.initFixedWithAuthority(a, &authority, &cache, true);
+    defer hit.deinit();
+    var direct = try Program.initFixedWithAuthority(a, &authority, null, true);
+    defer direct.deinit();
+    for ([_]*const Program{ &miss, &hit, &direct }) |candidate| {
+        try std.testing.expect(candidate.compact);
+        try std.testing.expect(!candidate.fixed_retired);
+        try std.testing.expectEqual(converted.identity, candidate.identity);
+        try std.testing.expectEqualDeep(converted.metadataView(), candidate.metadataView());
+        try std.testing.expectEqualSlices(@TypeOf(converted.fixed[0]), converted.fixed, candidate.fixed);
+    }
+    try std.testing.expectEqual(miss.entries.ptr, hit.entries.ptr);
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().hits);
+}
 test "full program lookup preserves sparse high64 aliases wrapping and branch alignment" {
     const high: u64 = 0x8000000000000400;
     var sparse = try Program.init(a, .{ .base = 1024, .words = &.{ AND, AND }, .addresses = &.{ 1024, high } });

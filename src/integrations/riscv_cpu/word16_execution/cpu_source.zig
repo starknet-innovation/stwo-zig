@@ -246,7 +246,7 @@ const Scan = struct {
         const pc = self.pc;
         const registers = &self.registers;
         const clocks = &self.clocks;
-        const meta = &self.metadata[index];
+        const meta = if (self.metadata.len == 0) null else &self.metadata[index];
         const word = try program.lookup(pc);
         const entry = program.entries[word];
         if (!entry.valid or (program.compact and !entry.compactValid())) return error.UnadmittedExecutionInstruction;
@@ -265,14 +265,20 @@ const Scan = struct {
         if (program.compact and !X.features.compactPcAdmitted(next)) return error.InvalidExecutionAdvice;
         const c = if (entry.branch) @intFromBool(record.branch_taken) else record.result.toInt();
         const rom_row = try program.factIndex(word, entry.branch and record.branch_taken);
-        meta.* = .{ .values = .{ record.lhs.toInt(), record.rhs.toInt(), c, record.previous_rd.toInt(), next }, .clocks = undefined, .rom_row = @intCast(rom_row) };
+        const lhs = record.lhs.toInt();
+        const rhs = record.rhs.toInt();
+        if (meta) |m| m.* = .{ .values = .{ lhs, rhs, c, record.previous_rd.toInt(), next }, .clocks = undefined, .rom_row = @intCast(rom_row) };
         for (entry.ids, 0..) |id, slot| {
             if (stitched and id != 0 and self.touched & (@as(u32, 1) << @intCast(id)) == 0) {
                 self.touched |= @as(u32, 1) << @intCast(id);
-                self.fixups[self.fixed] = .{ .index = index, .slot = @intCast(slot), .register = @intCast(id) };
-                self.fixed += 1;
-                meta.clocks[slot] = 0; // patched by the ordered stitch
-            } else meta.clocks[slot] = if (id == 0) 0 else clocks[id];
+                if (meta) |m| {
+                    self.fixups[self.fixed] = .{ .index = index, .slot = @intCast(slot), .register = @intCast(id) };
+                    self.fixed += 1;
+                    m.clocks[slot] = 0; // patched by the ordered stitch
+                }
+            } else if (meta) |m| {
+                m.clocks[slot] = if (id == 0) 0 else clocks[id];
+            }
             if (id != 0) clocks[id] = @intCast(4 * index + slot + 1);
         }
         if (stitched) self.rom_local[L.physical(rom_row, program.log_size)] += 1 else self.rom_counts[L.physical(rom_row, program.log_size)] += 1;
@@ -280,15 +286,15 @@ const Scan = struct {
         if (entry.function) {
             if (record.memory != null) return error.InvalidExecutionAdvice;
             // Compact decode folds AUIPC/JAL to ADD(0, pc+imm) / ADD(0, pc+4).
-            const fact_a = if (entry.use_pc and !program.compact) pc else meta.values[0];
-            const fact_b = if (!entry.use_immediate) meta.values[1] else if (program.compact) entry.compactB() else entry.immediate;
+            const fact_a = if (entry.use_pc and !program.compact) pc else lhs;
+            const fact_b = if (!entry.use_immediate) rhs else if (program.compact) entry.compactB() else entry.immediate;
             try self.functions.append(a, .{ .operation = entry.operation, .a = fact_a, .b = fact_b, .c = if (entry.dynamic_next) next else c });
         } else if (entry.instruction.opcode == .ECALL) {
             if (record.memory != null or c != 0) return error.InvalidExecutionAdvice;
-            try self.services.append(a, .{ .pointer = meta.values[0], .tag = meta.values[1], .epoch = self.epoch, .tick = @intCast(self.stride * (index + 1)) });
+            try self.services.append(a, .{ .pointer = lhs, .tag = rhs, .epoch = self.epoch, .tick = @intCast(self.stride * (index + 1)) });
         } else {
             const effect = record.memory orelse return error.MissingExecutionMemory;
-            try self.memory.append(a, .{ .opcode = entry.instruction.opcode, .a = meta.values[0], .immediate = entry.immediate, .b = meta.values[1], .c = c, .epoch = self.epoch, .tick = @intCast(self.stride * (index + 1)), .effect = effect });
+            try self.memory.append(a, .{ .opcode = entry.instruction.opcode, .a = lhs, .immediate = entry.immediate, .b = rhs, .c = c, .epoch = self.epoch, .tick = @intCast(self.stride * (index + 1)), .effect = effect });
         }
         // A written register is already known: its previous value was adopted.
         if (effects.writes_rd and entry.ids[2] != 0) registers[entry.ids[2]] = record.result.toInt();
@@ -413,10 +419,7 @@ pub const Source = struct {
         return captureRoute(a, program, public, epoch, log_size, tape, recorderEnabled());
     }
     pub fn captureRoute(a: std.mem.Allocator, program: *const Program, public: X.types.Boundary, epoch: u16, log_size: u32, tape: *const Tape, recorder: bool) !Source {
-        const wanted = captureChunks(public.steps);
-        const helpers = if (wanted > 1) reserveHelpers(wanted - 1) else 0;
-        defer releaseHelpers(helpers);
-        return captureChunkedRoute(a, program, public, epoch, log_size, tape, helpers + 1, recorder);
+        return captureWithMetadata(a, program, public, epoch, log_size, tape, null, recorder, true);
     }
     /// Producer scheduling only: every `chunks` value returns the same Source
     /// (metadata, ROM counts, FUNCTION/memory/service records in step order)
@@ -438,9 +441,17 @@ pub const Source = struct {
     /// `captureChunked` with the STWO_RV64_M8_CAPTURE_RECORDER route explicit
     /// (tests run both routes in one process). Same Source either way.
     pub fn captureChunkedRoute(a: std.mem.Allocator, program: *const Program, public: X.types.Boundary, epoch: u16, log_size: u32, tape: *const Tape, requested_chunks: usize, recorder: bool) !Source {
+        return captureWithMetadata(a, program, public, epoch, log_size, tape, requested_chunks, recorder, true);
+    }
+    /// The compact device path still checks the tape and builds all provider
+    /// facts. Its CPU witness is projected independently from device records.
+    pub fn captureWithMetadata(a: std.mem.Allocator, program: *const Program, public: X.types.Boundary, epoch: u16, log_size: u32, tape: *const Tape, requested_chunks: ?usize, recorder: bool, retain_metadata: bool) !Source {
+        const wanted = if (requested_chunks == null) captureChunks(public.steps) else 1;
+        const helpers = if (wanted > 1) reserveHelpers(wanted - 1) else 0;
+        defer releaseHelpers(helpers);
         _ = try X.types.inputs(public, epoch, log_size);
         if (tape.len != public.steps or tape.initial_pc != public.initial_pc) return error.InvalidExecutionAdvice;
-        const metadata = try a.alloc(Metadata, public.steps);
+        const metadata: []Metadata = if (retain_metadata) try a.alloc(Metadata, public.steps) else &.{};
         errdefer a.free(metadata);
         const rom_counts = try a.alloc(u64, program.size());
         errdefer a.free(rom_counts);
@@ -453,7 +464,7 @@ pub const Source = struct {
         @memset(counts8, 0);
         const stride: u32 = L.ramStride(log_size);
         const steps: usize = public.steps;
-        const chunks = @max(1, @min(requested_chunks, @min(MAX_CAPTURE_CHUNKS, steps)));
+        const chunks = @max(1, @min(requested_chunks orelse helpers + 1, @min(MAX_CAPTURE_CHUNKS, steps)));
         var functions: std.ArrayList(FunctionFact) = .empty;
         errdefer functions.deinit(a);
         var memory: std.ArrayList(MemoryRecord) = .empty;

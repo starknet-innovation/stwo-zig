@@ -17,6 +17,7 @@ const Scheme = engine.pcs.CommitmentSchemeProver(Cpu, H, MC);
 pub const Tree = Scheme.CommittedTree;
 const Budget = engine.host_budget_allocator.SharedHostBudget;
 const Native = @import("fixed_native_cache.zig");
+const Extensions = @import("fixed_extensions.zig").Cache;
 
 /// Immutable commitment shape only. Hash/schema are pinned by this module;
 /// rate and ordered coefficient geometry affect the tree. Secure field, query
@@ -64,6 +65,20 @@ fn coefficientsEqual(a: []const Coefficient, b: []const Coefficient) bool {
     }
     return true;
 }
+
+/// Borrow a frozen source's ordered coefficients and derive the candidate
+/// identity without computing its LDE or building its Merkle tree.
+pub const CommitInputs = struct {
+    descriptor: CommitmentDescriptor,
+    coefficients: []const Coefficient,
+    identity: [32]u8,
+
+    pub fn fromSource(source: anytype, descriptor: CommitmentDescriptor) !CommitInputs {
+        const coefficients = try sourceCoefficients(source);
+        return .{ .descriptor = descriptor, .coefficients = coefficients, .identity = try coefficientIdentity(coefficients, descriptor) };
+    }
+};
+
 fn releaseBudget(context: ?*anyopaque, _: u64) void {
     const budget: *Budget = @ptrCast(@alignCast(context.?));
     budget.destroy();
@@ -81,17 +96,16 @@ pub const WideFixedKey = struct {
     /// identity, root and shape only. It can bind a statement/transcript but
     /// can never be appended to a prover PCS.
     root_only: bool = false,
-    fn seal(a: std.mem.Allocator, budget: *Budget, native: *const Native.Cache, coefficients: []const Coefficient, descriptor: CommitmentDescriptor, id: [32]u8) !WideFixedKey {
+    fn seal(a: std.mem.Allocator, budget: *Budget, native: *const Native.Cache, extensions: ?*Extensions, coefficients: []const Coefficient, descriptor: CommitmentDescriptor, id: [32]u8) !WideFixedKey {
         var scheme = try Scheme.init(a, try configuration(descriptor));
         defer scheme.deinit(a);
-        scheme.setStorePolynomialsCoefficients();
-        scheme.setCompactPolynomialStorage(1);
-        var channel: QChannel = .{};
-        // Already interpolated native coefficients: no fixed-row reconstruction
-        // or interpolation. Retained copies are made ONCE when this key seals.
-        try scheme.commitPolys(a, coefficients, &channel);
-        if (scheme.trees.items.len != 1) return error.InvalidFixedSetupTree;
-        var tree = scheme.trees.pop().?;
+        var tree = if (extensions) |owner| try owner.commit(a, coefficients, descriptor.log_blowup, &scheme) else reference: {
+            scheme.setStorePolynomialsCoefficients();
+            scheme.setCompactPolynomialStorage(1);
+            var channel: QChannel = .{};
+            try scheme.commitPolys(a, coefficients, &channel);
+            break :reference scheme.trees.pop().?;
+        };
         errdefer tree.deinit(a);
         if (tree.backing_teardown != null) return error.UnexpectedFixedSetupBackingOwner;
         // Reserve the shared owner before the native cache can adopt payloads.
@@ -146,7 +160,7 @@ pub const SourceTag = struct {
     pub fn of(source: anytype) SourceTag {
         return .{ .root = source.root, .pcs = source.suite.config(), .columns = source.tree.columns.len };
     }
-    fn eql(self: SourceTag, other: SourceTag) bool {
+    pub fn eql(self: SourceTag, other: SourceTag) bool {
         return std.mem.eql(u8, &self.root, &other.root) and std.meta.eql(self.pcs, other.pcs) and self.columns == other.columns;
     }
 };
@@ -154,6 +168,7 @@ const Entry = struct { key: WideFixedKey, source: ?SourceTag = null };
 const State = struct {
     budget: *Budget,
     native: Native.Cache,
+    extensions: Extensions,
     references: std.atomic.Value(usize) = .init(1),
     mutex: std.Thread.Mutex = .{},
     entries: std.ArrayList(*Entry) = .empty,
@@ -173,6 +188,7 @@ const State = struct {
             a.destroy(entry);
         }
         self.entries.deinit(a);
+        self.extensions.clear(a);
         self.native.deinit();
         a.destroy(self);
         budget.destroy();
@@ -190,33 +206,46 @@ pub const Lease = struct {
         self.* = undefined;
     }
 };
-pub const Snapshot = struct { limit_bytes: usize, live_bytes: usize, peak_bytes: usize, keys: usize, hits: u64, seals: u64, loads: u64 = 0, refused: bool, native_coefficients: Native.Snapshot };
+pub const Snapshot = struct { limit_bytes: usize, live_bytes: usize, peak_bytes: usize, keys: usize, hits: u64, seals: u64, loads: u64 = 0, refused: bool, native_coefficients: Native.Snapshot, extension_transforms: usize, extension_cache_bytes: usize, extension_columns: usize, ordinary_extension_columns: usize, extension_transform_ns: u64, extension_merkle_ns: u64 };
 pub const Cache = struct {
     state: *State,
     /// Includes cache/control metadata and sealing scratch, not RSS. No global
     /// cache or eviction. A finite hard cap applies during construction too.
     pub fn init(a: std.mem.Allocator, maximum_bytes: usize) !Cache {
         if (maximum_bytes <= @sizeOf(Budget)) return error.InvalidFixedSetupBudget;
-        const budget = try Budget.createRetainingParent(a, maximum_bytes - @sizeOf(Budget));
+        return withBudget(try Budget.createRetainingParent(a, maximum_bytes - @sizeOf(Budget)));
+    }
+    fn withBudget(budget: *Budget) !Cache {
         errdefer budget.destroy();
+        const maximum_bytes = budget.limit + @sizeOf(Budget);
         const allocator = budget.allocator();
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
         // Both caches and every payload use the SAME hard owner. This inner
         // retention limit cannot authorize bytes beyond the outer limit.
-        state.* = .{ .budget = budget, .native = try Native.Cache.init(allocator, maximum_bytes) };
+        state.* = .{ .budget = budget, .native = try Native.Cache.init(allocator, maximum_bytes), .extensions = .{ .limit = maximum_bytes / 8 } };
         return .{ .state = state };
     }
     pub fn deinit(self: *Cache) void {
         self.state.release();
         self.* = undefined;
     }
+    /// Reserve half the fixed budget for sealing a new batch. Older tree and
+    /// key leases stay valid and charged against this same hard limit.
+    pub fn retireIfPressured(self: *Cache) !bool {
+        const budget = self.state.budget;
+        if (self.state.entries.items.len == 0 or budget.snapshot().live_bytes < budget.limit / 2) return false;
+        const next = try withBudget(budget.retain());
+        self.deinit();
+        self.* = next;
+        return true;
+    }
     pub fn snapshot(self: *const Cache) Snapshot {
         const state = self.state;
         state.mutex.lock();
         defer state.mutex.unlock();
         const b = state.budget.snapshot();
-        return .{ .limit_bytes = b.limit + @sizeOf(Budget), .live_bytes = b.live_bytes + @sizeOf(Budget), .peak_bytes = b.peak_live_bytes + @sizeOf(Budget), .keys = state.entries.items.len, .hits = state.hits, .seals = state.seals, .loads = state.loads, .refused = b.exceeded, .native_coefficients = state.native.snapshot() };
+        return .{ .limit_bytes = b.limit + @sizeOf(Budget), .live_bytes = b.live_bytes + @sizeOf(Budget), .peak_bytes = b.peak_live_bytes + @sizeOf(Budget), .keys = state.entries.items.len, .hits = state.hits, .seals = state.seals, .loads = state.loads, .refused = b.exceeded, .native_coefficients = state.native.snapshot(), .extension_transforms = state.extensions.transforms, .extension_cache_bytes = state.extensions.bytes, .extension_columns = state.extensions.columns, .ordinary_extension_columns = state.extensions.ordinary_columns, .extension_transform_ns = state.extensions.transform_ns, .extension_merkle_ns = state.extensions.merkle_ns };
     }
     pub fn acquireCoefficients(self: *const Cache, coefficients: []const Coefficient, descriptor: CommitmentDescriptor) !Lease {
         return self.acquireCoefficientsTagged(coefficients, descriptor, null);
@@ -235,13 +264,25 @@ pub const Cache = struct {
             state.retain();
             return .{ .state = state, .key = &entry.key };
         };
+        const selected = if (state.extensions.likelyReuse(coefficients, descriptor.log_blowup)) &state.extensions else null;
+        return sealEntry(state, coefficients, descriptor, id, tag, selected) catch |err| {
+            if (err != error.OutOfMemory or (selected == null and state.extensions.bytes == 0) or !state.budget.snapshot().exceeded) return err;
+            // Retention must not reject a tree admitted by the same hard
+            // budget on the ordinary compact builder. No published tree
+            // borrows an evaluation from the working cache.
+            state.extensions.clear(state.budget.allocator());
+            return sealEntry(state, coefficients, descriptor, id, tag, null);
+        };
+    }
+    fn sealEntry(state: *State, coefficients: []const Coefficient, descriptor: CommitmentDescriptor, id: [32]u8, tag: ?SourceTag, extensions: ?*Extensions) !Lease {
         const a = state.budget.allocator();
         try state.entries.ensureUnusedCapacity(a, 1);
         const entry = try a.create(Entry);
         errdefer a.destroy(entry);
-        entry.* = .{ .key = try WideFixedKey.seal(a, state.budget, &state.native, coefficients, descriptor, id), .source = tag };
+        entry.* = .{ .key = try WideFixedKey.seal(a, state.budget, &state.native, extensions, coefficients, descriptor, id), .source = tag };
         state.entries.appendAssumeCapacity(entry);
         state.seals += 1;
+        if (extensions == null) state.extensions.ordinary_columns +|= coefficients.len;
         state.retain();
         return .{ .state = state, .key = &entry.key };
     }

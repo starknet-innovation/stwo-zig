@@ -299,6 +299,32 @@ pub const CircuitView = struct {
             return error.VariableOutOfRange;
     }
 
+    /// Padding gates often read a single wire millions of times. Count that
+    /// suffix in one update after checking every input port. Output identities
+    /// and the rest of the graph are still checked by the ordinary writer.
+    fn countRepeatedInputs(gates: anytype, comptime fields: anytype, uses: []u32) Error!usize {
+        if (gates.len < 64) return gates.len;
+        const wire = @field(gates[gates.len - 1], fields[0]);
+        var i = gates.len;
+        while (i != 0) {
+            const gate = gates[i - 1];
+            inline for (fields) |field| {
+                if (@field(gate, field) != wire) break;
+            } else {
+                i -= 1;
+                continue;
+            }
+            break;
+        }
+        if (i != gates.len) {
+            if (wire >= uses.len) return error.VariableOutOfRange;
+            const count = std.math.cast(u32, gates.len - i) orelse return error.AddressOutOfField;
+            const reads = std.math.mul(u32, count, fields.len) catch return error.AddressOutOfField;
+            uses[wire] = std.math.add(u32, uses[wire], reads) catch return error.AddressOutOfField;
+        }
+        return i;
+    }
+
     /// `Circuit::compute_multiplicities().0`: uses of every variable.
     pub fn computeUses(self: CircuitView, allocator: std.mem.Allocator) (Error || std.mem.Allocator.Error)![]u32 {
         const uses = try allocator.alloc(u32, self.n_vars);
@@ -311,23 +337,29 @@ pub const CircuitView = struct {
             }
         }.at;
         inline for (.{ self.add, self.sub, self.mul, self.pointwise_mul }) |gates| {
-            for (gates) |gate| {
+            const end = try countRepeatedInputs(gates, .{ "in0", "in1" }, uses);
+            for (gates[0..end]) |gate| {
                 try bump(uses, gate.in0);
                 try bump(uses, gate.in1);
             }
         }
-        for (self.eq) |gate| {
+        const eq_end = try countRepeatedInputs(self.eq, .{ "in0", "in1" }, uses);
+        for (self.eq[0..eq_end]) |gate| {
             try bump(uses, gate.in0);
             try bump(uses, gate.in1);
         }
-        for (self.triple_xor) |gate| {
+        const xor_end = try countRepeatedInputs(self.triple_xor, .{ "input_a", "input_b", "input_c" }, uses);
+        for (self.triple_xor[0..xor_end]) |gate| {
             try bump(uses, gate.input_a);
             try bump(uses, gate.input_b);
             try bump(uses, gate.input_c);
         }
-        for (self.m31_to_u32) |gate| try bump(uses, gate.input);
-        for (self.blake_g_gate) |gate| {
-            inline for (.{ "input_a", "input_b", "input_c", "input_d", "input_f0", "input_f1" }) |field|
+        const m31_end = try countRepeatedInputs(self.m31_to_u32, .{"input"}, uses);
+        for (self.m31_to_u32[0..m31_end]) |gate| try bump(uses, gate.input);
+        const blake_inputs = .{ "input_a", "input_b", "input_c", "input_d", "input_f0", "input_f1" };
+        const blake_end = try countRepeatedInputs(self.blake_g_gate, blake_inputs, uses);
+        for (self.blake_g_gate[0..blake_end]) |gate| {
+            inline for (blake_inputs) |field|
                 try bump(uses, @field(gate, field));
         }
         for (self.permutation_inputs) |variable| try bump(uses, variable);
@@ -369,9 +401,26 @@ pub const PreprocessedCircuit = struct {
     pub const ArithmeticBlock = struct {
         columns: [QM31_OPS_COLUMN_IDS.len][]const M31,
         first_permutation_row: usize,
+
+        fn rowCount(self: ArithmeticBlock) usize {
+            return self.columns[0].len;
+        }
+        fn writeColumns(self: ArithmeticBlock, _: CircuitView, destination: [QM31_OPS_COLUMN_IDS.len][]M31, _: []const u32) Error!usize {
+            for (destination, self.columns) |dst, src| {
+                if (dst.len != src.len) return error.VariableOutOfRange;
+                @memcpy(dst, src);
+            }
+            return self.first_permutation_row;
+        }
     };
 
     pub fn fromCircuitWithArithmetic(allocator: std.mem.Allocator, circuit: CircuitView, mixed: ?ArithmeticBlock) (Error || std.mem.Allocator.Error)!PreprocessedCircuit {
+        return fromCircuitWithArithmeticWriter(allocator, circuit, mixed);
+    }
+
+    /// Lower replacement arithmetic directly into the owned commitment columns.
+    /// A writer borrows the same validated read counts used by the other gates.
+    pub fn fromCircuitWithArithmeticWriter(allocator: std.mem.Allocator, circuit: CircuitView, mixed: anytype) !PreprocessedCircuit {
         if (circuit.output.len == 0) return error.MissingOutputGate;
         try circuit.validate();
         const multiplicities = try circuit.computeUses(allocator);
@@ -403,15 +452,11 @@ pub const PreprocessedCircuit = struct {
         {
             const binary_rows = circuit.add.len + circuit.sub.len + circuit.mul.len + circuit.pointwise_mul.len;
             if (mixed) |replacement| {
-                const n = replacement.columns[0].len;
-                if (replacement.first_permutation_row > n or n - replacement.first_permutation_row != circuit.permutationRows())
-                    return error.VariableOutOfRange;
+                const n = replacement.rowCount();
                 const cols = try builder.block(&QM31_OPS_COLUMN_IDS, n);
-                for (cols, replacement.columns) |col, source| {
-                    if (source.len != n) return error.VariableOutOfRange;
-                    @memcpy(col, source);
-                }
-                first_permutation_row = replacement.first_permutation_row;
+                first_permutation_row = try replacement.writeColumns(circuit, cols, multiplicities);
+                if (first_permutation_row > n or n - first_permutation_row != circuit.permutationRows())
+                    return error.VariableOutOfRange;
             } else {
                 const cols = try builder.block(&QM31_OPS_COLUMN_IDS, binary_rows + circuit.permutationRows());
                 var row: usize = 0;

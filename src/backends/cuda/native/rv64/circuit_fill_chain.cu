@@ -1,8 +1,8 @@
 // M6 hint-tape: dependency-chain runs of the original circuit assignment DAG.
 //
 // One CTA executes an UNBOUNDED sequence of consecutive dependency levels of
-// width <= kChainMaxWidth (strided over kChainThreads threads), with one
-// __syncthreads per level, reading the absolute level ends from a device array
+// width <= kChainMaxWidth (strided over kChainThreads threads), with warp or
+// CTA fences according to width, reading the absolute level ends from a device array
 // staged through shared memory. Task records (immutable, generation-only
 // descriptors of the authenticated topology) are prefetched one level ahead so
 // the record load leaves the per-level dependency latency. Wider levels keep
@@ -85,7 +85,7 @@ __device__ __forceinline__ bool eval(const StwoCircuitAssignmentJob& j, const St
 // Byte-for-byte the evaluation of circuit_assignment.cu `at`.
 __device__ void at(const StwoCircuitAssignmentJob& j, const StwoCircuitAssignmentTask& t) {
     if (t.kind > 15 || t.out >= j.value_count) { fail(j.status); return; }
-    unsigned arity = t.kind == 15 ? 0 : t.kind <= 3 ? 2 : t.kind == 4 ? 3 : t.kind == 6 ? 6 : t.kind == 9 ? 2 : 1;
+    const unsigned arity = arity_of(t.kind);
     if (t.kind == 7) {
         const uint32_t base = t.args[0], count = t.args[1];
         if (uint64_t(base) + uint64_t(count) * 2 > j.index_count) { fail(j.status); return; }
@@ -111,33 +111,8 @@ __device__ void at(const StwoCircuitAssignmentJob& j, const StwoCircuitAssignmen
         if (t.args[i] >= j.value_count) { fail(j.status); return; }
         x[i] = load(j.values, t.args[i]);
     }
-    q::QM31 v{};
-    switch (t.kind) {
-        case 0: v = q::add(x[0], x[1]); break;
-        case 1: v = q::sub(x[0], x[1]); break;
-        case 2: v = q::mul(x[0], x[1]); break;
-        case 3: v = {{q::mul(x[0].a.a, x[1].a.a), q::mul(x[0].a.b, x[1].a.b)}, {q::mul(x[0].b.a, x[1].b.a), q::mul(x[0].b.b, x[1].b.b)}}; break;
-        case 4: v = packed(word(x[0]) ^ word(x[1]) ^ word(x[2])); break;
-        case 5: v = packed(x[0].a.a); break;
-        case 6: {
-            if (uint64_t(t.out) + 4 > j.value_count) { fail(j.status); return; }
-            uint32_t a = word(x[0]), b = word(x[1]), c = word(x[2]), d = word(x[3]);
-            a = a + b + word(x[4]); d = ror(d ^ a, 16); c += d; b = ror(b ^ c, 12);
-            a = a + b + word(x[5]); d = ror(d ^ a, 8); c += d; b = ror(b ^ c, 7);
-            store(j.values, t.out, packed(a)); store(j.values, t.out + 1, packed(b));
-            store(j.values, t.out + 2, packed(c)); store(j.values, t.out + 3, packed(d));
-            return;
-        }
-        case 8: if (zero(x[0])) { fail(j.status); return; } v = q::inverse(x[0]); break;
-        case 9: if (zero(x[1])) { fail(j.status); return; } v = q::mul(x[0], q::inverse(x[1])); break;
-        case 10: { const auto a = x[0]; v = {{a.a.a ? q::inverse(a.a.a) : 0, a.a.b ? q::inverse(a.a.b) : 0}, {a.b.a ? q::inverse(a.b.a) : 0, a.b.b ? q::inverse(a.b.b) : 0}}; break; }
-        case 11: { const auto a = x[0]; v = {{a.a.a & 1, a.a.b & 1}, {a.b.a & 1, a.b.b & 1}}; break; }
-        case 12: case 13: { if (t.args[1] > 3) { fail(j.status); return; } const auto octet = (word(x[0]) >> (t.args[1] * 8)) & 255u; v = {{t.kind == 12 ? octet : 255u - octet, 0}, {0, 0}}; break; }
-        case 14: v = {{zero(x[0]) ? 0u : 1u, 0}, {0, 0}}; break;
-        case 15: v = q::zero(); break;
-        default: fail(j.status); return;
-    }
-    store(j.values, t.out, v);
+    uint4 result;
+    eval(j, t, x, result);
 }
 // Out-of-line `at` for chain_flow's per-level paths: one body of the task
 // arithmetic there instead of three inlined copies (chain_run keeps its own
@@ -156,64 +131,80 @@ __device__ __forceinline__ StwoCircuitAssignmentTask fetch(const StwoCircuitAssi
 // seeds, constants) leaves the dependency chain.
 __device__ __forceinline__ void prefetch_inputs(const StwoCircuitAssignmentJob& j, const StwoCircuitAssignmentTask& t) {
     if (t.kind > 15 || t.kind == 7 || t.kind == 15) return;
-    const unsigned arity = t.kind <= 3 ? 2 : t.kind == 4 ? 3 : t.kind == 6 ? 6 : t.kind == 9 ? 2 : 1;
+    const unsigned arity = arity_of(t.kind);
 #pragma unroll
     for (unsigned i = 0; i < 6; ++i)
         if (i < arity && t.args[i] < j.value_count)
             asm volatile("prefetch.global.L2 [%0];" ::"l"(j.values + uint64_t(t.args[i]) * 4));
 }
 __global__ void __launch_bounds__(kChainThreads) chain_run(StwoCircuitAssignmentJob j, const uint32_t* __restrict__ ends, uint32_t first_level, uint32_t levels) {
-    __shared__ uint32_t s_ends[kEndsChunk];
-    __shared__ uint32_t s_bad;
+    __shared__ uint32_t s_ends[kEndsChunk], s_fences[kEndsChunk / 32];
     const auto* tasks = static_cast<const StwoCircuitAssignmentTask*>(j.records);
     const uint32_t tid = threadIdx.x;
-    if (tid == 0) s_bad = 0;
     uint32_t begin = j.first;
     for (uint32_t chunk = 0; chunk < levels; chunk += kEndsChunk) {
         const uint32_t n = min(kEndsChunk, levels - chunk);
         __syncthreads();  // previous chunk fully consumed
         for (uint32_t i = tid; i < n; i += kChainThreads) s_ends[i] = ends[first_level + chunk + i];
         __syncthreads();
-        // A malformed end is a uniform decision (every thread reads the same
-        // shared flag), so every thread leaves together; the status word
-        // records the refusal.
-        if (tid == 0) {
-            uint32_t b = begin;
-            for (uint32_t i = 0; i < n; ++i) {
-                const uint32_t e = s_ends[i];
-                if (e < b || e - b > kChainMaxWidth || e > j.record_count) { s_bad = 1; break; }
-                b = e;
+        // Validate all adjacent ends before any lane runs or reads ahead.
+        bool invalid = false;
+        for (uint32_t i = tid; (i & ~31u) < n; i += kChainThreads) {
+            bool fence = false;
+            if (i < n) {
+                const uint32_t first = i == 0 ? begin : s_ends[i - 1];
+                const uint32_t end = s_ends[i];
+                invalid |= end < first || end - first > kChainMaxWidth || end > j.record_count;
+                fence = i + 1 == n || end - first > 32 || s_ends[i + 1] - end > 32;
             }
-            if (s_bad) fail(j.status);
+            const uint32_t votes = __ballot_sync(0xffffffffu, fence);
+            if ((tid & 31u) == 0) s_fences[i / 32] = votes;
         }
-        __syncthreads();
-        if (s_bad) return;
-        // Record pipeline: records of levels l+1 and l+2 are in registers and
-        // the record of l+3 is requested during level l; the value inputs of
-        // level l+2 (record already arrived) are prefetched into L2 two levels
-        // before they are read. Nothing issued here waits on a load.
+        if (__syncthreads_or(invalid)) {
+            if (tid == 0) fail(j.status);
+            return;
+        }
+        // Warp zero visits every level. Other warps visit only the same CTA
+        // fences in the same order. A bitmap word skips up to 32 consecutive
+        // narrow levels without advancing any of their record pipelines.
+        uint32_t cursor = 0, pending = 0;
+        const auto take_level = [&]() -> uint32_t {
+            if (tid < 32) return cursor++;
+            while (!pending && cursor < n) {
+                pending = s_fences[cursor / 32];
+                cursor += 32;
+            }
+            if (!pending) return n;
+            const uint32_t level = cursor - 32 + __ffs(pending) - 1;
+            pending &= pending - 1;
+            return level;
+        };
         const auto record = [&](uint32_t level) -> StwoCircuitAssignmentTask {
             const StwoCircuitAssignmentTask none{15u, 0u, {0, 0, 0, 0, 0, 0}};
             if (level >= n) return none;
             const uint32_t first = level == 0 ? begin : s_ends[level - 1];
-            return first + tid < s_ends[level] ? fetch(tasks, first + tid) : none;
+            return tid < s_ends[level] - first ? fetch(tasks, first + tid) : none;
         };
-        StwoCircuitAssignmentTask current = record(0), next1 = record(1), next2 = record(2);
+        uint32_t l = take_level(), l1 = take_level(), l2 = take_level();
+        StwoCircuitAssignmentTask current = record(l), next1 = record(l1), next2 = record(l2);
         prefetch_inputs(j, next1);
-        for (uint32_t l = 0; l < n; ++l) {
-            const uint32_t end = s_ends[l];
-            const StwoCircuitAssignmentTask next3 = record(l + 3);
+        while (l < n) {
+            const uint32_t first = l == 0 ? begin : s_ends[l - 1], width = s_ends[l] - first;
+            const uint32_t l3 = take_level();
+            const StwoCircuitAssignmentTask next3 = record(l3);
             prefetch_inputs(j, next2);
-            if (begin + tid < end) at(j, current);
-            for (uint32_t i = begin + tid + kChainThreads; i < end; i += kChainThreads) at(j, fetch(tasks, i));
-            // Global writes of this level are visible to the whole CTA after
-            // the barrier, before any later dependency level reads them.
-            __syncthreads();
+            if (tid < width) at(j, current);
+            for (uint32_t i = tid + kChainThreads; i < width; i += kChainThreads) at(j, fetch(tasks, first + i));
+            if ((s_fences[l / 32] >> (l & 31u)) & 1u) __syncthreads();
+            else __syncwarp();
             current = next1;
             next1 = next2;
             next2 = next3;
-            begin = end;
+            l = l1;
+            l1 = l2;
+            l2 = l3;
         }
+        begin = s_ends[n - 1];
     }
     if (tid == 0 && begin != j.first + j.count) fail(j.status);
 }

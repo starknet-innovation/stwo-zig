@@ -209,6 +209,55 @@ def includes(src: Path) -> list[str]:
     return [f"-I{d}" for d in dirs]
 
 
+def write_secp_generator(work: Path) -> None:
+    """Build the fixed comb for low*G + high*(2^130 G), indexed by two five-bit digits."""
+    prime = (1 << 256) - (1 << 32) - 977
+    generator = (0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798,
+                 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8)
+
+    def add(left, right):
+        if left is None:
+            return right
+        if right is None:
+            return left
+        x, y = left
+        u, v = right
+        if x == u:
+            if (y + v) % prime == 0:
+                return None
+            slope = 3 * x * x * pow(2 * y, -1, prime)
+        else:
+            slope = (v - y) * pow(u - x, -1, prime)
+        rx = (slope * slope - x - u) % prime
+        return rx, (slope * (x - rx) - y) % prime
+
+    def multiples(base):
+        points = [None]
+        for _ in range(31):
+            points.append(add(points[-1], base))
+        return points
+
+    high = generator
+    for _ in range(130):
+        high = add(high, high)
+    upper = multiples(high)
+    rows = ["constexpr Affine kFixed[1024] = {"]
+    for lo in multiples(generator):
+        for hi in upper:
+            point = add(lo, hi)
+            # Index zero is skipped by the consumer. All other entries are affine.
+            assert (point is None) == (lo is None and hi is None)
+            coords = []
+            for value in point or (0, 0):
+                words = (f"0x{(value >> shift) & 0xffffffffffffffff:016x}ULL" for shift in range(0, 256, 64))
+                coords.append("{{" + ",".join(words) + "}}")
+            rows.append("    {" + ", ".join(coords) + "},")
+    content = "\n".join([*rows, "};", ""])
+    header = work / "secp_generator.inc"
+    if not header.is_file() or header.read_text() != content:
+        header.write_text(content)
+
+
 def needs_rebuild(obj: Path, dep: Path, stamp: Path, flags_hash: str) -> bool:
     if not obj.exists() or not dep.exists() or not stamp.exists() or stamp.read_text() != flags_hash:
         return True
@@ -251,7 +300,7 @@ def run_tests(src: Path, out: Path, work: Path, a) -> None:
     # Twice: the RV64IM field/scalar products, then the admitted v3 path (fe_mul/sc_mul on the
     # arith256_mod service, emulated on the host by an independent intx reduction).
     for tag, svc in (("", []), ("-v3arith", ["-DADMITTED_V3", "-DADMITTED_ARITH"])):
-        units = [(glue / "secp256k1_stwo.cpp", ["-DSTWO_SECP_NO_EVMONE_API", *svc]), (glue / "host_services.cpp", []),
+        units = [(glue / "secp256k1_stwo.cpp", ["-DSTWO_SECP_NO_EVMONE_API", f"-I{work}", *svc]), (glue / "host_services.cpp", []),
                  (glue / "keccak_stwo.cpp", []), (src / "evmone" / "lib" / "evmone_precompiles" / "secp256k1.cpp", []),
                  (HERE / "tests" / "secp_differential.cpp", [])]
         objs = []
@@ -280,14 +329,16 @@ def run_tests(src: Path, out: Path, work: Path, a) -> None:
     objs.append(o)
     run(["zig", "c++", a.opt, *objs, "-o", tdir / "curves_test"])
     run([tdir / "curves_test"])
-    tobjs = []
-    for f in (glue / "witness_trie.cpp", glue / "keccak_stwo.cpp", glue / "host_services.cpp",
-              HERE / "tests" / "trie_differential.cpp"):
-        o = tdir / ("trie-" + f.name + ".o")
-        run(["zig", "c++", *flags, "-c", f, "-o", o])
-        tobjs.append(o)
-    run(["zig", "c++", a.opt, *tobjs, "-o", tdir / "trie_differential"])
-    run([tdir / "trie_differential", "600"])
+    for suffix, service_flags in (("", []), ("-v3", ["-DADMITTED_V3", "-DADMITTED_MEM", "-DADMITTED_KECCAK"])):
+        tobjs = []
+        for f in (glue / "witness_trie.cpp", glue / "keccak_stwo.cpp", glue / "host_services.cpp",
+                  HERE / "tests" / "trie_differential.cpp"):
+            o = tdir / ("trie-" + f.name + suffix + ".o")
+            run(["zig", "c++", *flags, *service_flags, "-c", f, "-o", o])
+            tobjs.append(o)
+        exe = tdir / ("trie_differential" + suffix)
+        run(["zig", "c++", a.opt, *tobjs, "-o", exe])
+        run([exe, "600"])
     # Fused copy + Keccak-256 of contract codes (build_zeg0) vs ethash_keccak256.
     kobjs = []
     for f in (glue / "keccak_stwo.cpp", glue / "host_services.cpp", HERE / "tests" / "keccak_copy_test.cpp"):
@@ -387,6 +438,8 @@ def main(argv=None):
     if not (a.no_stage and (work / "src").exists()):
         staged = stage(cache, work)
     src = work / "src"
+    if a.secp == "stwo" or a.tests:
+        write_secp_generator(work)
 
     v3_groups = a.v3_set.split(",")
     for svc in v3_groups:
@@ -405,6 +458,8 @@ def main(argv=None):
     variant += isa_suffix
     mcpu = "-mcpu=generic_rv64+m" + ISA_FEATURES[a.isa]
     guest_target = [mcpu if f.startswith("-mcpu=") else f for f in GUEST_TARGET]
+    # Recover RV64 direct calls at link time and inline across guest translation units.
+    guest_optimization = ["-flto=thin", "-mrelax"] if a.profile == "v3" and a.isa == "im" and not a.host else []
     defines = list(DEFINES)
     if "zbb" in a.isa and not a.host:
         # ziskethone's default for Zbb targets (zeg/bswap.hpp): plain __builtin_bswap64 -> rev8.
@@ -440,7 +495,7 @@ def main(argv=None):
         cxx = [a.opt, "-g", *COMMON_CXX, *defines, *includes(src)]
         cc = [a.opt, "-g", *defines]
     else:
-        cxx = [*guest_target, a.opt, *COMMON_CXX, *GUEST_EXTRA, *defines, *includes(src)]
+        cxx = [*guest_target, *guest_optimization, a.opt, *COMMON_CXX, *GUEST_EXTRA, *defines, *includes(src)]
         cc = [*guest_target, *defines]
     jobs = []
     objdir = work / f"obj-{variant}"
@@ -450,9 +505,11 @@ def main(argv=None):
             flags += ["-ffunction-sections", "-fdata-sections"]
             if not a.host:
                 # No RISC-V assembly in blst: portable C with 32-bit limbs.
-                flags += ["-D__BLST_NO_ASM__", a.opt, *GUEST_EXTRA]
+                flags += ["-D__BLST_NO_ASM__", a.opt, *guest_optimization, *GUEST_EXTRA]
             else:
                 flags += [a.opt]
+        if f.name == "secp256k1_stwo.cpp":
+            flags.append(f"-I{work}")
         if f.name == "runtime.cpp":
             flags += ["-fno-builtin"]
         if f.name in ("hash.cpp", "memory_resource.cpp"):
@@ -473,7 +530,7 @@ def main(argv=None):
         tag = a.profile if a.profile == "admitted" or (a.profile == "candidate" and a.candidate_set == "mem,sha,arith") else \
             v3_tag if a.profile == "v3" else "candidate-" + a.candidate_set.replace(",", "-")
         exe = out / f"client-evmone-{tag}{isa_suffix}{'-eest' if a.eest else ''}.elf"
-        run(["zig", "c++", "-target", "riscv64-freestanding-none", mcpu, "-nostdlib",
+        run(["zig", "c++", "-target", "riscv64-freestanding-none", mcpu, *guest_optimization, "-nostdlib",
              "-static", "-T", LINKER_SCRIPT, "-Wl,--gc-sections", "-Wl,-z,stack-size=0", *objs, "-o", exe])
     audit = None
     if a.isa_audit and not a.host:
@@ -494,6 +551,7 @@ def main(argv=None):
         "sha256": digest,
         "zig_version": zig_version,
         "optimization": a.opt,
+        "guest_link_optimization": guest_optimization,
         "secp": a.secp,
         "isa": a.isa,
         "isa_audit": audit,

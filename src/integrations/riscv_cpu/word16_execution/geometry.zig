@@ -93,12 +93,29 @@ pub const Geometry = struct {
     pub fn terminalLog(self: Geometry) u32 {
         return self.terminal_log orelse self.boundary_log;
     }
+    pub const Projection = enum {
+        classic,
+        gkr_main,
+
+        pub fn validate(self: Projection, geometry: Geometry) !void {
+            return geometry.validateLayout(self == .gkr_main);
+        }
+    };
     pub fn validate(self: Geometry) !void {
+        return self.validateLayout(false);
+    }
+    /// Compact MAIN uses the same 37 columns at both clock widths. Its
+    /// high-gap ledger can use scaled U16 in a GKR projection. Classic INTER
+    /// still requires the byte-pair layout for compact decoding.
+    pub fn validateMainProjection(self: Geometry) !void {
+        return self.validateLayout(true);
+    }
+    fn validateLayout(self: Geometry, main_only: bool) !void {
         if (self.omit_empty_division and self.division_log != 5) return error.InvalidOmittedDivisionGeometry;
         // The pair encoding is defined only on top of the fused tail.
         if (self.cpu_u8_pairs and !self.cpu_fused_tail) return error.InvalidCpuPairGeometry;
         // Compact decode is defined only on top of the byte-pair encoding.
-        if (self.cpu_compact_decode and !self.cpu_u8_pairs) return error.InvalidCpuCompactGeometry;
+        if (self.cpu_compact_decode and !self.cpu_u8_pairs and !(main_only and self.wideClock())) return error.InvalidCpuCompactGeometry;
         // CPU log 23 is admitted only with the wide-clock encoding, which is
         // defined on the fused tail without byte pairs (layout.wideClock).
         if (self.cpu_log > 22 and (self.cpu_log > front.rv64_air.word16_execution.layout.MAX_LOG or !self.cpu_fused_tail or self.cpu_u8_pairs)) return error.InvalidExecutionGeometry;

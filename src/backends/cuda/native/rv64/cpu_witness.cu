@@ -31,6 +31,8 @@ __global__ void cpu_unpack(StwoRv64CpuUnpack j) {
     uint32_t *m = j.metadata + uint64_t(row) * 14;
     const uint32_t rr = r[2];
     if (rr >= rom_n) {
+      // Scratch holds prior contents. Define the rejected row for the witness.
+      if (reg < 14) m[reg] = 0;
       if (!reg) atomicOr(j.status, 2u);
       continue;
     }
@@ -38,7 +40,8 @@ __global__ void cpu_unpack(StwoRv64CpuUnpack j) {
 #pragma unroll
     for (uint32_t slot = 0; slot < 3; ++slot) {
       const uint32_t id = j.rom[uint64_t(10 + slot) * rom_n + rp];
-      if (id == reg) {
+      // Lane zero supplies the missing register slot on rejected ROM data.
+      if (id == reg || (id >= 32 && !reg)) {
         const uint32_t dest = slot == 2 ? 6 : 2 * slot;
         m[dest] = reg ? uint32_t(value) : 0;
         m[dest + 1] = reg ? uint32_t(value >> 32) : 0;
@@ -122,7 +125,7 @@ __global__ void cpu_witness(StwoRv64CpuWitness j) {
   for (uint32_t slot = 0; slot < 3; ++slot) {
     count_bin(j.counts16, row[26 + slot]);
     if (j.log > 22) count_bin(j.counts16, 128 * row[29 + slot]);
-    else count_bin(j.counts8, row[29 + slot]);
+    else if (j.counts8) count_bin(j.counts8, row[29 + slot]);
   }
   if (j.pair_counts) {
     count_bin(j.pair_counts, row[29] * 256 + row[30]);
@@ -152,6 +155,7 @@ extern "C" int stwo_rv64_cpu_witness_on(void *ctx, uint32_t lane,
   using namespace stwo::cuda::rv64;
   if (!job || job->log < 5 || job->log > 23 || job->rom_log < 5 || job->rom_log > 22 ||
       job->count >= (1u << job->log) || (job->pair_counts && job->log > 22) ||
+      (!job->counts8 && job->log <= 22 && !job->pair_counts) ||
       !job->final_pc || job->final_pc >= (1u << 31) || (job->final_pc & 3))
     return int(cudaErrorInvalidValue);
   const auto j = *job;
@@ -159,7 +163,7 @@ extern "C" int stwo_rv64_cpu_witness_on(void *ctx, uint32_t lane,
   if ((j.count && !c.range(j.metadata, uint64_t(j.count) * 14, false)) ||
       !c.range(j.rom, uint64_t(32) << j.rom_log, false) ||
       !c.range(j.main, uint64_t(37) << j.log, true) ||
-      !c.range(j.counts16, 65536, true) || !c.range(j.counts8, 256, true) ||
+      !c.range(j.counts16, 65536, true) || (j.counts8 && !c.range(j.counts8, 256, true)) ||
       !c.range(j.rom_counts, uint64_t(1) << j.rom_log, true) || !c.range(j.status, 1, true) ||
       (j.pair_counts && !c.range(j.pair_counts, 65536, true)))
     return c.status;

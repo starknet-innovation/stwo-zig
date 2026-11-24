@@ -33,7 +33,7 @@ const Commands = struct {
     poisoned: bool = false,
     batched_trees: bool = false,
     tree_waves: usize = 0,
-    tree_edges: [2048][5]usize = undefined,
+    tree_edges: [2048][6]usize = undefined,
     calls: usize = 0,
     layers: u32 = 0,
     batches: u32 = 0,
@@ -60,7 +60,7 @@ const Commands = struct {
         s.recordEdge(input, output);
     }
     fn recordEdge(s: *@This(), input: R.Fraction, output: R.Fraction) void {
-        s.tree_edges[s.layers] = .{ input.n.data.address, input.d.data.address, output.n.data.address, output.d.data.address, input.count };
+        s.tree_edges[s.layers] = .{ input.n.data.address, input.d.data.address, output.n.data.address, output.d.data.address, input.count, output.count };
         s.layers += 1;
     }
     pub fn layerBatch(s: *@This(), jobs: []const R.BatchFold) !void {
@@ -182,11 +182,12 @@ test "batched product trees retain every exact serial intermediate with one wave
     const seed = f.slice(9);
     const plan = try G.Plan.init(&heights, std.math.maxInt(usize));
     const arena = f.slice(plan.total_words);
+    const verdict = f.slice(1);
     var context = Context{};
     var serial = Commands{ .context = &context };
     var batched = Commands{ .context = &context, .batched_trees = true };
-    _ = try G.enqueue(&serial, &inputs, seed, arena, plan.total_words * 4, 1);
-    _ = try G.enqueue(&batched, &inputs, seed, arena, plan.total_words * 4, 1);
+    _ = try G.enqueueWithClosure(&serial, &inputs, seed, arena, plan.total_words * 4, 1, verdict);
+    _ = try G.enqueueWithClosure(&batched, &inputs, seed, arena, plan.total_words * 4, 1, verdict);
     try std.testing.expectEqual(serial.layers, batched.layers);
     try std.testing.expectEqual(@as(usize, 8), batched.tree_waves);
     try std.testing.expectEqual(serial.calls - serial.layers + batched.tree_waves, batched.calls);
@@ -200,6 +201,7 @@ test "batched product trees retain every exact serial intermediate with one wave
     try std.testing.expectEqual(serial.batches, batched.batches);
     try std.testing.expectEqual(serial.parents, batched.parents);
     try std.testing.expectEqual(serial.masks, batched.masks);
+    try std.testing.expectEqual(@as(u32, 1), batched.closures);
 }
 test "complete GKR rejects late invalid input alias generation and cap before any launch" {
     var f = Factory{};
@@ -422,7 +424,7 @@ test "GKR recomputed frontier bounds every source fold bank Eq and rebuild phase
     try std.testing.expectError(error.GkrWorkspaceBudgetExceeded, G.Plan.initMode(&real_heights, frontier.total_words * 4 - 1, .recomputed_frontier));
 }
 
-test "GKR recomputed frontier traverses all mixed heights and rejects alias before mutation" {
+test "GKR recomputed frontier traverses all mixed heights with closure and rejects alias before mutation" {
     const heights = [_]u32{ 1, 2, 3, 4, 7 };
     var f = Factory{};
     var inputs: [heights.len]R.Fraction = undefined;
@@ -430,12 +432,29 @@ test "GKR recomputed frontier traverses all mixed heights and rejects alias befo
     const seed = f.slice(9);
     const plan = try G.Plan.initMode(&heights, std.math.maxInt(usize), .recomputed_frontier);
     const arena = f.slice(plan.total_words);
+    const verdict = f.slice(1);
     var context = Context{};
     var commands = Commands{ .context = &context };
-    _ = try G.enqueueMode(&commands, &inputs, seed, arena, plan.total_words * 4, 1, .recomputed_frontier);
+    var batched = Commands{ .context = &context, .batched_trees = true };
+    const complete = try G.enqueueWithClosureMode(&commands, &inputs, seed, arena, plan.total_words * 4, 1, verdict, .recomputed_frontier);
+    _ = try G.enqueueWithClosureMode(&batched, &inputs, seed, arena, plan.total_words * 4, 1, verdict, .recomputed_frontier);
+    try std.testing.expectEqual(plan.total_words * 4, complete.traversal.requested_workspace_bytes);
+    try std.testing.expectEqual(verdict.address, complete.verdict.address);
+    try std.testing.expectEqual(@as(u32, 1), commands.closures);
     try std.testing.expectEqual(plan.layers, commands.parents);
     try std.testing.expectEqual(plan.layers, commands.batches);
+    try std.testing.expectEqual(commands.closures, batched.closures);
+    try std.testing.expectEqual(commands.layers, batched.layers);
+    try std.testing.expectEqual(@as(usize, 5), batched.tree_waves);
+    try std.testing.expect(batched.calls < commands.calls);
+    for (commands.tree_edges[0..commands.layers]) |edge| {
+        var matches: usize = 0;
+        for (batched.tree_edges[0..batched.layers]) |other| if (std.mem.eql(usize, &edge, &other)) {
+            matches += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), matches);
+    }
     commands = .{ .context = &context };
-    try std.testing.expectError(error.OverlappingWorkspace, G.enqueueMode(&commands, &inputs, try arena.sub(0, 9), arena, plan.total_words * 4, 1, .recomputed_frontier));
+    try std.testing.expectError(error.OverlappingWorkspace, G.enqueueWithClosureMode(&commands, &inputs, seed, arena, plan.total_words * 4, 1, try arena.sub(0, 1), .recomputed_frontier));
     try std.testing.expectEqual(@as(usize, 0), commands.calls);
 }

@@ -644,10 +644,14 @@ test "D1: one-device MAIN reservation sums admitted native classes with checked 
     var roster: [7]I.SlabClass = undefined;
     for (&roster, 0..) |*r, i| r.* = .{ .id = .{ .kind = .native_segment, .ordinal = @intCast(i) }, .key = if (i == 0) T.k_native else small_key };
     const expected: u64 = (1 << 29) + 6 * (16 << 20) + 7 * g;
-    try testing.expectEqual(expected, try I.nativeMainWords(cache, &.{&roster}));
+    huge.main_node_words = 2 * g - 8;
+    small.main_node_words = g + 1;
+    const fits = try I.nativeMainWords(cache, &.{&roster});
+    try testing.expectEqual(expected, fits.required);
+    try testing.expectEqual(expected + 14 * g, fits.preferred);
     try testing.expect(expected < 7 * ((1 << 29) + g));
     const larger = [_]I.SlabClass{ roster[0], .{ .id = .{ .kind = .native_segment, .ordinal = 1 }, .key = T.k_native } };
-    try testing.expectEqual(@as(u64, 2 * ((1 << 29) + g)), try I.nativeMainWords(cache, &.{ &roster, &larger }));
+    try testing.expectEqual(@as(u64, 2 * ((1 << 29) + g)), (try I.nativeMainWords(cache, &.{ &roster, &larger })).required);
     roster[0].key = @splat(255);
     try testing.expectError(error.GpuNativeClassNotWarmed, I.nativeMainWords(cache, &.{&roster}));
     roster[0].key = T.k_native;

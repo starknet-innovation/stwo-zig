@@ -121,7 +121,8 @@ pub fn build(b: *std.Build) void {
     var d2_circuit_imports = native_gkr_root.import_table.iterator();
     while (d2_circuit_imports.next()) |entry| d2_circuit_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     d2_circuit_root.addImport("stwo_circuit_frontend", circuit_frontend);
-    const d2_circuit_tests = b.addTest(.{ .root_module = d2_circuit_root, .filters = &.{"D2 actual native CPU recursive"} });
+    d2_circuit_root.addImport("stwo_circuit_cpu_integration", circuit_cpu);
+    const d2_circuit_tests = b.addTest(.{ .root_module = d2_circuit_root, .filters = if (d2_filter) |filter| &.{filter} else &.{"D2 actual native CPU recursive"} });
     b.step("test-d2-circuit-census", "Construct and census actual native default/D2 CPU recursive verifier graphs").dependOn(testDependency(b, d2_circuit_tests, check_only, 0));
     const census_root = b.createModule(.{ .root_source_file = b.path("rv64_native_gkr_census_main.zig"), .target = target, .optimize = optimize });
     var census_imports = native_gkr_root.import_table.iterator();

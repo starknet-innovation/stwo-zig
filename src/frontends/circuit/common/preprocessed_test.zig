@@ -339,3 +339,24 @@ test "preprocessed parallel fill: allocation failure after joined table fills is
     defer binding.deinit();
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailureCase, .{});
 }
+
+test "preprocessed: repeated padding inputs count every port and validate the boundary" {
+    const a = std.testing.allocator;
+    var gates = [_]BinaryGate{.{ .in0 = 1, .in1 = 1, .out = 3 }} ** 96;
+    gates[17].in1 = 2;
+    var view = SampleCircuit.init();
+    var graph = view.view();
+    graph.add = &gates;
+    const counts = try graph.computeUses(a);
+    defer a.free(counts);
+    graph.add = &.{};
+    const other = try graph.computeUses(a);
+    defer a.free(other);
+    try std.testing.expectEqual(other[1] + 191, counts[1]);
+    try std.testing.expectEqual(other[2] + 1, counts[2]);
+    graph.add = &gates;
+    gates[17].in1 = @intCast(graph.n_vars);
+    try std.testing.expectError(error.VariableOutOfRange, graph.computeUses(a));
+    @memset(&gates, .{ .in0 = 999, .in1 = 999, .out = 3 });
+    try std.testing.expectError(error.VariableOutOfRange, graph.computeUses(a));
+}

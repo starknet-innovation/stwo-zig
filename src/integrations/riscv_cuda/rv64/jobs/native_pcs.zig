@@ -17,6 +17,7 @@ const std = @import("std");
 const core = @import("stwo_core");
 const D = @import("stwo_riscv_cpu_integration").rv64_device_pcs;
 const Export = @import("../pcs_request_export.zig");
+pub const GeometryCache = Export.GeometryCache;
 const Decode = @import("../hybrid_pcs.zig");
 const Native = @import("../pcs_native_abi.zig");
 
@@ -30,7 +31,8 @@ pub const Plan = extern struct {
     steps: u32 = 0,
     samples: u32 = 0,
     rolling: u32 = 0,
-    reserved: [2]u32 = @splat(0),
+    source_node_images: u32 = 0,
+    reserved: u32 = 0,
 };
 pub const Memory = extern struct {
     user: ?*anyopaque,
@@ -50,20 +52,51 @@ pub const Io = extern struct {
     output_words: u64,
 };
 comptime {
-    if (@sizeOf(Plan) != 48 or @sizeOf(Memory) != 40 or @sizeOf(Io) != 40) @compileError("PCS job ABI changed");
+    if (@sizeOf(Plan) != 48 or @sizeOf(Memory) != 40 or @sizeOf(Io) != 40 or @sizeOf(DeviceTables) != 32) @compileError("PCS job ABI changed");
 }
 pub const PlanFn = *const fn (*const Native.Request, *Plan) callconv(.c) c_int;
 pub const EnqueueFn = *const fn (*anyopaque, u32, *const Native.Request, *const Memory, *const Io) callconv(.c) c_int;
 pub const ErrorFn = *const fn () callconv(.c) [*:0]const u8;
 /// NAT/rv64/jobs/oods_points.h
 pub const OodsFn = *const fn (*anyopaque, u32, [*]const u32, u32, u32, [*]u32, [*]u32) callconv(.c) c_int;
+pub const SourceImage = extern struct {
+    words: ?[*]const u32 = null,
+    count: u64 = 0,
+};
+pub const DeviceTables = extern struct {
+    forward: [*]const u32,
+    forward_words: u64,
+    inverse: [*]const u32,
+    inverse_words: u64,
+};
+/// Constructed for one job before enqueue. Keeping modes with their spans
+/// prevents a reused plan from taking its mask from a previous request.
+pub const SourceImages = struct {
+    trees: [4]SourceImage = @splat(.{}),
+    nodes_only: u32 = 0,
+
+    pub fn retain(self: *SourceImages, tree: u2, words: [*]const u32, count: usize, nodes_only: bool) void {
+        std.debug.assert(tree != 0 and self.trees[tree].words == null);
+        self.trees[tree] = .{ .words = words, .count = count };
+        if (nodes_only) self.nodes_only |= @as(u32, 1) << tree;
+    }
+};
+const OpenImages = *const fn (*anyopaque, u32, *const Native.Request, *const Memory, *const Io, *const [4]SourceImage) callconv(.c) c_int;
+const OpenNodeImages = *const fn (*anyopaque, u32, *const Native.Request, *const Memory, *const Io, *const [4]SourceImage, u32) callconv(.c) c_int;
+const OpenDeviceTables = *const fn (*anyopaque, u32, *const Native.Request, *const Memory, *const Io, ?*const [4]SourceImage, u32, *const DeviceTables) callconv(.c) c_int;
 pub const Symbols = struct {
+    open_device_tables: ?OpenDeviceTables = null,
+    open_node_images: ?OpenNodeImages = null,
+    open_images: ?OpenImages = null,
     plan: PlanFn,
     enqueue: EnqueueFn,
     last_error: ErrorFn,
     oods: OodsFn,
     pub fn load(addon: *std.DynLib) !Symbols {
         return .{
+            .open_device_tables = addon.lookup(OpenDeviceTables, "stwo_rv64_pcs_job_open_device_tables_v1"),
+            .open_node_images = addon.lookup(OpenNodeImages, "stwo_rv64_pcs_job_open_node_images"),
+            .open_images = addon.lookup(OpenImages, "stwo_rv64_pcs_job_open_images"),
             .plan = addon.lookup(PlanFn, "stwo_rv64_pcs_job_plan_v1") orelse return error.MissingPcsJobSymbol,
             .enqueue = addon.lookup(EnqueueFn, "stwo_rv64_pcs_job_enqueue_v1") orelse return error.MissingPcsJobSymbol,
             .last_error = addon.lookup(ErrorFn, "stwo_rv64_pcs_job_error_v1") orelse return error.MissingPcsJobSymbol,
@@ -106,6 +139,9 @@ pub fn baseShift(request: D.Request, oods: D.Point) !core.circle.CirclePointM31 
 }
 
 pub const PcsJob = struct {
+    /// Node-local borrow; populated after stage and used on the same stream.
+    source_images: ?SourceImages = null,
+    device_tables: ?DeviceTables = null,
     prepared: Export.Prepared,
     descriptor: Native.Request,
     plan: Plan,
@@ -116,23 +152,48 @@ pub const PcsJob = struct {
     /// Host framing for one proof. `request.points` are mask points at
     /// `oods_placeholder`; `request.trees[].root` may be placeholders.
     pub fn prepare(a: std.mem.Allocator, symbols: Symbols, request: D.Request, oods_placeholder: D.Point, wide_framing: bool) !PcsJob {
-        var prepared = try Export.prepareRequestWithFraming(a, request, D.Channel.init(), null, wide_framing);
+        return prepareWithGeometry(a, symbols, request, oods_placeholder, wide_framing, null);
+    }
+    pub fn prepareWithGeometry(a: std.mem.Allocator, symbols: Symbols, request: D.Request, oods_placeholder: D.Point, wide_framing: bool, cache: ?*GeometryCache) !PcsJob {
+        return fromPrepared(a, symbols, request, oods_placeholder, try Export.prepareRequestWithFraming(a, request, D.Channel.init(), cache, wide_framing));
+    }
+
+    pub fn prepareDevice(a: std.mem.Allocator, symbols: Symbols, request: D.Request, oods_placeholder: D.Point, wide_framing: bool) !PcsJob {
+        if (symbols.open_device_tables == null) return error.MissingPcsJobSymbol;
+        return fromPrepared(a, symbols, request, oods_placeholder, try Export.prepareDeviceJob(a, request, wide_framing));
+    }
+
+    fn fromPrepared(a: std.mem.Allocator, symbols: Symbols, request: D.Request, oods_placeholder: D.Point, value: Export.Prepared) !PcsJob {
+        var prepared = value;
         errdefer prepared.deinit(a);
         if (prepared.section_storage[0].len < 22 or prepared.section_storage[0][21] != 1) return error.PcsJobRequiresImportedPoint;
         var self = PcsJob{ .prepared = prepared, .descriptor = undefined, .plan = .{}, .base_shift = try baseShift(request, oods_placeholder) };
-        self.descriptor = self.prepared.descriptor();
+        self.descriptor = self.prepared.geometryDescriptor();
         if (symbols.plan(&self.descriptor, &self.plan) != 0) {
             std.debug.print("GPU_PCS_JOB_PLAN error={s}\n", .{symbols.last_error()});
             return error.PcsJobPlanFailed;
         }
         // Unsupported geometry retains the caller's historical reservation.
-        self.reserve_words = try reserveForSections(a, self.prepared.section_storage, false);
+        if (self.plan.rolling != 0) self.reserve_words = try reserveForSections(a, self.prepared.section_storage, .{ .device_tables = self.prepared.geometry_only });
         return self;
     }
-    /// Outer-only contract: checked again against REAL bound pointers before
-    /// enqueue; one contiguous kind1 transfer/tree is borrowed by JobOwner.
+    pub fn bindTables(self: *PcsJob, forward: []const u32, inverse: []const u32) !void {
+        if (!self.prepared.geometry_only) return;
+        const eval_log = self.prepared.metadata.eval_log;
+        if (eval_log < 3 or eval_log > 28) return error.InvalidPcsJobTables;
+        const words = @as(usize, 1) << @intCast(eval_log - 1);
+        if (self.prepared.forward_count == 0 or self.prepared.forward_count > words or words > forward.len or words > inverse.len) return error.InvalidPcsJobTables;
+        self.device_tables = .{
+            .forward = forward[forward.len - words ..].ptr,
+            .forward_words = words,
+            .inverse = inverse[inverse.len - words ..].ptr,
+            .inverse_words = words,
+        };
+    }
+    /// Tighten the reservation for complete coefficient trees. Enqueue checks
+    /// the bound device pointers before borrowing one contiguous span per tree.
     pub fn requireBorrowedTrees(self: *PcsJob, a: std.mem.Allocator) !void {
-        self.reserve_words = try reserveForSections(a, self.prepared.section_storage, true);
+        self.reserve_words = if (self.plan.rolling != 0) try reserveForSections(a, self.prepared.section_storage, .{ .borrowed_trees = true, .device_tables = self.prepared.geometry_only }) else null;
         self.require_borrowed_trees = self.reserve_words != null;
     }
     /// Bind tree `tree`, ORIGINAL column `original` to its device coefficient
@@ -152,6 +213,23 @@ pub const PcsJob = struct {
         };
         return error.InvalidPcsColumn;
     }
+    /// Install a complete tree in PCS order from producer offsets indexed by
+    /// original column. Wide mixed-height trees need one permutation pass.
+    pub fn bindTree(self: *PcsJob, tree: usize, buffer: []const u32, offsets: anytype) !void {
+        const trees = self.prepared.metadata.shape.trees;
+        if (tree >= trees.len) return error.InvalidPcsColumn;
+        const order = trees[tree].sorted_to_original;
+        if (order.len != offsets.len) return error.InvalidPcsColumn;
+        var base: usize = 0;
+        for (trees[0..tree]) |t| base += t.sorted_to_original.len;
+        const columns = self.prepared.coefficients[base..][0..order.len];
+        for (columns, order) |*column, original| {
+            const offset = offsets[original];
+            if (offset > buffer.len or column.count > buffer.len - offset) return error.InvalidPcsColumn;
+            column.kind = 1;
+            column.words = buffer.ptr + @as(usize, @intCast(offset));
+        }
+    }
     pub fn deinit(self: *PcsJob, a: std.mem.Allocator) void {
         self.prepared.deinit(a);
         self.* = undefined;
@@ -170,7 +248,18 @@ pub const PcsJob = struct {
         const B = Bridge(@TypeOf(e));
         const memory = Memory{ .user = @ptrCast(e), .alloc = B.alloc, .release = B.release, .pinned = pinned.ptr, .pinned_words = pinned.len };
         // Worker exec contexts have one lane; lane 0 is the job's exec stream.
-        if (symbols.enqueue(e.ctx(), 0, &self.descriptor, &memory, &io) != 0) {
+        const result = if (self.prepared.geometry_only) blk: {
+            const tables = self.device_tables orelse return error.InvalidPcsJobTables;
+            const open = symbols.open_device_tables orelse return error.MissingPcsJobSymbol;
+            const source_trees = if (self.source_images) |*images| &images.trees else null;
+            const mask = if (self.source_images) |images| images.nodes_only else 0;
+            break :blk open(e.ctx(), 0, &self.descriptor, &memory, &io, source_trees, mask, &tables);
+        } else if (self.source_images) |*images| blk: {
+            if (symbols.open_node_images) |open| break :blk open(e.ctx(), 0, &self.descriptor, &memory, &io, &images.trees, images.nodes_only);
+            if (images.nodes_only != 0 or images.trees[3].words != null) return error.MissingPcsJobSymbol;
+            break :blk (symbols.open_images orelse return error.MissingPcsJobSymbol)(e.ctx(), 0, &self.descriptor, &memory, &io, &images.trees);
+        } else symbols.enqueue(e.ctx(), 0, &self.descriptor, &memory, &io);
+        if (result != 0) {
             std.debug.print("GPU_PCS_JOB_ENQUEUE error={s}\n", .{symbols.last_error()});
             return error.PcsJobEnqueueFailed;
         }
@@ -245,11 +334,13 @@ fn checkBorrowedTrees(columns: []const Native.Column, trees: []const u32) !void 
 
 // Upper bound on EVERY JobOwner::plane allocation in jobs/pcs_enqueue.cu.
 // Count retired blocks again: its best-fit cache retains reservations until exit.
-// No reuse credit; coefficient borrowing requires the checked outer contract.
-// Only the fixed imported beta1 outer schedule is admitted here.
-fn reserveForSections(a: std.mem.Allocator, s: [17][]const u32, borrowed_trees: bool) !?u64 {
+// No reuse credit; coefficient borrowing requires the checked tree contract.
+// Only the imported-point rolling schedules are admitted here.
+const ReserveOptions = struct { borrowed_trees: bool = false, device_tables: bool = false };
+
+fn reserveForSections(a: std.mem.Allocator, s: [17][]const u32, options: ReserveOptions) !?u64 {
     const h = s[0];
-    if ((h.len != 24 and h.len != 28) or h[0] != 0x52564d53 or h[21] != 1 or h[5] != 1 or h[4] > 28) return null;
+    if ((h.len != 24 and h.len != 28) or h[0] != 0x52564d53 or h[21] != 1 or h[5] < 1 or h[5] > 2 or h[4] > 28) return null;
     const sc: u64 = h[8];
     const tc: u64 = h[9];
     const gc: u64 = h[10];
@@ -278,7 +369,7 @@ fn reserveForSections(a: std.mem.Allocator, s: [17][]const u32, borrowed_trees: 
             if (log > 28) return null;
             words += @as(u64, 1) << @intCast(log);
         }
-        if (!borrowed_trees) b.add(words);
+        if (!options.borrowed_trees) b.add(words);
         b.add(@as(u64, d[1]) * queries);
         b.add(queries * d[4] * 8);
     }
@@ -293,8 +384,13 @@ fn reserveForSections(a: std.mem.Allocator, s: [17][]const u32, borrowed_trees: 
         max_terms = @max(max_terms, terms);
     }
     const rows = @as(u64, 1) << @intCast(h[4]);
-    // Every standalone upload/plane at lines408,490–512 and544–545.
-    for ([_]u64{ h[19], nt * 8, h[13], @as(u64, h[13]) * 8, sc, 4 * sc, 4 * tc, 8 * gc, 4 * gc, 2 * rows, h[20], 16, 16, (gc + 1) * 16, gc * 224, gc + 1, scratch, scratch, max_terms, tc * 8, 8, tc * 8, gc * 16, 2, rows * 8, 8, queries, 2, 1, 8, 2, 1, 16, layers * 8 }) |n| b.add(n);
+    if (!options.device_tables) {
+        b.add(h[19]);
+        b.add(h[20]);
+        b.add(2 * rows);
+    }
+    // The remaining standalone uploads and temporary planes.
+    for ([_]u64{ nt * 8, h[13], @as(u64, h[13]) * 8, sc, 4 * sc, 4 * tc, 8 * gc, 4 * gc, 16, 16, (gc + 1) * 16, gc * 224, gc + 1, scratch, scratch, max_terms, tc * 8, 8, tc * 8, gc * 16, 2, rows * 8, 8, queries, 2, 1, 8, 2, 1, @as(u64, 8) << @intCast(h[5]), layers * 8 }) |n| b.add(n);
     for (0..layers) |i| {
         const d = s[13][i * 8 ..][0..8];
         if (d[0] == 0 or !std.math.isPowerOfTwo(d[0]) or d[1] > 4 or d[2] > d[1] or d[2] > std.math.log2_int(u32, d[0])) return null;
@@ -317,7 +413,7 @@ fn reserveForSections(a: std.mem.Allocator, s: [17][]const u32, borrowed_trees: 
         for (d[2]..d[2] + d[3]) |g| {
             if (g >= h[11]) return null;
             const v = s[6][g * 8 ..][0..8];
-            if (v[3] > 28 or n + v[5] > column_rows.len) return null;
+            if (v[3] > 28 or @as(u64, v[2]) + h[5] != v[3] or n + v[5] > column_rows.len) return null;
             @memset(column_rows[n..][0..v[5]], @as(u32, 1) << @intCast(v[3]));
             n += v[5];
         }
@@ -373,6 +469,36 @@ test "PCS framing is challenge independent except seed, imported point and roots
     try std.testing.expect(!std.mem.eql(u32, prepared[0].section_storage[2], prepared[1].section_storage[2]));
     try std.testing.expectEqual(@as(u32, 1), prepared[0].section_storage[0][21]);
 }
+test "separate whole-node classes share only PCS numerical domain sections" {
+    const a = std.testing.allocator;
+    var cache = Export.GeometryCache.init(a, 1 << 20);
+    defer cache.deinit();
+    const ffi = struct {
+        fn plan(_: *const Native.Request, _: *Plan) callconv(.c) c_int {
+            return 0;
+        }
+    };
+    var symbols: Symbols = undefined;
+    symbols.plan = ffi.plan;
+    var columns = [_]D.Column{placeholderColumn(4)};
+    var trees = [_]D.Tree{.{ .root = @splat(1), .columns = &columns }};
+    const oods = try placeholderPoint();
+    var points = [_]Point{oods};
+    var row = [_][]Point{&points};
+    var forest = [_][][]Point{&row};
+    const request = testRequest(&trees, &forest, 1);
+    var first = try PcsJob.prepareWithGeometry(a, symbols, request, oods, true, &cache);
+    defer first.deinit(a);
+    trees[0].root = @splat(2);
+    var second = try PcsJob.prepareWithGeometry(a, symbols, request, oods, true, &cache);
+    defer second.deinit(a);
+    var control = try PcsJob.prepare(a, symbols, request, oods, true);
+    defer control.deinit(a);
+    try std.testing.expectEqual(@as(u64, 1), cache.stats().hits);
+    for (first.prepared.section_storage[12..15], second.prepared.section_storage[12..15]) |x, y| try std.testing.expect(x.ptr == y.ptr);
+    try std.testing.expect(!std.mem.eql(u32, first.prepared.section_storage[15], second.prepared.section_storage[15]));
+    for (control.prepared.section_storage, second.prepared.section_storage) |x, y| try std.testing.expectEqualSlices(u32, x, y);
+}
 test "finish root check matches the legacy section-15 comparison" {
     var words = [_]u32{0} ** (31 + 16);
     words[7] = 2;
@@ -408,6 +534,25 @@ test "enqueue bridge maps api.Enqueue alloc/free onto the C memory callbacks" {
     try std.testing.expectEqual(@as(usize, 16), fake.freed);
 }
 
+test "PCS binds the entire lifting-height suffix for DEEP and FRI" {
+    var job: PcsJob = undefined;
+    job.prepared.geometry_only = true;
+    job.prepared.forward_count = 16;
+    job.prepared.metadata.eval_log = 7;
+    job.device_tables = null;
+    var forward: [128]u32 = undefined;
+    var inverse: [64]u32 = undefined;
+    try std.testing.expectError(error.InvalidPcsJobTables, job.bindTables(forward[0..63], &inverse));
+    try std.testing.expectError(error.InvalidPcsJobTables, job.bindTables(&forward, inverse[0..63]));
+    try std.testing.expect(job.device_tables == null);
+    try job.bindTables(&forward, &inverse);
+    const tables = job.device_tables.?;
+    try std.testing.expectEqual(@as(u64, 64), tables.forward_words);
+    try std.testing.expectEqual(@as(u64, 64), tables.inverse_words);
+    try std.testing.expect(tables.forward == forward[64..].ptr);
+    try std.testing.expect(tables.inverse == inverse[0..].ptr);
+}
+
 test "PCS reserve derives rounded allocation upper bound from imported geometry" {
     const a = std.testing.allocator;
     var h = [_]u32{0} ** 24;
@@ -436,30 +581,43 @@ test "PCS reserve derives rounded allocation upper bound from imported geometry"
     sections[6] = &.{ 0, 0, 4, 5, 0, 1, 0, 16 };
     sections[7] = &.{ 0, 1, 0, 1, 5, 0 };
     sections[13] = &.{ 32, 4, 4, 0, 0, 0, 0, 0 };
-    const words = (try reserveForSections(a, sections, false)).?;
+    const words = (try reserveForSections(a, sections, .{})).?;
     // Independent sum of rounded C++ plane calls for this tiny geometry.
     try std.testing.expectEqual(@as(u64, 4352), words);
-    try std.testing.expectEqual(@as(?u64, 4288), try reserveForSections(a, sections, true));
+    try std.testing.expectEqual(@as(?u64, 4288), try reserveForSections(a, sections, .{ .borrowed_trees = true }));
+    try std.testing.expectEqual(@as(?u64, 4096), try reserveForSections(a, sections, .{ .borrowed_trees = true, .device_tables = true }));
     try std.testing.expectEqual(@as(u64, 0), words % 64);
     try std.testing.checkAllAllocationFailures(a, struct {
         fn check(alloc: std.mem.Allocator, descriptors: [17][]const u32) !void {
-            _ = try reserveForSections(alloc, descriptors, false);
+            _ = try reserveForSections(alloc, descriptors, .{});
         }
     }.check, .{sections});
     h[5] = 2;
-    try std.testing.expectEqual(@as(?u64, null), try reserveForSections(a, sections, false));
+    try std.testing.expectEqual(@as(?u64, null), try reserveForSections(a, sections, .{}));
+    var beta2 = h;
+    beta2[4] = 6;
+    beta2[16] *= 2;
+    beta2[18] *= 2;
+    var wider = sections;
+    wider[0] = &beta2;
+    wider[6] = &.{ 0, 0, 4, 6, 0, 1, 0, 16 };
+    wider[7] = &.{ 0, 1, 0, 1, 6, 0 };
+    wider[13] = &.{ 64, 4, 4, 0, 0, 0, 0, 0 };
+    const reserve_beta2 = (try reserveForSections(a, wider, .{})).?;
+    try std.testing.expect(reserve_beta2 > words);
+    try std.testing.expectEqual(@as(u64, 0), reserve_beta2 % 64);
     h[5] = 1;
     h[1] = 3;
     var wide = [_]u32{0} ** 28;
     @memcpy(wide[0..24], &h);
     wide[24] = 1 << 17;
     sections[0] = &wide;
-    try std.testing.expectEqual(@as(?u64, null), try reserveForSections(a, sections, false));
+    try std.testing.expectEqual(@as(?u64, null), try reserveForSections(a, sections, .{}));
 }
 
 test "PCS reserve refuses an absent descriptor" {
     const sections: [17][]const u32 = @splat(&.{});
-    try std.testing.expectEqual(@as(?u64, null), try reserveForSections(std.testing.allocator, sections, false));
+    try std.testing.expectEqual(@as(?u64, null), try reserveForSections(std.testing.allocator, sections, .{}));
 }
 
 test "PCS borrowed tree contract rejects gaps host columns and address overflow" {

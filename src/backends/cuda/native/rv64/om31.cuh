@@ -28,7 +28,7 @@ __host__ __device__ __forceinline__ OM31 sub(OM31 a, OM31 b) {
     return {q::sub(a.c0, b.c0), q::sub(a.c1, b.c1)};
 }
 __host__ __device__ __forceinline__ q::QM31 mul_u(q::QM31 a) {
-    return {q::mul(q::kExtensionR, a.b), a.a};
+    return {q::detail::mul_twist(a.b), a.a};
 }
 __host__ __device__ __forceinline__ OM31 mul(OM31 a, OM31 b) {
     const auto ac = q::mul(a.c0, b.c0), bd = q::mul(a.c1, b.c1);

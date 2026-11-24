@@ -77,6 +77,9 @@ pub const Stage1Job = struct {
             try p.checkMainLogs(c.spec.gkr.logs[c.spec.gkr.fixed_count..]);
             // The plan bound (arena_peak_words via jobWords) must hold the program.
             if (c.spec.compact_words != 0 and p.arenaWords() > c.spec.compact_words) return error.GnPackArenaExceedsPlan;
+            if (c.spec.compact_retained_words) |words| {
+                if (p.retained_words > words) return error.GnPackArenaExceedsPlan;
+            }
         }
         self.main = try C.jobCopy(self.a, &c.main);
         errdefer C.freeJobCopy(self.a, &self.main);
@@ -88,6 +91,7 @@ pub const Stage1Job = struct {
         self.gplan.source.items = self.items;
         self.gkr = try NG.Gkr.init(self.a, &self.gplan, self.sym.gkr orelse return error.NativeStage1SymbolsNotBound);
         errdefer self.gkr.deinit();
+        self.gkr.compact_traversal_words = c.compact_gkr_words;
         self.binding = .{ .plan = &c.bind, .sym = self.sym.binding };
         self.inputs = try self.a.alloc(C.Input, c.main.shapes.len);
         errdefer self.a.free(self.inputs);
@@ -134,7 +138,7 @@ pub const Stage1Job = struct {
         // v2 program bound, checked >= this program's arena at init): only an
         // unplanned program (compact_words 0) adds its arena on top.
         const planned: usize = if (self.witness == .compact and c.spec.compact_words != 0) chunk_words else 0;
-        const staged = up(9) + Schema.granule + c.spec.gkr.stagedWords(true) + up(c.main.stagedWords(0)) + chunk_words;
+        const staged = c.stagedWords() + if (self.witness == .chunks) chunk_words else 0;
         return .{ .device_words = c.jobWords() + chunk_words - planned, .staged_words = staged, .slab_words = 0, .pinned_words = c.requestPinnedWords() };
     }
     pub fn stage(self: *Stage1Job, s: *api.Stager) !void {
@@ -201,6 +205,10 @@ pub const Stage1Job = struct {
         const fixed_region = self.fixed orelse return error.NativeStage1NotStaged;
         const resident = self.ctx.main_resident[self.segment];
         const main_view = try c.resident.mainView(resident);
+        const nodes = if (resident.words - c.resident.words >= c.main.tree_words)
+            try resident.slice(c.resident.words, c.main.tree_words)
+        else
+            null;
         const bind_view = try c.resident.bindingView(resident);
         const section_view = try c.resident.sectionView(resident);
         const authority_view = try c.resident.authorityView(resident);
@@ -222,7 +230,7 @@ pub const Stage1Job = struct {
         e.slab.* = .{ .device = section_view };
         try e.slab.bind(&c.section);
 
-        const pro = try Schema.enqueuePrologue(c, sym, e, seed, fixed_region, self.witness, self.runs, &self.main, self.inputs, main_view, root_out);
+        const pro = try Schema.enqueuePrologue(c, sym, e, seed, fixed_region, self.witness, self.runs, &self.main, self.inputs, main_view, root_out, nodes);
         const fixed_root = pro.fixed_root;
         const class_root = pro.class_root;
         const fixed = pro.fixed;

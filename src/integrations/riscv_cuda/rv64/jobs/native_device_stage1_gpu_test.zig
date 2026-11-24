@@ -95,7 +95,7 @@ const Probe = struct {
             .request => {
                 const main_view = try e.alloc(c.main.coefficient_cells);
                 const root_out = try e.slab.device.slice(8, 8);
-                const pro = try S1.enqueuePrologue(c, self.sym, e, self.seed_buf.?, region, .{ .chunks = self.chunks }, self.runs[0..self.chunks.len], &self.main, self.inputs, main_view, root_out);
+                const pro = try S1.enqueuePrologue(c, self.sym, e, self.seed_buf.?, region, .{ .chunks = self.chunks }, self.runs[0..self.chunks.len], &self.main, self.inputs, main_view, root_out, null);
                 try e.channel.snapshot(e.slab, 16);
                 const cursor = e.channel.step;
                 const chain = e.channel.expectedChain(cursor);

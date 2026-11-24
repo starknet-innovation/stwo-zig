@@ -80,7 +80,7 @@ pub const Statement = struct {
         };
         const fixed_root = if (binding) |b| b.root else setup.key.root;
         if (!std.mem.eql(u8, &fixed_root, &expected.fixed)) return error.WideCpuStatementMismatch;
-        const derived_instances = try @import("../../word16_global_execution/services/gkr_local/roster.zig").fromSetup(a, setup);
+        const derived_instances = try @import("../../word16_global_execution/services/gkr_local/roster.zig").fromSetupFor(expected.envelope, a, setup);
         const admitted_instances = expected.local_instances orelse return error.WideCpuLocalRequired;
         if (derived_instances.len != admitted_instances.len) return error.WideCpuRosterMismatch;
         for (derived_instances, admitted_instances) |derived, admitted| if (!std.meta.eql(derived, admitted)) return error.WideCpuRosterMismatch;
@@ -132,7 +132,7 @@ pub const Statement = struct {
             chain_inputs.register_clocks[r] = clock.word;
         }
         const inputs = A.word16_execution.types.InputsFor(F){ .steps = steps, .initial_pc = initial_pc, .final_pc = final_pc, .epoch = epoch, .wide_clock = A.word16_execution.layout.wideClock(setup.materials.geometry.cpu_log) };
-        const plan = try Components.Plan.init(a, setup);
+        const plan = try Components.Plan.initFor(expected.envelope, a, setup);
         if (claims.len != plan.claim_count) return error.InvalidWideCpuClaims;
         const instances = expected.local_instances.?;
         if (instances.len != plan.binding_count) return error.WideCpuRosterMismatch;
@@ -208,7 +208,7 @@ pub const Statement = struct {
     pub fn evalComposition(self: *Statement, ctx: *C.Context, point: V.Point, sampled: []const []const []const F, alpha: F, _: void) !F {
         var accumulator = E.lane.PointAccumulator(F).init(alpha);
         for (self.plan.slots, self.publics) |slot, public| {
-            const descriptor = Oods.Authority.Source.Descriptor{ .origin = slot.origin, .cpu_u8_pairs = self.setup.materials.geometry.cpu_u8_pairs, .cpu_compact_decode = self.setup.materials.geometry.cpu_compact_decode };
+            const descriptor = Oods.Authority.Source.Descriptor.forGeometry(slot.origin, self.setup.materials.geometry);
             _ = try Oods.evaluateRole(F, ctx.scratch(), descriptor, slot, public, .{ .x = point.x, .y = point.y }, self.globalLog(), sampled, &accumulator);
         }
         return accumulator.finalize();
@@ -244,7 +244,7 @@ pub fn expectedWords(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.
         try words.append(a, cpu.register_clocks[r]);
     }
     try words.append(a, request.sponge.first_id);
-    var plan = try Components.Plan.init(a, setup);
+    var plan = try Components.Plan.initFor(expected.envelope, a, setup);
     defer plan.deinit();
     if (claims.len != plan.claim_count) return error.InvalidWideCpuClaims;
     const ls = try setup.materials.geometry.lsCounts(request.base.memory.ls_count);

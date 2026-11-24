@@ -263,9 +263,9 @@ void test_keccak() {
     // Two full blocks, then the tail with padding, in separate calls.
     alignas(8) uint64_t st[25];
     alignas(8) uint64_t pk[4] = {stwo::ptr(st), stwo::ptr(buf + 3), 272, stwo::kSpongeFresh};
-    stwo::ecall(stwo::kCandKeccakSponge, pk);
+    stwo::ecall(stwo::kKeccakSponge, pk);
     alignas(8) uint64_t pk2[4] = {stwo::ptr(st), stwo::ptr(buf + 3 + 272), 100, stwo::kSpongeFinalize};
-    stwo::ecall(stwo::kCandKeccakSponge, pk2);
+    stwo::ecall(stwo::kKeccakSponge, pk2);
     CHECK(std::memcmp(st, ethash_keccak256(buf + 3, 372).word64s, 32) == 0);
     CHECK(stwo_host_curve_calls[0x30] == uint64_t(cases) + 2);
     std::printf("keccak sponge: %d cases\n", cases + 1);

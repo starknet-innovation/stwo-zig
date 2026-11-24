@@ -147,18 +147,7 @@ pub const Roles = struct {
                 spec.* = try self.truthRole(context, id, @intCast(c.log_size), @intCast(c.maxConstraintLogDegreeBound()), .{ w[0], w[1], w[2] }, .{ c.offsets[0], c.offsets[1], c.offsets[2] }, TC.nativeMetadata(c), c.nConstraints(), true);
             },
             .delegated => |c| {
-                const id: u32 = switch (c.truth.family()) {
-                    .sha256 => 3,
-                    .arith256_mod => 4,
-                    .add => 5,
-                    .double => 6,
-                    .bn254_g1_add => 10,
-                    .bn254_g1_double => 11,
-                    .bn254_fp2_mul => 12,
-                    .bls12_381_fp2_mul => 13,
-                    .arith384_mont => 14,
-                    else => return error.UnsupportedTruthCompositionRole,
-                };
+                const id = try TC.delegatedKernelId(c.truth.family());
                 const shape = c.mainShape();
                 self.specs[0] = try self.truthRole(context, id, @intCast(c.logSize()), @intCast(c.maxConstraintLogDegreeBound()), .{ shape.fixed, shape.main, c.interWidth() }, .{ c.offsets[0], c.offsets[1], c.inter_offset }, TC.nativeMetadataV3(c), c.nConstraints(), false);
             },

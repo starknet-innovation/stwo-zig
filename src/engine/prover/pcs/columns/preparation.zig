@@ -9,6 +9,7 @@ const work_profile = @import("stwo_prover_api").work_profile;
 const twiddle_source_mod = @import("../../poly/twiddle_source.zig");
 const commitment_tree = @import("../commitment_tree.zig");
 const circle_transforms = @import("circle_transforms.zig");
+pub const extendCoefficientColumnsByGroupForBackend = circle_transforms.extendCoefficientColumnsByGroupForBackend;
 const column_storage = @import("storage.zig");
 const preparation_cache = @import("../column_preparation_cache.zig");
 

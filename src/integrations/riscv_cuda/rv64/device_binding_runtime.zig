@@ -338,8 +338,8 @@ const Call = struct {
             temporary.deinit(a);
         }
         const metadata = try alloc(a, &context, &temporary, 260 * 8, 0);
-        const point = try alloc(a, &context, &temporary, 22 * 8, 0);
-        const carry = try alloc(a, &context, &temporary, 22 * 16, 0);
+        const point = try alloc(a, &context, &temporary, A.binding_max_row_log * 8, 0);
+        const carry = try alloc(a, &context, &temporary, A.binding_max_row_log * 16, 0);
         const seed = try alloc(a, &context, &temporary, 9, 0);
         const status = try alloc(a, &context, &temporary, 1, 0);
         try context.upload(status, &.{0});

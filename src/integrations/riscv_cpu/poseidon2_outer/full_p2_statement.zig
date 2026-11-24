@@ -211,7 +211,7 @@ pub const Statement = struct {
     pub fn evalComposition(self: *Statement, ctx: *C.Context, point: V.Point, sampled: []const []const []const F, alpha: F, _: void) !F {
         var accumulator = E.lane.PointAccumulator(F).init(alpha);
         for (self.plan.slots, self.publics) |slot, public| {
-            const descriptor = Oods.Authority.Source.Descriptor{ .origin = slot.origin, .cpu_u8_pairs = self.setup.materials.geometry.cpu_u8_pairs, .cpu_compact_decode = self.setup.materials.geometry.cpu_compact_decode };
+            const descriptor = Oods.Authority.Source.Descriptor.forGeometry(slot.origin, self.setup.materials.geometry);
             _ = try Oods.evaluateRole(F, ctx.scratch(), descriptor, slot, public, .{ .x = point.x, .y = point.y }, self.globalLog(), sampled, &accumulator);
         }
         return accumulator.finalize();

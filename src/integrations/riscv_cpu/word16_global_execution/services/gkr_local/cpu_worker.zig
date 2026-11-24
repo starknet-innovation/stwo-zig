@@ -123,7 +123,7 @@ fn validate(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.Request, 
     if (fixed) |binding| try binding.require(&setup.key, config) else try W.validateConfig(config);
     const root = if (fixed) |binding| binding.root() else setup.key.root;
     if (expected.kind != .cpu or !std.mem.eql(u8, &expected.fixed, &root) or !std.mem.eql(u8, &expected.statement, &cpuStatementWithAuthority(setup, request, first, config, fixed))) return error.WideCpuStatementMismatch;
-    const roster = try @import("roster.zig").fromSetup(a, setup);
+    const roster = try @import("roster.zig").fromSetupFor(expected.envelope, a, setup);
     defer a.free(roster);
     const admitted = expected.local_instances orelse return error.WideCpuLocalRequired;
     if (roster.len != admitted.len) return error.WideCpuRosterMismatch;
@@ -233,9 +233,9 @@ pub const CpuWorker = struct {
     }
     pub fn initWithAuthority(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.Request, source: R.Sources, expected: Manifest.ExpectedWorker, config: W.PcsConfig, first: anytype, gkr_budget: usize, fixed: ?*const Fixed.Binding) !CpuWorker {
         try validate(a, setup, request, expected, first, config, fixed);
-        const instances = try @import("roster.zig").fromSetup(a, setup);
+        const instances = try @import("roster.zig").fromSetupFor(expected.envelope, a, setup);
         errdefer a.free(instances);
-        var plan = try Components.Plan.init(a, setup);
+        var plan = try Components.Plan.initFor(expected.envelope, a, setup);
         errdefer plan.deinit();
         var scheme = try W.Prover.init(a, config);
         errdefer scheme.deinit(a);
@@ -598,7 +598,7 @@ pub fn verifyCpu(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.Requ
 /// without verifying the proof twice. Returns the decoded physical proof.
 pub fn admitCpuBeforeCoreVerify(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.Request, expected: Manifest.ExpectedWorker, first: anytype, pending: *const Manifest.PendingManifest, index: usize, config: W.PcsConfig, encoded: *const CpuEncoded, fixed: ?*const Fixed.Binding) !W.Proof {
     try validate(a, setup, request, expected, first, config, fixed);
-    var plan = try Components.Plan.init(a, setup);
+    var plan = try Components.Plan.initFor(expected.envelope, a, setup);
     defer plan.deinit();
     try checkManifest(expected, pending, index);
     var proof = try W.decodePhysical(a, encoded.bytes);
@@ -612,7 +612,7 @@ pub fn admitCpuBeforeCoreVerify(a: std.mem.Allocator, setup: *const R.CpuSetup, 
 }
 pub fn verifyCpuWithAuthority(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.Request, expected: Manifest.ExpectedWorker, first: anytype, pending: *const Manifest.PendingManifest, index: usize, config: W.PcsConfig, encoded: *const CpuEncoded, fixed: ?*const Fixed.Binding) !Manifest.Claims {
     try validate(a, setup, request, expected, first, config, fixed);
-    var plan = try Components.Plan.init(a, setup);
+    var plan = try Components.Plan.initFor(expected.envelope, a, setup);
     defer plan.deinit();
     try checkManifest(expected, pending, index);
     var proof = try W.decodePhysical(a, encoded.bytes);

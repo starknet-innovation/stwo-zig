@@ -94,13 +94,17 @@ const Inventory = union(enum) {
 };
 /// Existing setup-based admission retains its exact checks, with no allocation.
 pub fn validateRequests(setups: []const *const Setup, requests: []const Old.Request, expected: Expected) !void {
-    return validateInventory(.{ .setups = setups }, requests, expected);
+    return validateInventory(.classic, .{ .setups = setups }, requests, expected);
 }
 /// Concrete rootless caller supplies independently expected immutable owners.
 pub fn validateMaterials(materials: []const *const Materials, requests: []const Old.Request, expected: Expected) !void {
-    return validateInventory(.{ .materials = materials }, requests, expected);
+    return validateMaterialsFor(.classic, materials, requests, expected);
 }
-fn validateInventory(inventory: Inventory, requests: []const Old.Request, expected: Expected) !void {
+pub const Projection = @import("../word16_execution/geometry.zig").Geometry.Projection;
+pub fn validateMaterialsFor(projection: Projection, materials: []const *const Materials, requests: []const Old.Request, expected: Expected) !void {
+    return validateInventory(projection, .{ .materials = materials }, requests, expected);
+}
+fn validateInventory(projection: Projection, inventory: Inventory, requests: []const Old.Request, expected: Expected) !void {
     if (inventory.len() == 0 or inventory.len() > 65535 or inventory.len() != requests.len or expected.total_steps == 0) return error.InvalidGlobalExecutionRoster;
     if (expected.max_total_steps == 0 or expected.total_steps > expected.max_total_steps) return error.GlobalExecutionBudgetExceeded;
     if (expected.admission.max_prefix_steps == 0 or expected.admission.max_prefix_steps >= 1 << 23) return error.InvalidExecutionBudget;
@@ -110,7 +114,7 @@ fn validateInventory(inventory: Inventory, requests: []const Old.Request, expect
         const materials = inventory.at(index);
         try materials.suite.validate();
         if (!materials.suite.eql(inventory.at(0).suite)) return error.MixedWord16PcsSuites;
-        try materials.geometry.validate();
+        try projection.validate(materials.geometry);
         try r.cpu.validate(materials.geometry.cpu_log);
         if (r.cpu.steps > expected.admission.max_prefix_steps) return error.ExecutionPrefixBudgetExceeded;
         if (r.memory.ls_count > r.cpu.steps) return error.InvalidExecutionMemoryCount;
@@ -118,7 +122,7 @@ fn validateInventory(inventory: Inventory, requests: []const Old.Request, expect
         if (!std.mem.eql(u8, &materials.program.identity, &expected.program_identity)) return error.GlobalExecutionProgramMismatch;
         _ = materials.geometry.lsCounts(r.memory.ls_count) catch return error.GlobalMemoryCapacity;
         if (r.memory.initial.len >= @as(usize, 1) << @intCast(materials.geometry.initialLog()) or r.memory.terminal.len >= @as(usize, 1) << @intCast(materials.geometry.terminalLog())) return error.GlobalMemoryCapacity;
-        @import("../word16_execution/protocol.zig").validateArithmeticRequests(materials.geometry, r) catch return error.GlobalArithmeticCapacity;
+        @import("../word16_execution/protocol.zig").validateArithmeticRequestsFor(projection, materials.geometry, r) catch return error.GlobalArithmeticCapacity;
         if (index == 0) {
             if (r.cpu.initial_pc != expected.admission.initial_pc or !std.mem.eql(u64, &r.cpu.initial_registers, &expected.admission.initial_registers)) return error.UntrustedGlobalGenesis;
         } else {

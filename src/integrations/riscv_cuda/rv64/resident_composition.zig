@@ -124,8 +124,8 @@ pub const Context = struct {
     b2n: B2n,
     copy: Copy,
     clear: Clear,
-    artifacts: [49]KernelMetadata,
-    truth_artifacts: [15]?KernelMetadata = @splat(null),
+    artifacts: [Oracle.count]KernelMetadata,
+    truth_artifacts: [@import("truth_codegen.zig").role_count]?KernelMetadata = @splat(null),
     truth_role: ?*const @TypeOf(Abi.stwo_rv64_composition_role_on) = null,
     twiddles: [29]?Twiddle = @splat(null),
     mutex: std.Thread.Mutex = .{},
@@ -319,18 +319,7 @@ pub const Context = struct {
                 made += 1;
             },
             .delegated => |c| {
-                const id: u32 = switch (c.truth.family()) {
-                    .sha256 => 3,
-                    .arith256_mod => 4,
-                    .add => 5,
-                    .double => 6,
-                    .bn254_g1_add => 10,
-                    .bn254_g1_double => 11,
-                    .bn254_fp2_mul => 12,
-                    .bls12_381_fp2_mul => 13,
-                    .arith384_mont => 14,
-                    else => return error.UnsupportedTruthCompositionRole,
-                };
+                const id = try @import("truth_codegen.zig").delegatedKernelId(c.truth.family());
                 const shape = c.mainShape();
                 roles[0] = try self.bindTruthRole(a, id, c.logSize(), c.maxConstraintLogDegreeBound(), .{ shape.fixed, shape.main, c.interWidth() }, .{ c.offsets[0], c.offsets[1], c.inter_offset }, @import("truth_codegen.zig").nativeMetadataV3(c), c.nConstraints(), false);
                 made = 1;

@@ -59,10 +59,15 @@ pub fn exercise(comptime selected: Candidate.Profile, comptime Hook: type) !void
         defer old_authority.deinit();
         if (bundle.verifyWithAuthority(a, &receiver_cpus, &.{}, expected, Candidate.configFor(Candidate.DEFAULT_PROFILE), &old_authority)) |_| return error.D2AcceptedUnderDefaultProfile else |_| {}
     }
-    for (0..2) |case| {
+    for (0..3) |case| {
         var proof = try W.decodePhysical(a, bundle.cpus[0].bytes);
         defer proof.deinit(a);
-        if (case == 0) proof.commitment_scheme_proof.config.fri_config.n_queries -= 1 else proof.commitment_scheme_proof.proof_of_work +%= 1;
+        switch (case) {
+            0 => proof.commitment_scheme_proof.config.fri_config.n_queries -= 1,
+            1 => proof.commitment_scheme_proof.proof_of_work +%= 1,
+            2 => proof.commitment_scheme_proof.commitments.items[0][0] ^= 1,
+            else => unreachable,
+        }
         const bytes = try W.encodePhysical(a, proof);
         defer a.free(bytes);
         const original = bundle.cpus[0].bytes;
@@ -78,10 +83,10 @@ pub fn exercise(comptime selected: Candidate.Profile, comptime Hook: type) !void
     defer loaded.deinit(a);
     _ = try loaded.bundle.verifyWithAuthority(a, &receiver_cpus, &.{}, expected, config, &receiver);
     try Hook.run(a, &cpus, &bundle, expected, config, &authority);
-    std.debug.print("NATIVE_CPU_MINI profile={s} beta={} q={} pow={} fold={} physical=2 fresh_authority=true wire_reload=true tamper={} accepted=true certified=false\n", .{ selected.name(), config.fri_config.log_blowup_factor, config.fri_config.n_queries, config.pow_bits, config.fri_config.fold_step, @as(u32, if (selected == Candidate.DEFAULT_PROFILE) 2 else 3) });
+    std.debug.print("NATIVE_CPU_MINI profile={s} beta={} q={} pow={} fold={} physical=2 fresh_authority=true wire_reload=true tamper={} accepted=true certified=false\n", .{ selected.name(), config.fri_config.log_blowup_factor, config.fri_config.n_queries, config.pow_bits, config.fri_config.fold_step, @as(u32, if (selected == Candidate.DEFAULT_PROFILE) 3 else 4) });
 }
 
-test "D2 native CPU mini proves fresh verifies and rejects profile query and PoW tampering" {
+test "D2 native CPU mini proves fresh verifies and rejects profile query PoW and FIXED root tampering" {
     try exercise(.d2_native_b4_q54_p20_fold4, struct {
         pub fn run(_: std.mem.Allocator, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) !void {}
     });

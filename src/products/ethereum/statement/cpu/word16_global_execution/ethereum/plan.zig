@@ -5,6 +5,8 @@ const A = @import("ethereum_frontend_component").rv64_air;
 const Coverage = @import("stwo_riscv_cpu_integration").rv64_execution.word16.coverage;
 const W = @import("stwo_riscv_cpu_integration").rv64_execution.services.wire;
 const Capture = @import("capture.zig").Owner;
+const CPU = @import("stwo_riscv_cpu_integration");
+const Services = CPU.rv64_services_types;
 pub const Ladder = struct { head: u32, tail: ?u32 = null };
 pub fn ladder(count: usize, reserve: u32) !Ladder {
     const full: u32 = @intCast(std.math.log2_int_ceil(usize, @max(32, try std.math.add(usize, count, reserve))));
@@ -40,6 +42,14 @@ pub const CpuLayout = struct {
     alu_fused_tail: bool = false,
     /// LS-D64 fused tail + byte pair (requires u8_pairs and ls_dword).
     ls_dword_fused_pairs: bool = false,
+    /// Compact wide-clock rows have a MAIN-only GKR projection.
+    gkr_main: bool = false,
+
+    fn validateGeometry(self: CpuLayout, geometry: @FieldType(W.CpuDeclaration, "geometry")) !void {
+        if (self.gkr_main and geometry.wideClock()) return geometry.validateMainProjection();
+        return geometry.validate();
+    }
+
     /// Default layout for a profile route. Only the admitted v3 routes
     /// (`ethereum_services_v3` and its Zbb variant `ethereum_services_v3_zbb`)
     /// default to the fused tail, byte pairs,
@@ -53,7 +63,7 @@ pub const CpuLayout = struct {
         const v3 = profile == .ethereum_services_v3;
         // Compact decode has GKR-local CPU/ROM projections (gkr_local/fractions.zig
         // cpuCompactFor, main_only `.cpu_compact`): 37 instead of 47 CPU MAIN columns.
-        return .{ .fused_tail = v3, .u8_pairs = v3, .ls_dword = v3, .compact_decode = v3 };
+        return .{ .fused_tail = v3, .u8_pairs = v3, .ls_dword = v3, .compact_decode = v3, .gkr_main = v3 };
     }
     pub fn forProfile(profile: @import("ethereum_frontend_component").rv64.execution_profile.Profile) CpuLayout {
         const v3 = @import("ethereum_frontend_component").rv64.execution_profile.isV3(profile);
@@ -77,26 +87,73 @@ pub fn cpuForShard(n: *const @import("stwo_riscv_cpu_integration").rv64_executio
     return cpuForSegmentAt(n, &advice, 0, ordinal, total_segments, initial_count, layout);
 }
 fn cpuForSegmentAt(n: *const @import("stwo_riscv_cpu_integration").rv64_execution.word16.prepared.Prepared, advice: *const @import("stwo_riscv_cpu_integration").rv64_services_collector.Advice, advice_index: usize, ordinal: usize, total_segments: usize, initial_count: usize, layout: CpuLayout) !W.CpuDeclaration {
-    if (total_segments == 0 or ordinal >= total_segments or advice_index >= advice.events.len) return error.CanonRosterMismatch;
-    const boundary = try Coverage.minimalBoundaryLog(@intCast(initial_count));
-    var result: W.CpuDeclaration = undefined;
-    const d = &result;
-    var g = n.geometryOmittingEmptyDivision() catch |err| {
-        std.debug.print("RV64_PLAN_CAPACITY cpu_ordinal={d} memory={d} unique_words={d} alu={d} binary={d} shift={d} mul={d} div={d}\n", .{ ordinal, n.raw_counts.memory, n.unique_memory_words, n.alu.facts.len, n.binary.facts.len, n.shift.len, n.multiplication.len, n.division.len });
-        return err;
-    };
+    if (advice_index >= advice.events.len) return error.CanonRosterMismatch;
     const events = advice.events[advice_index];
-    const dword: usize = if (layout.ls_dword) @import("stwo_riscv_cpu_integration").rv64_execution.services.pipeline.dwordCount(events) else 0;
-    const ls = try ladder(events.len - dword, 1);
+    const cpu = n.cpu orelse return error.PreparedExecutionConsumed;
+    const jalr = n.jalr orelse return error.PreparedExecutionConsumed;
+    var calls: [Services.FAMILIES]u32 = @splat(0);
+    calls[0] = @intCast(advice.keccak[advice_index].len);
+    calls[1] = @intCast(advice.secp[advice_index][0].len);
+    calls[2] = @intCast(advice.secp[advice_index][1].len);
+    calls[3] = @intCast(advice.sha256[advice_index].len);
+    calls[4] = @intCast(advice.arith256_mod[advice_index].len);
+    for (advice.curves[advice_index], calls[Services.FIRST_CURVE..]) |values, *count| count.* = @intCast(values.len);
+    return cpuForCensus(.{
+        .cpu_log = cpu.log_size,
+        .jalr_log = jalr.log_size,
+        .alu = @intCast(n.alu.facts.len),
+        .binary = @intCast(n.binary.facts.len),
+        .shift = @intCast(n.shift.len),
+        .zbb = @intCast(n.zbb.facts.len),
+        .division = @intCast(n.division.len),
+        .multiplication = @intCast(n.multiplication.len),
+        .ls = @intCast(events.len),
+        .dword = if (layout.ls_dword) CPU.rv64_execution.services.pipeline.dwordCount(events) else 0,
+        .calls = calls,
+        .bulk = advice.bulk[advice_index].counts(),
+        .sponge = advice.sponge[advice_index].counts(),
+    }, ordinal, total_segments, initial_count, layout);
+}
+
+/// Cardinalities suffice for geometry. The AIR and receiver authenticate the
+/// actual facts and service spans independently of the census producer.
+pub const CpuCensus = struct {
+    cpu_log: u32,
+    jalr_log: u32,
+    alu: u32,
+    binary: u32,
+    shift: u32,
+    zbb: u32,
+    division: u32,
+    multiplication: u32,
+    ls: u32,
+    dword: u32,
+    calls: [Services.FAMILIES]u32,
+    bulk: Services.BulkCounts,
+    sponge: Services.SpongeCounts,
+};
+
+pub fn cpuForCensus(c: CpuCensus, ordinal: usize, total_segments: usize, initial_count: usize, layout: CpuLayout) !W.CpuDeclaration {
+    if (total_segments == 0 or ordinal >= total_segments) return error.CanonRosterMismatch;
+    if (c.dword > c.ls or (!layout.ls_dword and c.dword != 0)) return error.InvalidCombinedServiceCount;
+    const boundary = try Coverage.minimalBoundaryLog(std.math.cast(u32, initial_count) orelse return error.EthereumInstanceCapacityExceeded);
+    var g: @FieldType(W.CpuDeclaration, "geometry") = .{
+        .cpu_log = c.cpu_log,
+        .jalr_log = c.jalr_log,
+        .division_log = try Coverage.minimalLog(try std.math.add(u32, c.division, @intFromBool(layout.gkr_main))),
+        .multiplication_log = try Coverage.minimalMultiplicationLog(try std.math.add(u32, c.multiplication, @intFromBool(layout.gkr_main))),
+        .omit_empty_division = c.division == 0,
+    };
+    const ls = try ladder(c.ls - c.dword, 1);
     g.ls_log = ls.head;
     g.ls_tail_log = ls.tail;
-    const alu = try ladder(n.alu.facts.len, 0);
+    const alu = try ladder(c.alu, 0);
     g.alu_log = alu.head;
     g.alu_tail_log = alu.tail;
-    const binary = try ladder(n.binary.facts.len, 0);
+    const binary = try ladder(c.binary, 0);
     g.binary_log = binary.head;
     g.binary_tail_log = binary.tail;
-    const shift = try ladder(n.shift.len, 0);
+    const shift = try ladder(c.shift, 0);
     g.shift_log = shift.head;
     g.shift_tail_log = shift.tail;
     g.boundary_log = 5;
@@ -115,36 +172,28 @@ fn cpuForSegmentAt(n: *const @import("stwo_riscv_cpu_integration").rv64_executio
     if (g.wideClock()) {
         g.cpu_fused_tail = true;
         g.cpu_u8_pairs = false;
-        g.cpu_compact_decode = false;
+        g.cpu_compact_decode = layout.gkr_main and layout.compact_decode;
         g.mul_u8_pairs = false;
         g.ls_fused_pairs = false;
         g.ls_dword_fused_pairs = false;
     }
-    d.* = .{ .geometry = g, .bridges = .{} };
+    var declaration: W.CpuDeclaration = .{ .geometry = g, .bridges = .{} };
+    const d = &declaration;
     // The same two-instance ladder as LS32 (one inactive row per instance).
-    if (dword != 0) {
-        const dl = try ladder(dword, 1);
+    if (c.dword != 0) {
+        const dl = try ladder(c.dword, 1);
         d.bridges.ls_dword = dl.head;
         d.bridges.ls_dword_tail = dl.tail;
     }
-    const k = advice.keccak[advice_index].len;
-    const add = advice.secp[advice_index][0].len;
-    const double = advice.secp[advice_index][1].len;
-    if (k != 0) d.bridges.keccak = try Coverage.minimalPrefixLog(@intCast(try std.math.mul(usize, 25, k)));
-    if (add != 0) d.bridges.add = try Coverage.minimalPrefixLog(@intCast(try std.math.mul(usize, A.crypto.secp256k1.word16_bridge.types.coordinates(.add), add)));
-    if (double != 0) d.bridges.double = try Coverage.minimalPrefixLog(@intCast(try std.math.mul(usize, A.crypto.secp256k1.word16_bridge.types.coordinates(.double), double)));
-    const sha256 = advice.sha256[advice_index].len;
-    if (sha256 != 0) d.bridges.sha256 = try Coverage.minimalPrefixLog(@intCast(try std.math.mul(usize, A.crypto.secp256k1.word16_bridge.types.coordinates(.sha256), sha256)));
-    const arith = advice.arith256_mod[advice_index].len;
-    if (arith != 0) d.bridges.arith256_mod = try Coverage.minimalPrefixLog(@intCast(try std.math.mul(usize, A.crypto.secp256k1.word16_bridge.types.coordinates(.arith256_mod), arith)));
-    // v3 curve/field families: coordinates rows per call each.
-    const ST = @import("stwo_riscv_cpu_integration").rv64_services_types;
-    for (advice.curves[advice_index], ST.FIRST_CURVE..) |calls, f| if (calls.len != 0) {
-        const family: ST.Family = @enumFromInt(f);
-        d.bridges.set(family, try Coverage.minimalPrefixLog(@intCast(try std.math.mul(usize, A.crypto.secp256k1.word16_bridge.types.coordinates(ST.bridgeKind(family)), calls.len))));
-    };
+    for (c.calls, 0..) |count, i| {
+        if (count == 0) continue;
+        const family: Services.Family = @enumFromInt(i);
+        const coordinates = if (family == .keccak) 25 else A.crypto.secp256k1.word16_bridge.types.coordinates(Services.bridgeKind(family));
+        const rows = std.math.mul(u32, @intCast(coordinates), count) catch return error.EthereumInstanceCapacityExceeded;
+        d.bridges.set(family, try Coverage.minimalPrefixLog(rows));
+    }
     // v3 bulk memory: one descriptor row per call, one body row per word.
-    const bulk = advice.bulk[advice_index].counts();
+    const bulk = c.bulk;
     if (bulk.calls != 0) d.bridges.bulk.desc = try Coverage.minimalPrefixLog(bulk.calls);
     if (bulk.copy_words != 0) d.bridges.bulk.copy = try Coverage.minimalPrefixLog(bulk.copy_words);
     if (bulk.set_words != 0) d.bridges.bulk.set = try Coverage.minimalPrefixLog(bulk.set_words);
@@ -158,14 +207,14 @@ fn cpuForSegmentAt(n: *const @import("stwo_riscv_cpu_integration").rv64_executio
     if (bulk.cmp_calls != 0) d.bridges.bulk.cdesc = try Coverage.minimalPrefixLog(bulk.cmp_calls);
     if (bulk.cmp_words != 0) d.bridges.bulk.cmp = try Coverage.minimalPrefixLog(bulk.cmp_words);
     // v3 Keccak sponge: one call row per ECALL, one row per permutation.
-    const sponge = advice.sponge[advice_index].counts();
+    const sponge = c.sponge;
     if (sponge.calls != 0) d.bridges.sponge.call = @max(5, try Coverage.minimalPrefixLog(sponge.calls));
     if (sponge.perms != 0) d.bridges.sponge.perm = @max(5, try Coverage.minimalPrefixLog(sponge.perms));
     // v3_zbb: one Zbb BINARY row per distinct Zbb FUNCTION fact (pure
     // truth provider, every row may be active), only when the shard has one.
-    if (n.zbb.facts.len != 0) d.bridges.zbb = try Coverage.minimalLog(@intCast(n.zbb.facts.len));
-    try g.validate();
-    return result;
+    if (c.zbb != 0) d.bridges.zbb = try Coverage.minimalLog(c.zbb);
+    try layout.validateGeometry(g);
+    return declaration;
 }
 pub fn cpus(a: std.mem.Allocator, captured: *const Capture, layout: CpuLayout) ![]W.CpuDeclaration {
     const out = try a.alloc(W.CpuDeclaration, captured.native.items.len);
@@ -191,6 +240,7 @@ const SecpRow = truth_plan.SecpRow;
 pub const secpRowSpan = truth_plan.secpRowSpan;
 pub const secpRcbCells = truth_plan.secpRcbCells;
 pub const truthsWithOptions = truth_plan.truthsWithOptions;
+pub const truthsForServiceCounts = truth_plan.truthsForServiceCounts;
 pub const oneTruthPerFamily = truth_plan.oneTruthPerFamily;
 pub const topRungLog = truth_plan.topRungLog;
 pub const appendSplitFamily = truth_plan.appendSplitFamily;
@@ -208,16 +258,27 @@ test "one truth per family producer resource mapping preserves the selected part
     @memcpy(total[0..5], &[_]u32{ 29998, 10358, 9751, 2901, 319 });
     const declarations = try coalesceTruthFamilies(std.testing.allocator, total, selected, 18);
     defer std.testing.allocator.free(declarations);
-    try std.testing.expectEqual(@as(usize, 7), declarations.len);
+    try std.testing.expectEqual(@as(usize, 6), declarations.len);
 }
 test "one truth per family partial coalescing preserves bounded Keccak and admitted secp spans" {
     const ST = @import("stwo_riscv_cpu_integration").rv64_services_types;
-    for ([_][5]u32{ .{ 20994, 14855, 14001, 3157, 25 }, .{ 29998, 10358, 9751, 2901, 319 } }) |counts| {
+    const Case = struct { counts: [5]u32, tail_log: u32 };
+    for ([_]Case{
+        .{ .counts = .{ 20_994, 14_855, 14_001, 3157, 25 }, .tail_log = 15 },
+        .{ .counts = .{ 29_998, 10_358, 9751, 2901, 319 }, .tail_log = 18 },
+        .{ .counts = .{ 29_112, 8159, 9751, 2901, 319 }, .tail_log = 17 },
+        .{ .counts = .{ 29_126, 8159, 9751, 2901, 319 }, .tail_log = 17 },
+        .{ .counts = .{ 29_127, 8159, 9751, 2901, 319 }, .tail_log = 18 },
+    }) |case| {
         var total: [ST.FAMILIES]u32 = @splat(0);
-        @memcpy(total[0..5], &counts);
+        @memcpy(total[0..5], &case.counts);
         const truth = try coalesceTruthFamilies(std.testing.allocator, total, .{ .v3 = true, .uniform_throughput = true, .coalesce_families = true }, 18);
         defer std.testing.allocator.free(truth);
-        try std.testing.expectEqual(@as(usize, 7), truth.len);
+        try std.testing.expectEqual(@as(usize, 6), truth.len);
+        try std.testing.expectEqual(@as(u32, 19_418), truth[0].calls);
+        try std.testing.expectEqual(@as(u32, 19_419), truth[1].first_id);
+        try std.testing.expectEqual(total[0] - truth[0].calls, truth[1].calls);
+        try std.testing.expectEqual(case.tail_log, truth[1].logs[0]);
         var got: [ST.FAMILIES]u32 = @splat(0);
         for (truth) |declaration| {
             const index = @intFromEnum(declaration.family);
@@ -228,9 +289,9 @@ test "one truth per family partial coalescing preserves bounded Keccak and admit
         try std.testing.expectEqualSlices(u32, &total, &got);
         // The coalesced secp spans fit the existing source-owned M6 rung table.
         var classes: [4]CanonClass = undefined;
-        try canonicalTruths(truth[3..], @import("stwo_riscv_cpu_integration").rv64_native_rungs, &classes);
+        try canonicalTruths(truth[2..], @import("stwo_riscv_cpu_integration").rv64_native_rungs, &classes);
         try std.testing.expectEqual(@as(u32, 14), truth[3].logs[0]);
-        try std.testing.expectEqual(@as(u32, 14), truth[4].logs[0]);
+        if (case.counts[1] > 8191) try std.testing.expectEqual(@as(u32, 14), truth[2].logs[0]);
     }
 }
 test "truth split leaves every plan the coalesced profile admits unchanged" {
@@ -640,6 +701,26 @@ pub fn canonicalCpusMode(captured: *const Capture, layout: CpuLayout, decls: []W
 /// Same receiver-owned rung/role policy for a single known segment. No
 /// producer-selected layout or hypothetical INITIAL capacity is accepted.
 pub fn canonicalCpuForSegment(n: *@import("stwo_riscv_cpu_integration").rv64_execution.word16.prepared.Prepared, events: []const @import("ethereum_frontend_component").rv64_air.memory.load_store_v2.native.Event, layout: CpuLayout, d: *W.CpuDeclaration, ordinal: usize, total_segments: usize, table: anytype, strict: bool) !CanonClass {
+    const dword: usize = if (layout.ls_dword) @import("stwo_riscv_cpu_integration").rv64_execution.services.pipeline.dwordCount(events) else 0;
+    const counts = [5]usize{ n.alu.facts.len, n.binary.facts.len, n.shift.len, events.len - dword, dword };
+    const chosen = try canonicalCpuForCounts(counts, layout, d, ordinal, total_segments, table, strict);
+    if (chosen.rung == UNCLASSED) return chosen;
+    // The JALR source is the only capture-time sized component (facts only,
+    // MAIN not yet materialized): rebind its log to the padded class.
+    if (n.jalr) |*j| {
+        if (j.main.len != 0 or j.fixed.len != 0 or j.facts.len > (@as(usize, 1) << @intCast(d.geometry.jalr_log))) return error.CanonJalrRebind;
+        j.log_size = d.geometry.jalr_log;
+    } else return error.CanonJalrRebind;
+    return chosen;
+}
+
+/// Apply receiver-owned rung policy using the same device or capture census.
+pub fn canonicalCpuForCensus(c: CpuCensus, layout: CpuLayout, d: *W.CpuDeclaration, ordinal: usize, total_segments: usize, table: anytype, strict: bool) !CanonClass {
+    if (c.dword > c.ls or (!layout.ls_dword and c.dword != 0)) return error.InvalidCombinedServiceCount;
+    return canonicalCpuForCounts(.{ c.alu, c.binary, c.shift, c.ls - c.dword, c.dword }, layout, d, ordinal, total_segments, table, strict);
+}
+
+fn canonicalCpuForCounts(counts: [5]usize, layout: CpuLayout, d: *W.CpuDeclaration, ordinal: usize, total_segments: usize, table: anytype, strict: bool) !CanonClass {
     if (total_segments == 0 or ordinal >= total_segments) return error.CanonRosterMismatch;
     var result: CanonClass = undefined;
     const class = &result;
@@ -647,11 +728,9 @@ pub fn canonicalCpuForSegment(n: *@import("stwo_riscv_cpu_integration").rv64_exe
     const rungs = for (table.CPU) |e| {
         if (e.family == family) break e.rungs;
     } else return error.CanonFamilyMissing;
-    const dword: usize = if (layout.ls_dword) @import("stwo_riscv_cpu_integration").rv64_execution.services.pipeline.dwordCount(events) else 0;
     const actual = Canon.cpuVector(d.*);
     var chosen: ?W.CpuDeclaration = null;
     for (rungs, 0..) |rung, r| {
-        const counts = [5]usize{ n.alu.facts.len, n.binary.facts.len, n.shift.len, events.len - dword, dword };
         if (if (strict) canonFitStrict(d.*, actual, rung, counts, layout.ls_dword) else canonFit(d.*, actual, rung, counts)) |padded| {
             chosen = padded;
             class.* = .{ .family = family, .rung = @intCast(r) };
@@ -668,13 +747,7 @@ pub fn canonicalCpuForSegment(n: *@import("stwo_riscv_cpu_integration").rv64_exe
         class.* = .{ .family = family, .rung = UNCLASSED };
         return result;
     };
-    try d.geometry.validate();
-    // The JALR source is the only capture-time sized component (facts only,
-    // MAIN not yet materialized): rebind its log to the padded class.
-    if (n.jalr) |*j| {
-        if (j.main.len != 0 or j.fixed.len != 0 or j.facts.len > (@as(usize, 1) << @intCast(d.geometry.jalr_log))) return error.CanonJalrRebind;
-        j.log_size = d.geometry.jalr_log;
-    } else return error.CanonJalrRebind;
+    try layout.validateGeometry(d.geometry);
     return result;
 }
 const PAIRS = [_]struct { head: usize, tail: usize, reserve: u32 }{
@@ -684,6 +757,96 @@ const PAIRS = [_]struct { head: usize, tail: usize, reserve: u32 }{
     .{ .head = 10, .tail = 11, .reserve = 1 }, // ls (core LS32 events)
     .{ .head = 38, .tail = 39, .reserve = 1 }, // ls_dword
 };
+/// Group only the closed windows of the current ticket. A candidate must
+/// preserve fixed program routing, contain every native event and remain
+/// within a per-member row budget. Each installed worker still authenticates
+/// its own observed counts and the receiver checks every physical proof.
+pub fn shareCurrentCpuClasses(a: std.mem.Allocator, declarations: []W.CpuDeclaration, counts: []const CpuCensus, layout: CpuLayout) !usize {
+    if (declarations.len != counts.len or counts.len > 256) return error.CanonRosterMismatch;
+    for (declarations, counts) |declaration, census| {
+        if (census.dword > census.ls or (!layout.ls_dword and census.dword != 0)) return error.InvalidCombinedServiceCount;
+        for (Canon.cpuVector(declaration)) |log| if (log > 31) return error.InvalidExecutionGeometry;
+        try layout.validateGeometry(declaration.geometry);
+    }
+    if (counts.len < 2) return counts.len;
+    const n = counts.len;
+    const group = try a.alloc(usize, n);
+    defer a.free(group);
+    const envelope = try a.alloc(Canon.CpuVector, n);
+    defer a.free(envelope);
+    // Smallest capacity for every member of this group.
+    const smallest = try a.alloc(u64, n);
+    defer a.free(smallest);
+    var groups: usize = 0;
+    for (declarations, counts, 0..) |d, census, i| {
+        const orig = Canon.cpuVector(d);
+        const orig_rows = roleRows(orig);
+        var selected: ?usize = null;
+        var best_rows: u64 = std.math.maxInt(u64);
+        var best_shape: Canon.CpuVector = undefined;
+        for (envelope[0..groups], 0..) |old, g| {
+            var candidate: Canon.CpuVector = undefined;
+            for (old, orig, &candidate) |left, right, *out| out.* = @max(left, right);
+            const bound = @min(smallest[g], orig_rows);
+            const candidate_rows = roleRows(candidate);
+            if (candidate_rows > bound + bound / 4 or candidate_rows >= best_rows) continue;
+            var compatible = true;
+            for ([_]usize{ 0, 7, 12, 13, 14, 35 }) |k| if (old[k] != orig[k]) {
+                compatible = false;
+                break;
+            };
+            if (!compatible or cohortFit(d, census, candidate, layout) == null) continue;
+            for (group[0..i], declarations[0..i], counts[0..i], 0..) |member, prior, c_prior, prior_idx| {
+                if (member == g and (Canon.Family.cpu(i, n) != Canon.Family.cpu(prior_idx, n) or
+                    d.geometry.omit_empty_division != prior.geometry.omit_empty_division or
+                    cohortFit(prior, c_prior, candidate, layout) == null))
+                {
+                    compatible = false;
+                    break;
+                }
+            }
+            if (!compatible) continue;
+            selected = g;
+            best_rows = candidate_rows;
+            best_shape = candidate;
+        }
+        if (selected) |g| {
+            envelope[g] = best_shape;
+            smallest[g] = @min(smallest[g], orig_rows);
+            group[i] = g;
+        } else {
+            group[i] = groups;
+            envelope[groups] = orig;
+            smallest[groups] = orig_rows;
+            groups += 1;
+        }
+    }
+    for (declarations, counts, group) |*d, c_seg, g| {
+        if (std.mem.count(usize, group, &.{g}) == 1) continue;
+        d.* = cohortFit(d.*, c_seg, envelope[g], layout) orelse return error.CanonRosterMismatch;
+    }
+    return groups;
+}
+
+fn cohortFit(d: W.CpuDeclaration, c: CpuCensus, shape: Canon.CpuVector, layout: CpuLayout) ?W.CpuDeclaration {
+    const reqs = [5]usize{ c.alu, c.binary, c.shift, c.ls - c.dword, c.dword };
+    const actual = Canon.cpuVector(d);
+    // Flat proofs require each optional bridge and every tail to have work.
+    // Use the same presence-preserving fit as the flat receiver's producer.
+    const padded = canonFit(d, actual, shape, reqs) orelse return null;
+    layout.validateGeometry(padded.geometry) catch return null;
+    const physical = Canon.cpuVector(padded);
+    if (!std.mem.eql(u32, &physical, &shape)) return null;
+    return padded;
+}
+fn roleRows(shape: Canon.CpuVector) u64 {
+    var rows: u64 = 0;
+    for (shape) |log| if (log != 0) {
+        rows += @as(u64, 1) << @intCast(log);
+    };
+    return rows;
+}
+
 fn canonFit(d: W.CpuDeclaration, actual: Canon.CpuVector, rung: Canon.CpuVector, counts: [5]usize) ?W.CpuDeclaration {
     var v = actual;
     for (actual, rung, 0..) |a, r, c| {

@@ -6,6 +6,15 @@ The production proof receiver and its fail-closed admission are unchanged.
 
 ## Host numerical checks
 
+`test-rv64-guest-execution` checks the same execution core that the CUDA
+kernel uses against the Zig RV64 reference, the standard-library hash
+functions and wide-integer arithmetic. It covers the RV64IM/Zbb opcode set,
+window continuation, register clocks, and the supported service packets.
+
+```sh
+zig build test-rv64-guest-execution --build-file src/integrations/riscv_cuda/build.zig -Doptimize=ReleaseFast -j2
+```
+
 `independent_field.py` compiles the actual CUDA arithmetic header on the host
 and checks basis, edge and random products against an independent schoolbook
 Python polynomial tower. The host shim declares no CUDA driver functions and
@@ -28,6 +37,85 @@ protocol oracle gate. That gate and full receiver parity remain pending.
 Use CUDA >=12.8 with support for `sm_89` and `sm_120`. Match toolkit headers,
 compiler and libraries; install NVTX3 headers for the existing context runtime.
 `CUDA_HOME` and `NVTX_INCLUDE` below are explicit toolchain locations.
+
+The guest execution smoke test transfers compact records and register
+checkpoints directly between CUDA contexts on the same device, then runs the
+existing CPU witness unpacker. It checks the expanded witness and terminal
+machine state. Eight halt positions and a service-capacity fault around 256-row
+checkpoints exercise the retired prefix, untouched suffix, seeds and final clocks.
+Keccak, secp256k1, copy and fill cases compare the warp path with
+scalar execution, including the output RAM, event order and packet rejection
+when the event buffer is too small. The same cases compare device RAM
+predecessor clocks and sorted boundaries with an independent ordered scan,
+then pass the device terminal cells to the CUDA boundary witness builder.
+
+```sh
+"$CUDA_HOME/bin/nvcc" -O2 -std=c++17 -arch=sm_120 \
+  -Isrc/backends/cuda/native -I"$NVTX_INCLUDE" \
+  src/backends/cuda/native/rv64/guest_execution/guest.cu \
+  src/backends/cuda/native/rv64/cpu_witness.cu \
+  src/backends/cuda/native/rv64/memory_witness.cu \
+  src/backends/cuda/native/runtime/context.cu \
+  tests/cuda/rv64/guest_execution_smoke.cu \
+  -Xcompiler=-pthread -ldl -o /tmp/rv64-guest-execution-smoke
+/tmp/rv64-guest-execution-smoke
+```
+
+## GPU execution contract
+
+Each launch retires a bounded window on device. The decoded immutable program
+can be shared by independent guests. Each guest owns its RAM, registers,
+records, 256-row register checkpoints and RAM events. The consumer uses the
+produced prefixes and orders their reads before reusing the output buffers.
+For ROM execution, the service stages the original decoder rows in its admitted
+boot scratch and packs them into a separate immutable plane. The compact entry
+checks its format and slot count. Each slot has an eight-byte header, with an
+exact 64-bit side entry for large immediates. Raw and prepared-run entry points
+retain their original contracts. The compact path emits the same records,
+events and seeds, including at permission faults and instruction limits.
+
+Register clocks start at zero in each window. ROM mode writes the existing
+compact witness record format, with the untaken fact index supplied by the
+receiver-owned ROM. The caller supplies an exact page-aligned guest memory
+map and authorizes the final PC and halt/output state at the product boundary.
+
+The installed single-GPU Ethereum service can select CUDA guest execution with
+`resources.guest_execution = "cuda"`. It loads the pinned ELF and input, checks
+the terminal PC and output, and sends the completed windows through the
+ordered RAM and service collector. One warp handles each guest, with a
+leader executing scalar instructions and the warp running Keccak, secp256k1,
+copy and fill calls.
+The next GPU window can run while the host formats the
+previous one. Two device slots keep compact CPU records and checkpoints alive
+through the proof worker's same-device copies. The ordered RAM and service
+collector reads execution records and RAM events back to construct the
+current proof jobs. Request receipts report trace readback, compact
+device-to-device bytes and proof slab readback separately. Streaming capture
+skips host CPU metadata when the proof worker reads the device records.
+The portable upload releases its CPU metadata after serialization. Both
+release load/store records and grouped ordinary provider facts after the
+capture ring owns them. The ledger and service truth inputs retain the data
+needed for complete-block closure. Timers distinguish
+device execution, boot, trace readback, host projection, proof-job
+publication and slot waits. Projection and device execution can overlap.
+
+Use the existing live basket harness with freshly pinned producer, receiver
+and CUDA libraries. It verifies every recursive root in a fresh CPU process
+before generating a report or starting the matched CPU comparison. Guest
+retirements must match the receiver's authenticated count through the
+terminal PC. The halt-flag census is preserved as a separate measurement.
+
+```sh
+python3 scripts/rv64_m8_bench15.py live \
+  --assets "$ASSETS" --workload "$WORKLOAD" --out "$RESULTS" \
+  --guest-execution cuda --compare-cpu
+```
+
+Use `--blocks 24628607` for a single-block qualification. The live path still
+uses an installed class roster. Device-resident RAM and service projection
+would remove the staged trace transfers.
+
+## GPU proof-stage checks
 
 ```sh
 "$CUDA_HOME/bin/nvcc" -O3 -std=c++17 \

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a complete resident image from generated CPU and 15-role truth AOTs.
+"""Build a complete resident image from generated CPU and truth AOTs.
 
 Every compiler owns a process-group deadline. This builds one coherent truth
 catalogue, never combines cached kernels with a different partition geometry.
@@ -25,9 +25,19 @@ from scripts.rv64 import rv64_cuda_partition_grouped as Grouped
 from scripts.rv64 import rv64_cuda_partition_instruction_slices as Instructions
 
 
+# The appended wide CPU slot preserves the installed narrow image ABI.
+NARROW_CORE_ROLES = 49
+WIDE_CORE_ROLES = NARROW_CORE_ROLES + 1
+
+
 def core_catalog(directory):
     sources, symbols, groups = [], [], []
-    for role in range(49):
+    count = WIDE_CORE_ROLES if (directory / f"case-{NARROW_CORE_ROLES}-domain.cu").is_file() else NARROW_CORE_ROLES
+    for source in directory.glob("case-*-domain.cu"):
+        match = re.fullmatch(r"case-(\d+)-domain\.cu", source.name)
+        if not match or int(match[1]) >= count:
+            raise ValueError(f"unexpected CPU role source: {source}")
+    for role in range(count):
         source = directory / f"case-{role}-domain.cu"
         text = source.read_text()
         symbol = f"rv64_joined_domain_{role}"
@@ -46,8 +56,8 @@ def core_catalog(directory):
 
 def truth_sources(raw, partitions):
     manifest = json.loads((partitions / "partition.json").read_text())
-    if len(manifest["roles"]) != 15:
-        raise ValueError("complete image requires all fifteen truth roles")
+    if len(manifest["roles"]) != Grouped.TRUTH_ROLE_COUNT:
+        raise ValueError(f"complete image requires all {Grouped.TRUTH_ROLE_COUNT} truth roles")
     available = {}
     for directory in (raw, partitions):
         for source in directory.rglob("*.cu"):
@@ -87,8 +97,11 @@ def global_sources(directory):
 def outer_sources(directory):
     manifest = json.loads((directory / "outer-manifest.json").read_text())
     groups = manifest.get("groups", [])
-    if manifest.get("profile") != "native-om31-circuit" or manifest.get("geometry_independent") is not True or len(groups) != 12:
+    if manifest.get("profile") != "native-om31-circuit" or manifest.get("geometry_independent") is not True or len(groups) not in (12, 13):
         raise ValueError("complete geometry-independent outer catalogue required")
+    if len(groups) == 13 and (groups[12].get("component"), groups[12].get("part"),
+                              groups[12].get("first"), groups[12].get("count")) != (1, 0, 0, 6):
+        raise ValueError("invalid mixed arithmetic evaluator group")
     sources = []
     for i, group in enumerate(groups):
         if group.get("id") != i or group.get("filename") != f"outer-group-{i}.cu":
@@ -121,7 +134,7 @@ def split_core(directory, build, roles, max_module_bytes=128 << 10):
     original, _ = core_catalog(directory)
     if max_module_bytes < 1:
         raise ValueError("positive core compiler-unit byte bound required")
-    if len(set(roles)) != len(roles) or any(role not in range(49) for role in roles):
+    if len(set(roles)) != len(roles) or any(role not in range(len(original)) for role in roles):
         raise ValueError("distinct existing core role IDs required")
     signature = "const uint32_t*,const uint32_t*,const uint32_t*,const uint64_t*,const uint32_t*,const uint32_t*,const uint32_t*,uint32_t*,uint32_t,uint32_t,uint32_t,uint32_t"
     lines = ["#pragma once", "#include <cuda_runtime.h>", "#include <cstdint>",
@@ -153,7 +166,7 @@ def split_core(directory, build, roles, max_module_bytes=128 << 10):
 extern "C" int stwo_rv64_composition_role_on(void *ctx,uint32_t lane,
     const StwoRv64CompositionRole *job,uint32_t *launches) {
   if (launches) *launches=0;
-  if (!job || !launches || job->role>=49) return int(cudaErrorInvalidValue);
+  if (!job || !launches || job->role>=sizeof(core_catalog)/sizeof(core_catalog[0])) return int(cudaErrorInvalidValue);
   const auto &span=core_catalog[job->role];
   StwoRv64CompositionRole local=*job; local.role=0;
   for (uint32_t i=0;i<span.count;++i) {
@@ -230,6 +243,7 @@ def main():
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--outer-circuit-dir", type=Path, help="Include the exact twelve-group OM31 outer circuit catalogue")
     parser.add_argument("--outer-hybrid-circuit-dir",type=Path,help="Include receiver-derived cyclic-Eq hybrid outer AIR")
+    parser.add_argument("--guest-aot-profile", type=Path, help="Build bounded CUDA regions from a hash-pinned guest ELF profile")
     parser.add_argument("--nvcc", default="/usr/local/cuda/bin/nvcc")
     parser.add_argument("--jobs", type=int, default=6)
     parser.add_argument("--compile-timeout", type=float, default=180)
@@ -251,18 +265,20 @@ def main():
     logs = build / "aot-logs"
     logs.mkdir(exist_ok=True)
     core, header = core_catalog(args.core_domain.resolve())
+    # INIT and TEARDOWN participate only in the joined composition.
+    role_count = len(core)
+    projection_count = role_count - 2
     (build / "real_composition_launches.h").write_text(header)
     if args.split_core_role:
         core = split_core(args.core_domain.resolve(), build, args.split_core_role, args.core_module_max_bytes)
     (build / "truth_composition_launches.h").write_bytes((args.truth_partitions / "truth_composition_launches.h").read_bytes())
     (build / "projection_fixture.h").write_bytes((root / "tests/cuda/rv64/projection_fixture.h").read_bytes())
     sources = core + truth_sources(args.truth_domain.resolve(), args.truth_partitions.resolve())
-    # The source projection catalogue is distinct from the 49 composition
-    # layouts. Keep its exact exported IDs, including the fixture ABI header.
+    # Projection and composition catalogues must describe the same image ABI.
     projections = sorted(args.core_projection.resolve().glob("case-*.cu"))
     ids = {int(re.fullmatch(r"case-(\d+)\.cu", p.name)[1]) for p in projections}
-    if ids != set(range(47)):
-        raise ValueError("complete image requires all 47 source projections")
+    if ids != set(range(projection_count)):
+        raise ValueError(f"complete image requires all {projection_count} source projections")
     sources.extend(projections)
     global_kernels, global_symbols = global_sources(args.global_projection.resolve())
     sources.extend(global_kernels)
@@ -271,7 +287,7 @@ def main():
     if args.outer_hybrid_circuit_dir:
         if not args.outer_circuit_dir: raise ValueError("hybrid outer requires original MAIN circuit catalogue")
         sources.extend(outer_hybrid_sources(args.outer_hybrid_circuit_dir.resolve()))
-    for role in range(15):
+    for role in range(Grouped.TRUTH_ROLE_COUNT):
         source = args.truth_rational / f"stwo_rv64_truth_projection_{role}.cu"
         result = Rational.partition(source.resolve(), build / "rational" / str(role), 16)
         sources.extend(map(Path, result))
@@ -322,6 +338,8 @@ def main():
         compiled = [obj for group in pool.map(compile_one, sources) for obj in group]
 
     command = [sys.executable, str(root / "scripts/rv64/rv64_cuda_native_library_build.py"), "--source-root", str(root), "--build", str(build / "native"), "--nvcc", args.nvcc, "--jobs", str(args.jobs), "--compile-timeout", str(args.compile_timeout), "--link-timeout", str(args.link_timeout), "--extra-native-source", "rv64/curve_witness.cu"]
+    if args.guest_aot_profile:
+        command += ["--guest-aot-profile", str(args.guest_aot_profile.resolve())]
     if device_link:
         command += ["--device-link"]
     if args.object_store:
@@ -339,7 +357,7 @@ def main():
     subprocess.run(command, check=True)
     library = build / "native/libstwo-rv64-native.so"
     image = ctypes.CDLL(str(library))
-    required = ["stwo_rv64_composition_role_on", "stwo_rv64_truth_composition_role_on", "stwo_rv64_curve_witness_on", "stwo_rv64_secp_witness_on"] + [f"stwo_rv64_truth_projection_{i}" for i in range(15)] + [f"launch_{i}" for i in range(47)]
+    required = ["stwo_rv64_composition_role_on", "stwo_rv64_truth_composition_role_on", "stwo_rv64_curve_witness_on", "stwo_rv64_secp_witness_on"] + [f"stwo_rv64_truth_projection_{i}" for i in range(Grouped.TRUTH_ROLE_COUNT)] + [f"launch_{i}" for i in range(projection_count)]
     if args.outer_circuit_dir:
         required += ["stwo_circuit_base_witness_on", "stwo_circuit_om31_fractions_on", "stwo_circuit_om31_cumulative_on", "stwo_circuit_om31_composition_identity", "stwo_circuit_om31_composition_role_on", "stwo_circuit_assignment_seed_on", "stwo_circuit_assignment_level_on", "stwo_circuit_assignment_capabilities", "stwo_fused_blake2s_v1_shadow_on", "stwo_circuit_assignment_chain_run_on", "stwo_circuit_assignment_chain_max_width", "stwo_circuit_outer_gkr_validate_on", "stwo_circuit_outer_gkr_layer_on", "stwo_circuit_outer_gkr_sum_on", "stwo_circuit_outer_gkr_fold_on", "stwo_circuit_outer_gkr_mask_on", "stwo_circuit_outer_gkr_binding_on"]
     if args.outer_hybrid_circuit_dir:
@@ -352,7 +370,9 @@ def main():
         image.stwo_circuit_assignment_capabilities.restype = ctypes.c_uint32
         if image.stwo_circuit_assignment_capabilities() & 0xffff != 0xffff:
             raise RuntimeError("native outer assignment executor lacks sixteen required kinds")
-    receipt = {"schema": "rv64-resident-image-build/v1", "cpu_roles": 49, "core_split_roles": args.split_core_role, "core_module_max_bytes": args.core_module_max_bytes, "truth_roles": 15, "global_projection_symbols": global_symbols, "bounded_aot_sources": lowering, "separable_device_sources": device_link, "outer_hybrid_manifest_sha256": N.sha(args.outer_hybrid_circuit_dir / "hybrid-outer-manifest.json") if args.outer_hybrid_circuit_dir else None, "outer_manifest_sha256": N.sha(args.outer_circuit_dir / "outer-manifest.json") if args.outer_circuit_dir else None, "library_sha256": N.sha(library), "source_sha256": {str(source): N.sha(source) for source in sources}, "gpu_qualified": False}
+    receipt = {"schema": "rv64-resident-image-build/v1", "cpu_roles": role_count, "projection_roles": projection_count, "core_split_roles": args.split_core_role, "core_module_max_bytes": args.core_module_max_bytes, "truth_roles": Grouped.TRUTH_ROLE_COUNT, "global_projection_symbols": global_symbols, "bounded_aot_sources": lowering, "separable_device_sources": device_link, "outer_hybrid_manifest_sha256": N.sha(args.outer_hybrid_circuit_dir / "hybrid-outer-manifest.json") if args.outer_hybrid_circuit_dir else None, "outer_manifest_sha256": N.sha(args.outer_circuit_dir / "outer-manifest.json") if args.outer_circuit_dir else None, "library_sha256": N.sha(library), "source_sha256": {str(source): N.sha(source) for source in sources}, "gpu_qualified": False}
+    if args.guest_aot_profile:
+        receipt["guest_aot"] = json.loads((build / "native" / "build.json").read_text())["guest_aot"]
     (build / "image-build.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(library)
 

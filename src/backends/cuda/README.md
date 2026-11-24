@@ -233,6 +233,21 @@ verification, timing, memory and scheduling still need NVIDIA hardware. The
 complete staged Cairo CLI can be cross-compiled locally with
 `zig build check-cairo-cuda-local -Dtarget=x86_64-linux-gnu`.
 
+### RV64 guest translation candidate
+
+The resident and native RV64 image builders accept `--guest-aot-profile` for
+qualifying static translation on a pinned guest. The JSON profile has schema
+`rv64-guest-aot/v1`, an `elf` path resolved relative to the profile, its
+`elf_sha256`, and a `regions` list of `{ "pc": N, "instructions": N }` entries.
+Supply up to 32 disjoint straight-line regions within executable pages. Each
+region has 2 to 16 instructions. The build receipt pins the emitted catalogue.
+
+The prepared CUDA executor checks each region against the admitted decoded ROM
+before the first use in a window. Region matching preserves the normal page,
+terminal PC, event capacity and checkpoint boundaries. A descriptor mismatch or
+unavailable region uses ordinary device execution. A build without a profile
+provides the prepared executor for matched GPU comparisons.
+
 ### Generated Cairo evaluation sources
 
 The 33 recorded-witness bodies in the 48-entry Native catalogue are emitted by

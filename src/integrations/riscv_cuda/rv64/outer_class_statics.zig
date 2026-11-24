@@ -53,10 +53,10 @@ fn samplePoints(a: std.mem.Allocator, key: *const Schema.Authority) !*core.pcs.T
 }
 
 const Catalogue = struct {
-    const Group = struct { component: u32, roots: u32, masks: []u32, slots: []u32 };
+    const Group = struct { role: u32, component: u32, roots: u32, masks: []u32, slots: []u32 };
     var mutex: std.Thread.Mutex = .{};
-    var groups: ?[]Group = null;
-    var identity: [32]u8 = undefined;
+    var groups: [2]?[]Group = @splat(null);
+    var identities: [2][32]u8 = undefined;
     const IdentityFn = *const fn (u32, [*]u8) callconv(.c) c_int;
     fn bodyIdentity(key: *const Schema.Authority) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -72,27 +72,40 @@ const Catalogue = struct {
         mutex.lock();
         defer mutex.unlock();
         const body = bodyIdentity(key);
-        if (groups) |g| {
-            if (!std.mem.eql(u8, &identity, &body)) return error.ChangedOm31CircuitProgram;
+        const variant = @intFromBool(key.pp.mixed_arithmetic);
+        if (groups[variant]) |g| {
+            if (!std.mem.eql(u8, &identities[variant], &body)) return error.ChangedOm31CircuitProgram;
             return g;
         }
         const a = std.heap.c_allocator;
         const ident = library.lookup(IdentityFn, "stwo_circuit_om31_composition_identity") orelse return error.MissingOuterCompositionKernel;
         const catalogue = try Aot.groups(a, &key.bound);
         defer a.free(catalogue);
+        if (catalogue.len != Aot.mixed_role_id) return error.InvalidOm31OuterCatalogue;
         const out = try a.alloc(Group, catalogue.len);
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |g| {
+                a.free(g.masks);
+                a.free(g.slots);
+            }
+            a.free(out);
+        }
         for (catalogue, out, 0..) |group, *dst, id| {
             var artifact = try Outer.record.record(a, &key.bound.components[group.component], group.part, group.first, group.count);
             defer artifact.deinit();
+            const role: u32 = if (key.pp.mixed_arithmetic and group.component == Aot.mixed_component) Aot.mixed_role_id else @intCast(id);
             var actual: [64]u8 = undefined;
-            if (ident(@intCast(id), &actual) != 0) return error.Om31OuterAotIdentityMismatch;
+            if (ident(role, &actual) != 0) return error.Om31OuterAotIdentityMismatch;
             if (!std.mem.eql(u8, actual[0..32], &artifact.program.identity) or !std.mem.eql(u8, actual[32..], &(try Code.identity(&artifact.program)))) return error.Om31OuterAotIdentityMismatch;
             const masks = try a.alloc(u32, artifact.program.inputs.len);
+            errdefer a.free(masks);
             for (masks, artifact.program.inputs) |*m, input| m.* = input.column;
-            dst.* = .{ .component = group.component, .roots = @intCast(artifact.program.roots.len), .masks = masks, .slots = try a.dupe(u32, artifact.parameter_slots) };
+            dst.* = .{ .role = role, .component = group.component, .roots = @intCast(artifact.program.roots.len), .masks = masks, .slots = try a.dupe(u32, artifact.parameter_slots) };
+            made += 1;
         }
-        groups = out;
-        identity = body;
+        groups[variant] = out;
+        identities[variant] = body;
         return out;
     }
 };
@@ -192,7 +205,8 @@ const Rc = struct {
                 try params.appendSlice(a, &entry);
             }
             role.* = .{
-                .id = @intCast(id),
+                .id = group.role,
+                .component = group.component,
                 .trace_log = rl,
                 .eval_log = el,
                 .widths = .{ @intCast(component.preprocessed_indices.len), @intCast(main.end - main.start), @intCast(inter.end - inter.start) },
@@ -252,7 +266,7 @@ pub const Statics = struct {
     refs: u32 = 0,
     last_use: u64 = 0,
 
-    pub fn init(a: std.mem.Allocator, key: *const Schema.Authority, library: *std.DynLib, composition: bool) !*Statics {
+    pub fn init(a: std.mem.Allocator, key: *const Schema.Authority, library: *std.DynLib, composition: bool, device_twiddles: bool) !*Statics {
         const self = try a.create(Statics);
         errdefer a.destroy(self);
         self.* = .{ .public = undefined, .allocator = a, .gather = undefined, .gathered = &.{} };
@@ -264,7 +278,9 @@ pub const Statics = struct {
         }
         var pairs: [Plan.n_components]usize = undefined;
         for (&pairs, std.enums.values(circuit.common.component_list.ComponentList)) |*p, kind| p.* = (circuit.witness.trace.RawLookupRows.count(kind) + 1) / 2;
-        var geometry = try Plan.Geometry.init(key.logs.toArray(), circuit.witness.trace.traceWidths(), pairs);
+        var widths = circuit.witness.trace.traceWidths();
+        if (key.pp.mixed_arithmetic) widths[1] += 4;
+        var geometry = try Plan.Geometry.init(key.logs.toArray(), widths, pairs);
         geometry.fixed_logs = &key.fixed_logs;
         for (&geometry.gather, self.gather) |*dst, src| dst.* = src;
         geometry.n_outputs = @intCast(key.pp.n_outputs);
@@ -294,7 +310,7 @@ pub const Statics = struct {
                 @memcpy(self.gathered[@as(usize, @intCast(offset)) + k * rows ..][0..rows], std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(values)));
             }
         }
-        self.public = .{ .identity = key.identity, .plan = plan, .gather = undefined, .gathered_fixed = self.gathered, .main_logs = undefined, .inter_logs = undefined };
+        self.public = .{ .identity = key.identity, .plan = plan, .gather = undefined, .gathered_fixed = self.gathered, .device_twiddles = device_twiddles, .main_logs = undefined, .inter_logs = undefined };
         for (&self.public.gather, self.gather) |*dst, src| dst.* = src;
         try self.addTable(plan.main.eval_log);
         if (composition) {
@@ -313,13 +329,18 @@ pub const Statics = struct {
             try self.addTable(self.rc.?.static.log);
             try self.addTable(self.rc.?.static.commitLog());
         }
-        TC.sortedLogs(&self.public.plan.main, &self.public.main_logs);
+        TC.sortedLogs(&self.public.plan.main, self.public.main_logs[0..main_logs.len]);
         TC.sortedLogs(&self.public.plan.inter, &self.public.inter_logs);
         return self;
     }
     fn addTable(self: *Statics, log: u32) !void {
-        if (log >= 29) return error.InvalidOuterTwiddles;
+        if (log >= self.public.tables.len) return error.InvalidOuterTwiddles;
         if (self.public.tables[log] != null) return;
+        if (self.public.device_twiddles) {
+            if (log < 2) return error.InvalidOuterTwiddles;
+            self.public.tables[log] = .{ .twiddles = &.{}, .itwiddles = &.{} };
+            return;
+        }
         const tw = try Twiddles.get(log);
         self.public.tables[log] = .{ .twiddles = tw.twiddles, .itwiddles = tw.itwiddles };
     }
@@ -386,18 +407,18 @@ pub const StaticsCache = struct {
     var budget: ?ClassPlan.Budget = null;
     var tick: u64 = 0;
     const Acquired = struct { statics: *Statics, owned: bool, counted: bool = false };
-    fn find(key: *const Schema.Authority, composition: bool) ?*Statics {
-        for (entries.items) |s| if (std.mem.eql(u8, &s.public.identity, &key.identity) and (s.rc != null) == composition) return s;
+    fn find(key: *const Schema.Authority, composition: bool, device_twiddles: bool) ?*Statics {
+        for (entries.items) |s| if (std.mem.eql(u8, &s.public.identity, &key.identity) and (s.rc != null) == composition and s.public.device_twiddles == device_twiddles) return s;
         return null;
     }
-    pub fn acquire(key: *const Schema.Authority, reusable: bool, library: *std.DynLib, composition: bool) !Acquired {
+    pub fn acquire(key: *const Schema.Authority, reusable: bool, library: *std.DynLib, composition: bool, device_twiddles: bool) !Acquired {
         const a = std.heap.c_allocator;
-        if (try ClassPlan.selected()) return acquireCounted(a, key, library, composition);
-        if (!reusable) return .{ .statics = try Statics.init(a, key, library, composition), .owned = true };
+        if (try ClassPlan.selected()) return acquireCounted(a, key, library, composition, device_twiddles);
+        if (!reusable) return .{ .statics = try Statics.init(a, key, library, composition, device_twiddles), .owned = true };
         mutex.lock();
         defer mutex.unlock();
-        if (find(key, composition)) |s| return .{ .statics = s, .owned = false };
-        const s = try Statics.init(a, key, library, composition);
+        if (find(key, composition, device_twiddles)) |s| return .{ .statics = s, .owned = false };
+        const s = try Statics.init(a, key, library, composition, device_twiddles);
         if (entries.items.len >= limit) return .{ .statics = s, .owned = true };
         entries.append(a, s) catch return .{ .statics = s, .owned = true };
         return .{ .statics = s, .owned = false };
@@ -430,18 +451,19 @@ pub const StaticsCache = struct {
     /// builds OUTSIDE the cache lock (leaf prestages of different classes run
     /// concurrently on the lanes' threads, 0.18-0.34 s each [M, feeder gate-c
     /// 24628607]); a racing builder of the same class keeps the first entry.
-    fn acquireCounted(a: std.mem.Allocator, key: *const Schema.Authority, library: *std.DynLib, composition: bool) !Acquired {
+    fn acquireCounted(a: std.mem.Allocator, key: *const Schema.Authority, library: *std.DynLib, composition: bool, device_twiddles: bool) !Acquired {
         {
             mutex.lock();
             defer mutex.unlock();
-            if (find(key, composition)) |s| return borrow(s);
+            if (find(key, composition, device_twiddles)) |s| return borrow(s);
             // Parsed before the build so no error can leak a built class.
-            if (budget == null) budget = .{ .limit = try ClassPlan.hostBudgetBytes() };
+            // Reserve the shared FFT/FRI domain cache within the class budget.
+            if (budget == null) budget = .{ .limit = try ClassPlan.hostBudgetBytes() - ClassPlan.geometry_bytes };
         }
-        const s = try Statics.init(a, key, library, composition);
+        const s = try Statics.init(a, key, library, composition, device_twiddles);
         mutex.lock();
         defer mutex.unlock();
-        if (find(key, composition)) |hit| {
+        if (find(key, composition, device_twiddles)) |hit| {
             s.destroy();
             return borrow(hit);
         }

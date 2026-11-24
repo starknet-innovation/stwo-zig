@@ -224,13 +224,51 @@ fn groupRoot(values: []const u32, pack: bool, step: u32, worst: *u16) Schema.Has
     return level[0];
 }
 
-/// Fold statement mirror: the node's outputs (4 words each) and its
-/// transcript checkpoint (9 words) from the children's regions; returns the
-/// child_binding verdict.
+fn serviceGroupDigest(program: Schema.Program, children: []const []const u32, digest: *Schema.Hash) ?Schema.BindDetail {
+    const w = program.words;
+    const n = Schema.service_group_members;
+    const first = w[Schema.P.outputs_at];
+    if (children.len != n or w[Schema.P.n_children] != n or w[Schema.P.n_outputs] != 8 or first > std.math.maxInt(u32) - n or
+        w[Schema.P.domain] != Schema.service_group_domain or w[Schema.P.version_word] != Schema.service_group_version) return .region;
+    const roots_at = 14 + 1 + 16;
+    const n_public = Schema.service_group_public_words;
+    const member_words = n_public + 8 + Schema.service_group_claim_words;
+    var message: [5 + n * member_words]u32 = undefined;
+    message[0..5].* = .{ w[Schema.P.domain], w[Schema.P.version_word], first, n, first + n };
+    for (children, 0..) |region, k| {
+        const child = program.child(k);
+        const image_at = child[Schema.C.image];
+        const image_words = child[Schema.C.image_words];
+        const tail_at = @as(usize, image_at) + image_words;
+        if (image_at < 2 or image_words < roots_at + 16 or region.len < tail_at + 4 * Schema.service_group_tail_seeds or
+            region[0] == 0 or region[0] > @as(u64, image_at - 1) * 4) return .region;
+        const image = region[image_at..][0..image_words];
+        if (image[0] != Schema.image_magic or image[1] != 2) return .magic;
+        if (!std.mem.eql(u32, image[roots_at..][0..8], child[Schema.C.fixed_root..][0..8])) return .fixed_root;
+        const tail = region[tail_at..][0 .. 4 * Schema.service_group_tail_seeds];
+        const frame = message[5 + k * member_words ..][0..member_words];
+        for (frame[0..n_public], 0..) |*word, i| {
+            const seed = tail[8 * i ..][0..8];
+            if (seed[0] > 0xffff or seed[4] > 0xffff or (seed[1] | seed[2] | seed[3] | seed[5] | seed[6] | seed[7]) != 0)
+                return .noncanonical;
+            word.* = seed[0] | (seed[4] << 16);
+        }
+        if (frame[0] != first + @as(u32, @intCast(k))) return .identity;
+        @memcpy(frame[n_public..][0..8], image[roots_at + 8 ..][0..8]);
+        const claim = tail[8 * n_public ..][0..Schema.service_group_claim_words];
+        for (claim) |word| if (word >= Schema.modulus) return .noncanonical;
+        @memcpy(frame[n_public + 8 ..], claim);
+    }
+    digest.* = Schema.blakeWords(&.{&message});
+    return null;
+}
+
+/// The node's outputs (4 words each) and its transcript checkpoint (9 words)
+/// from the children's regions. Returns the child_binding verdict.
 pub fn statementHost(program: Schema.Program, children: []const []const u32, outputs: []u32, checkpoint: *[9]u32) u32 {
     const w = program.words;
     const kind = w[Schema.P.statement];
-    if (kind != 1 and kind != 2) return reject(bind_check, Schema.BindDetail.region);
+    if (kind < 1 or kind > 3) return reject(bind_check, Schema.BindDetail.region);
     var worst: u16 = 0xffff;
     const n_self = w[Schema.P.n_outputs];
     if (outputs.len < 4 * @as(usize, n_self)) return reject(bind_check, Schema.BindDetail.region);
@@ -243,34 +281,40 @@ pub fn statementHost(program: Schema.Program, children: []const []const u32, out
         };
         @memcpy(outputs[0 .. 4 * n_self], r[at..][0 .. 4 * n_self]);
     } else {
-        var msg: std.ArrayListUnmanaged(u32) = .empty;
-        const a = std.heap.page_allocator;
-        defer msg.deinit(a);
-        msg.appendSlice(a, &.{ w[Schema.P.domain], w[Schema.P.version_word] }) catch return reject(bind_check, Schema.BindDetail.region);
-        const profile = w[w[Schema.P.profile]..][0..8];
-        for (children, 0..) |region, k| {
-            const e = program.child(k);
-            const n_out = e[Schema.C.n_outputs];
-            if (region.len < @as(usize, e[Schema.C.image]) + e[Schema.C.image_words] or region[0] < 4 * (19 + 4 * n_out) or e[Schema.C.image] < 20 + 4 * n_out) {
-                worst = @min(worst, @intFromEnum(Schema.BindDetail.region));
-                continue;
+        const digest = if (kind == 3) blk: {
+            var result: Schema.Hash = undefined;
+            if (serviceGroupDigest(program, children, &result)) |detail| return reject(bind_check, detail);
+            break :blk result;
+        } else blk: {
+            var msg: std.ArrayListUnmanaged(u32) = .empty;
+            const a = std.heap.page_allocator;
+            defer msg.deinit(a);
+            msg.appendSlice(a, &.{ w[Schema.P.domain], w[Schema.P.version_word] }) catch return reject(bind_check, Schema.BindDetail.region);
+            const profile = w[w[Schema.P.profile]..][0..8];
+            for (children, 0..) |region, k| {
+                const e = program.child(k);
+                const n_out = e[Schema.C.n_outputs];
+                if (region.len < @as(usize, e[Schema.C.image]) + e[Schema.C.image_words] or region[0] < 4 * (19 + 4 * n_out) or e[Schema.C.image] < 20 + 4 * n_out) {
+                    worst = @min(worst, @intFromEnum(Schema.BindDetail.region));
+                    continue;
+                }
+                if (region[1] != Schema.wire_magic[0] or region[2] != Schema.wire_magic[1]) worst = @min(worst, @intFromEnum(Schema.BindDetail.magic));
+                if (!std.mem.eql(u32, region[3..11], profile)) worst = @min(worst, @intFromEnum(Schema.BindDetail.profile));
+                if (!std.mem.eql(u32, region[11..19], e[Schema.C.identity..][0..8])) worst = @min(worst, @intFromEnum(Schema.BindDetail.identity));
+                if (region[19] != n_out) worst = @min(worst, @intFromEnum(Schema.BindDetail.outputs));
+                const img = region[e[Schema.C.image]..];
+                const roots_at: usize = 14 + 1 + 16;
+                if (!std.mem.eql(u32, img[roots_at..][0..8], e[Schema.C.fixed_root..][0..8])) worst = @min(worst, @intFromEnum(Schema.BindDetail.fixed_root));
+                for (region[20..][0 .. 4 * n_out]) |v| if (v >= Schema.modulus) {
+                    worst = @min(worst, @intFromEnum(Schema.BindDetail.noncanonical));
+                };
+                msg.appendSlice(a, region[11..19]) catch {};
+                msg.appendSlice(a, img[roots_at..][0..8]) catch {};
+                msg.append(a, n_out) catch {};
+                msg.appendSlice(a, region[20..][0 .. 4 * n_out]) catch {};
             }
-            if (region[1] != Schema.wire_magic[0] or region[2] != Schema.wire_magic[1]) worst = @min(worst, @intFromEnum(Schema.BindDetail.magic));
-            if (!std.mem.eql(u32, region[3..11], profile)) worst = @min(worst, @intFromEnum(Schema.BindDetail.profile));
-            if (!std.mem.eql(u32, region[11..19], e[Schema.C.identity..][0..8])) worst = @min(worst, @intFromEnum(Schema.BindDetail.identity));
-            if (region[19] != n_out) worst = @min(worst, @intFromEnum(Schema.BindDetail.outputs));
-            const img = region[e[Schema.C.image]..];
-            const roots_at: usize = 14 + 1 + 16;
-            if (!std.mem.eql(u32, img[roots_at..][0..8], e[Schema.C.fixed_root..][0..8])) worst = @min(worst, @intFromEnum(Schema.BindDetail.fixed_root));
-            for (region[20..][0 .. 4 * n_out]) |v| if (v >= Schema.modulus) {
-                worst = @min(worst, @intFromEnum(Schema.BindDetail.noncanonical));
-            };
-            msg.appendSlice(a, region[11..19]) catch {};
-            msg.appendSlice(a, img[roots_at..][0..8]) catch {};
-            msg.append(a, n_out) catch {};
-            msg.appendSlice(a, region[20..][0 .. 4 * n_out]) catch {};
-        }
-        const digest = Schema.blakeWords(&.{msg.items});
+            break :blk Schema.blakeWords(&.{msg.items});
+        };
         for (0..n_self) |i| {
             const v = if (i < 8) digest[i] else 0;
             outputs[4 * i ..][0..4].* = .{ v & 0xffff, v >> 16, 0, 0 };

@@ -45,13 +45,13 @@ pub const Whole = struct {
 };
 
 /// Node buffers that live through PCS, allocated before the body so the PCS
-/// framing names real addresses. Only what the PCS opens (coefficients) and
-/// what composition reads lives this long; trees are transient (streamed) or,
-/// on the full-LDE path, held as before.
+/// framing names real addresses. Retained opening images share this lifetime
+/// with the source coefficients and composition inputs.
 const Held = struct {
     long: N.Long,
     composition: K.Buffer,
     composition_tree: ?K.Buffer,
+    composition_opening: ?TC.OpeningImage = null,
     rc_parameters: K.Buffer,
 };
 
@@ -239,11 +239,16 @@ pub const OuterNodeJob = struct {
         out.whole = whole;
         if (staged.statics.composition == null or staged.pcs_points == null) return error.OuterJobWholeStagingMissing;
         if (out.streams != null) out.composition_stream = try Comp.CommitStream.init(out.allocator, &staged.statics.composition.?, try TC.streamChunkWords(), kernels.compact_eager);
-        var placeholder = try out.request(null);
+        var placeholder = try out.placeholderRequest();
         defer out.freeRequest(&placeholder);
         // Framed once, here on the caller's thread (pre-stage side); stage()
-        // only binds the real coefficient addresses (native_pcs.bindColumn).
-        out.pcs = try Pcs.PcsJob.prepare(out.allocator, whole.pcs, placeholder, try Pcs.placeholderPoint(), whole.wide);
+        // only binds the real coefficient addresses.
+        const geometry = if (staged.statics.class_plan != null) &WholeBuild.geometry else null;
+        const placeholder_point = try Pcs.placeholderPoint();
+        out.pcs = if (out.staged.statics.device_twiddles)
+            try Pcs.PcsJob.prepareDevice(out.allocator, whole.pcs, placeholder, placeholder_point, whole.wide)
+        else
+            try Pcs.PcsJob.prepareWithGeometry(out.allocator, whole.pcs, placeholder, placeholder_point, whole.wide, geometry);
         try out.pcs.?.requireBorrowedTrees(out.allocator);
         out.pcs_plan = out.pcs.?.plan;
         _ = try out.layout.add(.opaque_words, pcs_index, @intCast(out.pcs.?.outputWords()));
@@ -283,10 +288,8 @@ pub const OuterNodeJob = struct {
         self.pcs_words = &.{};
     }
 
-    /// The PCS request of this node: FIXED (class region), MAIN, INTER and
-    /// composition coefficients, all device resident; roots are placeholders
-    /// (the PCS echoes them; finish checks them against the committed roots).
-    fn request(self: *OuterNodeJob, held: ?Held) !D.Request {
+    /// Class geometry, with per-request device addresses bound at enqueue.
+    fn placeholderRequest(self: *OuterNodeJob) !D.Request {
         const a = self.allocator;
         const p = self.staged.plan();
         const cs = &self.staged.statics.composition.?;
@@ -300,30 +303,26 @@ pub const OuterNodeJob = struct {
                 return .{ .log_size = log, .device = .{ .words = ptr, .count = @as(u64, 1) << @intCast(log), .context_token = 1, .generation = 1 } };
             }
         };
-        const fixed_base: [*]const u32 = if (held != null) self.bases.at(cs.fixed) else fake;
         trees[0] = .{ .root = self.staged.fixed_root, .columns = &.{} };
         const cols0 = try a.alloc(D.Column, cs.fixed_offsets.len);
         trees[0].columns = cols0;
         made += 1;
-        for (cols0, cs.fixed_offsets, self.staged.fixed_logs) |*c, off, log| c.* = Col.col(log, fixed_base + @as(usize, @intCast(off)));
-        const main: [*]const u32 = if (held) |h| h.long.main_coef.ptr else fake;
+        for (cols0, self.staged.fixed_logs) |*c, log| c.* = Col.col(log, fake);
         trees[1] = .{ .root = @splat(0), .columns = &.{} };
         const cols1 = try a.alloc(D.Column, p.main.logs.len);
         trees[1].columns = cols1;
         made += 1;
-        for (cols1, p.main.logs, p.main.offsets) |*c, log, off| c.* = Col.col(log, main + @as(usize, @intCast(off)));
-        const inter: [*]const u32 = if (held) |h| h.long.inter_coef.ptr else fake;
+        for (cols1, p.main.logs) |*c, log| c.* = Col.col(log, fake);
         trees[2] = .{ .root = @splat(0), .columns = &.{} };
         const cols2 = try a.alloc(D.Column, p.inter.logs.len);
         trees[2].columns = cols2;
         made += 1;
-        for (cols2, p.inter.logs, p.inter.offsets) |*c, log, off| c.* = Col.col(log, inter + @as(usize, @intCast(off)));
-        const comp: [*]const u32 = if (held) |h| h.composition.ptr else fake;
+        for (cols2, p.inter.logs) |*c, log| c.* = Col.col(log, fake);
         trees[3] = .{ .root = @splat(0), .columns = &.{} };
         const cols3 = try a.alloc(D.Column, cs.outputColumns());
         trees[3].columns = cols3;
         made += 1;
-        for (cols3, 0..) |*c, i| c.* = Col.col(cs.chunkLog(), comp + i * (@as(usize, 1) << @intCast(cs.chunkLog())));
+        @memset(cols3, Col.col(cs.chunkLog(), fake));
         const points: *const core.pcs.TreeVec([][]D.Point) = @ptrCast(@alignCast(self.staged.pcs_points.?));
         return .{ .scope = null, .config = try Outer.protocol.targetConfig(), .lifting_log_size = cs.commitLog(), .trees = trees, .points = points.* };
     }
@@ -355,18 +354,24 @@ pub const OuterNodeJob = struct {
 
     /// Static per-node peak from the class plan, in the worker's 64-word
     /// granules: staged inputs + buffers held through PCS + the largest phase
-    /// transient (FIXED recommit, MAIN, INTER, composition, PCS). With
-    /// streamed commits no phase holds an LDE image or a tree: the commit
-    /// transient is one chunk + two state banks.
+    /// transient (FIXED recommit, MAIN, INTER, composition, PCS). A streamed
+    /// source may retain its LDE and tree for the final PCS opening.
     /// One ordered schedule for both declaration and holdBuffers allocation.
     /// Zero-sized tree slots are omitted on the streamed path.
-    fn heldBufferWords(self: *const OuterNodeJob) [9]usize {
+    fn heldBufferWords(self: *const OuterNodeJob) [11]usize {
         const streamed = self.streams != null;
         const w = N.Long.words(self.staged.plan(), streamed);
-        var sizes = [_]usize{ w[0], w[1], w[2], w[3], w[4], w[5], 0, 0, 0 };
+        var sizes = [_]usize{ w[0], w[1], w[2], w[3], w[4], w[5], 0, 0, 0, 0, 0 };
+        if (self.whole) |whole| if (streamed and (whole.pcs.open_images != null or whole.pcs.open_node_images != null)) {
+            const p = self.staged.plan();
+            const nodes: [2]usize = if (whole.pcs.open_node_images != null) .{ @intCast(p.main.tree_words), @intCast(p.inter.tree_words) } else .{ 0, 0 };
+            sizes[9..11].* = TC.openingReservations(.{ TC.retainedWords(&p.main), TC.retainedWords(&p.inter) }, nodes);
+        };
         if (self.whole != null) if (self.staged.statics.composition) |*cs| {
             sizes[6] = @intCast(cs.coefficientWords());
-            sizes[7] = if (streamed) 0 else @intCast(cs.treeWords());
+            if (!streamed) sizes[7] = @intCast(cs.treeWords()) else if (self.whole.?.pcs.open_node_images != null) {
+                if (self.composition_stream) |*c| sizes[7] = TC.compositionReservation(sizes[9..11].*, &c.tree);
+            }
             sizes[8] = @as(usize, cs.param_total) * 8;
         };
         return sizes;
@@ -380,7 +385,8 @@ pub const OuterNodeJob = struct {
             }
         }.r;
         var held: u64 = 0;
-        for (self.heldBufferWords()) |w| if (w != 0) {
+        const held_sizes = self.heldBufferWords();
+        for (held_sizes) |w| if (w != 0) {
             held += g(w);
         };
         var widest_inter: u64 = 0;
@@ -390,14 +396,14 @@ pub const OuterNodeJob = struct {
             widest_inter = @max(widest_inter, (if (numerators == 0) 0 else g(numerators)) + g(prefix));
         }
         const eval = g(p.main.coefficient_words);
-        const main_commit: u64 = if (self.streams) |*st| st.main.scratchWords() else g(p.main.evaluation_words);
-        const inter_commit: u64 = if (self.streams) |*st| st.inter.scratchWords() else g(p.inter.evaluation_words);
+        const main_commit: u64 = if (self.streams) |*st| st.main.scratchWords(held_sizes[9] == TC.retainedWords(&p.main)) else g(p.main.evaluation_words);
+        const inter_commit: u64 = if (self.streams) |*st| st.inter.scratchWords(held_sizes[10] == TC.retainedWords(&p.inter)) else g(p.inter.evaluation_words);
         var phase = @max(@max(eval + g(self.staged.assignment.count * 4), eval + main_commit), @max(eval + widest_inter, inter_commit));
         const node = self.staged.image.words[@intFromEnum(St.Region.node)];
         const class = self.staged.image.words[@intFromEnum(St.Region.class)];
         var staged: u64 = g(node);
         if (self.packed_class) |compressed| {
-            staged += g(compressed.outputWords()) + g(12);
+            staged += g(compressed.outputWords()) + g(Packed.scratch_words);
         } else if (!self.persistentClass()) staged += g(class);
         var pinned_extra: u64 = 0;
         if (self.staged.statics.composition) |*cs| if (self.whole != null) {
@@ -410,7 +416,7 @@ pub const OuterNodeJob = struct {
                 if (!seen[r.eval_log]) buckets += g(@as(u64, 8) << @intCast(r.eval_log));
                 seen[r.eval_log] = true;
             }
-            const commit: u64 = if (self.composition_stream) |*c| c.stream.scratchWords() else g(@as(u64, cs.outputColumns()) << @intCast(cs.commitLog()));
+            const commit: u64 = if (self.composition_stream) |*c| c.stream.scratchWords(held_sizes[7] == TC.retainedWords(&c.tree)) else g(@as(u64, cs.outputColumns()) << @intCast(cs.commitLog()));
             phase = @max(phase, buckets + @max(widest, g(cs.coefficientWords()) + commit));
             phase = @max(phase, self.pcsReserveWords(cs));
             pinned_extra = self.pcs_plan.ingress_words;
@@ -420,7 +426,7 @@ pub const OuterNodeJob = struct {
                 // precommit handoff); commit scratch as a phase either way (a
                 // fresh persistent region is still committed in the node).
                 if (self.packed_class == null and !self.persistentClass() and self.fixed_handoff == null) staged += g(fp.coefficient_words);
-                const fixed_commit: u64 = if (self.streams) |*st| (if (st.fixed) |*f| f.scratchWords() else 0) else g(fp.evaluation_words) + g(fp.tree_words + fp.prefix_words);
+                const fixed_commit: u64 = if (self.streams) |*st| (if (st.fixed) |*f| f.scratchWords(false) else 0) else g(fp.evaluation_words) + g(fp.tree_words + fp.prefix_words);
                 phase = @max(phase, fixed_commit);
                 if (!self.require_warm and self.packed_class == null) pinned_extra += fp.coefficient_words;
             };
@@ -432,11 +438,12 @@ pub const OuterNodeJob = struct {
         // (JobWorkExceedsArena) if its real allocations do not fit.
         var device: u64 = staged + held + phase;
         if (self.declare_words) |cap| device = @min(device, cap);
+        const twiddle_upload = if (self.staged.statics.device_twiddles) 0 else self.staged.image.words[@intFromEnum(St.Region.twiddles)];
         return .{
             .device_words = @intCast(device),
             .staged_words = @intCast(staged),
             .slab_words = self.layout.words,
-            .pinned_words = @intCast(node + (if (self.require_warm) 0 else (if (self.packed_class) |compressed| compressed.words.len else class) + self.staged.image.words[@intFromEnum(St.Region.twiddles)]) + pinned_extra),
+            .pinned_words = @intCast(node + (if (self.require_warm) 0 else (if (self.packed_class) |compressed| compressed.words.len else class) + twiddle_upload) + pinned_extra),
         };
     }
 
@@ -456,45 +463,24 @@ pub const OuterNodeJob = struct {
         self.staged_packed = null;
         if (self.mode == .full and self.tail == null and self.whole == null) return error.OuterJobTailUnbound;
         if (self.staged.plan().geometry.beta != 1) return error.UnsupportedOuterJobBlowup;
-        const words = self.staged.image.words;
         var regions: [4][*]const u32 = undefined;
         regions[@intFromEnum(St.Region.fixed)] = undefined;
         if (self.packed_class) |compressed| {
-            const program = try s.persistent(compressed.key, compressed.words.len);
-            if (self.require_warm and program.fresh) return error.GpuNativeRecursionClassCold;
-            if (program.fresh) {
-                const pinned = try s.pinned(compressed.words.len);
-                @memcpy(pinned, compressed.words);
-                try s.upload(program.buffer, pinned);
-            }
-            const output = try s.alloc(compressed.outputWords());
-            self.staged_packed = .{ .class = compressed, .launch = self.packed_launch orelse return error.PackedClassDecoderMissing, .program = program.buffer, .output = output, .scratch = try s.alloc(12) };
-            regions[@intFromEnum(St.Region.fixed)] = output.ptr + compressed.class_words;
+            const program = try compressed.stageProgram(s, self.require_warm);
+            self.staged_packed = try compressed.stageDecode(s, program, self.packed_launch orelse return error.PackedClassDecoderMissing);
+            regions[@intFromEnum(St.Region.fixed)] = self.staged_packed.?.output.ptr + compressed.class_words;
         }
         for (St.uploaded) |region| {
-            const n = words[@intFromEnum(region)];
-            const buffer: api.DeviceBuffer, const fresh = switch (region) {
-                .node => .{ try s.alloc(@intCast(@max(n, 1))), true },
-                .class => blk: {
-                    if (self.packed_class) |compressed| break :blk .{ try self.staged_packed.?.output.slice(0, compressed.class_words), false };
-                    if (!self.persistentClass()) break :blk .{ try s.alloc(@intCast(@max(n, 1))), true };
-                    const p = try s.persistent(self.staged.classRegionKey(), @intCast(@max(n, 1)));
-                    break :blk .{ p.buffer, p.fresh };
-                },
-                .twiddles => blk: {
-                    const p = try s.persistent(self.staged.twiddleRegionKey(), @intCast(@max(n, 1)));
-                    break :blk .{ p.buffer, p.fresh };
-                },
-                .fixed => unreachable,
-            };
-            regions[@intFromEnum(region)] = buffer.ptr;
-            if (self.require_warm and fresh and region != .node) return error.GpuNativeRecursionClassCold;
-            if (fresh and n != 0) {
-                const pinned = try s.pinned(@intCast(n));
-                try self.staged.pack(region, pinned);
-                try s.upload(buffer, pinned);
-                self.report.staged_words[@intFromEnum(region)] = n;
+            const tag = @intFromEnum(region);
+            if (region == .class and self.staged_packed != null) {
+                regions[tag] = self.staged_packed.?.output.ptr;
+                continue;
             }
+            const resident = region == .twiddles or (region == .class and self.persistentClass());
+            const buffer = try self.staged.stageRegion(s, region, resident, self.require_warm and region != .node);
+            regions[tag] = buffer.buffer.ptr;
+            if (buffer.fresh and !(region == .twiddles and self.staged.statics.device_twiddles))
+                self.report.staged_words[tag] = self.staged.image.words[tag];
         }
         if (self.nodeFixed() and self.packed_class == null) {
             // FIXED coefficients: the lane's precommit handoff, else
@@ -520,7 +506,15 @@ pub const OuterNodeJob = struct {
             }
         }
         self.bases = .{ .regions = regions };
-        if (self.whole != null) self.pcs_pinned = try s.pinned(@intCast(self.pcs.?.ingressWords()));
+        if (self.pcs) |*pcs| {
+            if (pcs.prepared.geometry_only) {
+                const log = pcs.prepared.metadata.eval_log;
+                const fwd = self.staged.image.twiddles[log];
+                const inv = self.staged.image.itwiddles[log];
+                try pcs.bindTables(self.bases.at(fwd)[0..@intCast(fwd.words)], self.bases.at(inv)[0..@intCast(inv.words)]);
+            }
+            self.pcs_pinned = try s.pinned(@intCast(pcs.ingressWords()));
+        }
     }
 
     /// Node buffers that live through PCS. Allocated in the job's work window
@@ -531,7 +525,7 @@ pub const OuterNodeJob = struct {
     fn holdBuffers(self: *OuterNodeJob, e: *Heap.Heap) !void {
         const p = self.staged.plan();
         const cs = &self.staged.statics.composition.?;
-        var b: [9]?K.Buffer = @splat(null);
+        var b: [11]?K.Buffer = @splat(null);
         const sizes = self.heldBufferWords();
         for (sizes) |n| try Plan.requireIndexable(&.{n});
         // Refuse before the body: every commit transient of this node. The
@@ -553,10 +547,30 @@ pub const OuterNodeJob = struct {
             const d = try e.alloc(n);
             out.* = .{ .ptr = d.ptr, .words = d.words };
         };
-        self.held = .{ .long = .{ .main_coef = b[0].?, .inter_coef = b[1].?, .main_tree = b[2], .inter_tree = b[3], .parameters = b[4].?, .powers = b[5].? }, .composition = b[6].?, .composition_tree = b[7], .rc_parameters = b[8].? };
-        var r = try self.request(self.held.?);
-        defer self.freeRequest(&r);
-        for (r.trees, 0..) |tree, t| for (tree.columns, 0..) |column, c| try self.pcs.?.bindColumn(t, c, column.device.?.words);
+        self.held = .{ .long = .{ .main_coef = b[0].?, .inter_coef = b[1].?, .main_tree = b[2], .inter_tree = b[3], .parameters = b[4].?, .powers = b[5].? }, .composition = b[6].?, .composition_tree = if (self.composition_stream == null) b[7] else null, .rc_parameters = b[8].? };
+        self.pcs.?.source_images = null;
+        var images: Pcs.SourceImages = .{};
+        for ([_]*const Plan.TreePlan{ &p.main, &p.inter }, b[9..11], 0..) |tree, held_image, i| {
+            if (held_image) |image| {
+                const opening = try TC.OpeningImage.init(tree, image);
+                self.held.?.long.opening_images[i] = opening;
+                images.retain(@intCast(i + 1), image.ptr, image.words, opening.evaluations == null);
+            }
+        }
+        if (self.composition_stream) |*c| if (b[7]) |image| {
+            const opening = try TC.OpeningImage.init(&c.tree, image);
+            self.held.?.composition_opening = opening;
+            images.retain(3, image.ptr, image.words, opening.evaluations == null);
+        };
+        if (b[9] != null or b[10] != null or images.trees[3].words != null) self.pcs.?.source_images = images;
+        const held = self.held.?;
+        const pcs = &self.pcs.?;
+        try pcs.bindTree(0, self.bases.at(cs.fixed)[0..@intCast(cs.fixed.words)], cs.fixed_offsets);
+        try pcs.bindTree(1, held.long.main_coef.ptr[0..held.long.main_coef.words], p.main.offsets);
+        try pcs.bindTree(2, held.long.inter_coef.ptr[0..held.long.inter_coef.words], p.inter.offsets);
+        const stride = @as(usize, 1) << @intCast(cs.chunkLog());
+        if (held.composition.words != cs.outputColumns() * stride) return error.InvalidPcsColumn;
+        for (0..cs.outputColumns()) |c| try pcs.bindColumn(3, c, held.composition.ptr + c * stride);
     }
 
     const TailState = struct {
@@ -584,6 +598,7 @@ pub const OuterNodeJob = struct {
                 .parameters = held.rc_parameters.ptr,
                 .output = held.composition,
                 .tree = held.composition_tree,
+                .opening = held.composition_opening,
                 .commit = if (nj.composition_stream) |*c| c else null,
                 .root_out = in.section + Plan.Section.composition_root,
                 .status = in.section + Plan.Section.status + 2,
@@ -784,6 +799,9 @@ fn wholeSignature(kernels: *const K.Kernels, whole: Whole) !CP.Signature {
 }
 
 const WholeBuild = struct {
+    // Cached whole plans can outlive any request or worker. Their immutable
+    // FFT/FRI domain sections share this bounded, equally long-lived owner.
+    var geometry = Pcs.GeometryCache.init(std.heap.c_allocator, CP.geometry_bytes);
     staged: *St.Staged,
     kernels: *const K.Kernels,
     whole: Whole,
@@ -813,6 +831,6 @@ fn clonePcs(a: std.mem.Allocator, template: *const Pcs.PcsJob) !Pcs.PcsJob {
     job.prepared.section_owned = @splat(false);
     job.prepared.owns_metadata = false;
     job.prepared.geometry = null;
-    job.descriptor = job.prepared.descriptor();
+    job.descriptor = job.prepared.geometryDescriptor();
     return job;
 }

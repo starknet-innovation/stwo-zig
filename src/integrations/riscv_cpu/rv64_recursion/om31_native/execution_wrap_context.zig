@@ -16,6 +16,7 @@ const Dag = @import("ready_dag.zig");
 const Pools = @import("stwo_prover_engine").work_pool;
 const ownership_owner = @import("execution_wrap_ownership.zig");
 const Pending = ownership_owner.Pending;
+const FoldClasses = ownership_owner.FoldClasses;
 const cached = ownership_owner.cached;
 const child = ownership_owner.child;
 const pipeline_owner = @import("execution_wrap_pipeline.zig");
@@ -49,6 +50,8 @@ pub const PreparedExecution = struct {
     frames: Root.Frames,
     timer: *std.time.Timer,
     existing_only: bool = false,
+    service_group: ?@import("truth_group.zig").Span = null,
+    prefix_source: ?std.fs.Dir = null,
     /// Sequential planned path only; parallel lanes carry their own factory.
     factory: ?Outer.Device.Factory = null,
     /// sched M6 streaming handoff: leaves open as native workers finish and
@@ -62,6 +65,7 @@ pub const ParallelExecution = struct {
     plan: *const Dag.Plan,
     dispatch: Dag.Dispatcher,
     nodes: []Node,
+    receiver_fold_classes: ?*FoldClasses = null,
     proofs: [Dag.max_nodes]?Pending = @splat(null),
     graph_ns: u64 = 0,
     wrap_ns: u64 = 0,
@@ -120,47 +124,84 @@ pub const ParallelExecution = struct {
         const spec = &self.plan.nodes[id];
         // Trace-only graphs for the receiver and the GPU circuit source; the
         // CPU outer prover (no factory) needs the builder assignment.
-        const trace_only = in.existing_only or (factory != null and factory.?.prepare_from_circuit != null);
+        const seed = if (in.service_group) |span| if (spec.first_leaf + spec.leaf_count <= span.first) in.prefix_source else null else null;
+        const trace_only = seed != null or in.existing_only or (factory != null and factory.?.prepare_from_circuit != null);
         if (!spec.isLeaf()) {
             var children: [Dag.max_arity]Bridge.Child = undefined;
             for (spec.kids(), 0..) |kid, i| children[i] = child(self.proofs[kid].?);
             const kids = children[0..spec.arity];
             const digest = try Bridge.expectedDigest(kids);
             var timer = try std.time.Timer.start();
+            const class_key = try Bridge.classKey(kids);
+            var name_buffer: [64]u8 = undefined;
+            const name = try std.fmt.bufPrint(&name_buffer, "fold-{d:0>6}.proof", .{id});
+            const receiver_classes = if (in.existing_only) self.receiver_fold_classes else null;
+            const held = if (receiver_classes) |classes| classes.find(class_key) else null;
+            // Verified children supply the geometry. Each node still needs its
+            // own proof checked against the digest of its actual children.
+            if (held) |entry| if (!receiver_classes.?.check) {
+                const encoded = (try cached(a, in.dir, name, true)) orelse return error.MissingRecursiveNodeProof;
+                defer a.free(encoded);
+                const proof = try a.create(Outer.Wrapped);
+                errdefer a.destroy(proof);
+                proof.* = try Outer.restoreWithAuthority(a, entry.pp, entry.authority, digest, encoded);
+                receiver_classes.?.hits += 1;
+                return .{ .pending = .{ .proof = proof, .node = id }, .restored = true, .retired_bytes = 0, .proof_ns = timer.read() };
+            };
             var graph = if (trace_only) try Bridge.buildFoldTraceOnly(a, kids) else try Bridge.buildFold(a, kids);
             defer graph.deinit();
             if (in.existing_only) try requireReceiverTrace(&graph.ctx);
             if (!std.mem.eql(u8, &digest, &graph.output_digest)) return error.RecursiveFoldDigest;
             const graph_ns = timer.lap();
-            var name_buffer: [64]u8 = undefined;
-            const name = try std.fmt.bufPrint(&name_buffer, "fold-{d:0>6}.proof", .{id});
             // Fold v2: topology-only producer caches key by geometry class.
-            Outer.Device.class_hint = try Bridge.classKey(kids);
+            Outer.Device.class_hint = class_key;
             defer Outer.Device.class_hint = null;
-            return self.wrap(a, &graph.ctx, digest, id, name, factory, graph_ns, &timer);
+            const outcome = try self.wrap(a, &graph.ctx, digest, id, name, factory, graph_ns, &timer, seed);
+            errdefer outcome.pending.deinit(a);
+            if (receiver_classes) |classes| {
+                if (held) |entry| {
+                    if (!std.mem.eql(u8, &entry.authority.identity, &outcome.pending.proof.authority.identity)) return error.FoldClassAuthorityMismatch;
+                    classes.checked += 1;
+                } else {
+                    try classes.adopt(class_key, outcome.pending.proof);
+                    classes.misses += 1;
+                }
+            }
+            return outcome;
         }
         const ordinal = spec.first_leaf;
         const worker = in.inventory.workers[ordinal];
         var timer = try std.time.Timer.start();
         const build_cpu = if (trace_only) &Graph.cpuTraceOnly else &Graph.cpu;
         const build_truth = if (trace_only) &Graph.truthTraceOnly else &Graph.truth;
-        var graph = if (ordinal < in.setups.len) try build_cpu(a, .{ .setup = in.setups[ordinal], .request = in.bundle.requests[ordinal], .expected = worker, .first = in.inventory.first_ids[ordinal], .manifest = in.manifest, .index = ordinal, .stage = &in.stages.stages[ordinal], .config = in.config, .encoded = &in.bundle.cpus[ordinal], .fixed = if (in.fixed) |authority| authority.at(ordinal) else null }) else try build_truth(a, .{ .truth = in.truths[ordinal - in.setups.len], .expected = worker, .manifest = in.manifest, .config = in.config, .encoded = &in.bundle.truths[ordinal - in.setups.len], .fixed = if (in.fixed) |authority| authority.at(ordinal) else null });
+        const grouped = spec.leaf_count != 1;
+        var graph = if (grouped) blk: {
+            const span = in.service_group orelse return error.ServiceGroupMembership;
+            if (spec.leaf_count != 3 or ordinal != span.first or ordinal < in.setups.len) return error.ServiceGroupMembership;
+            const fixed = in.fixed orelse return error.ServiceGroupRequiresFixedAuthority;
+            var inputs: [3]Graph.TruthInput = undefined;
+            for (&inputs, ordinal..) |*input, index| {
+                const i = index - in.setups.len;
+                input.* = .{ .truth = in.truths[i], .expected = in.inventory.workers[index], .manifest = in.manifest, .config = in.config, .encoded = &in.bundle.truths[i], .fixed = fixed.at(index) };
+            }
+            break :blk try Graph.truthGroup(a, span, inputs, in.words[ordinal..][0..3], trace_only);
+        } else if (ordinal < in.setups.len) try build_cpu(a, .{ .setup = in.setups[ordinal], .request = in.bundle.requests[ordinal], .expected = worker, .first = in.inventory.first_ids[ordinal], .manifest = in.manifest, .index = ordinal, .stage = &in.stages.stages[ordinal], .config = in.config, .encoded = &in.bundle.cpus[ordinal], .fixed = if (in.fixed) |authority| authority.at(ordinal) else null }) else try build_truth(a, .{ .truth = in.truths[ordinal - in.setups.len], .expected = worker, .manifest = in.manifest, .config = in.config, .encoded = &in.bundle.truths[ordinal - in.setups.len], .fixed = if (in.fixed) |authority| authority.at(ordinal) else null });
         defer graph.deinit();
         if (in.existing_only) try requireReceiverTrace(graph.ctx);
-        if (!std.mem.eql(u32, graph.words, in.words[ordinal])) return error.RecursiveLeafFrame;
+        if (!grouped and !std.mem.eql(u32, graph.words, in.words[ordinal])) return error.RecursiveLeafFrame;
         const graph_ns = timer.lap();
         var name_buffer: [64]u8 = undefined;
-        const name = try std.fmt.bufPrint(&name_buffer, "leaf-{d:0>6}.proof", .{ordinal});
-        return self.wrap(a, graph.ctx, graph.digest, id, name, factory, graph_ns, &timer);
+        const name = try @import("publication.zig").leafName(&name_buffer, ordinal, spec.leaf_count);
+        return self.wrap(a, graph.ctx, graph.digest, id, name, factory, graph_ns, &timer, seed);
     }
-    pub fn wrap(self: *ParallelExecution, a: std.mem.Allocator, ctx: *@import("common.zig").Context, digest: [32]u8, id: usize, name: []const u8, factory: ?Outer.Device.Factory, graph_ns: u64, timer: *std.time.Timer) !Outcome {
-        const encoded = try cached(a, self.input.dir, name, self.input.allow_resume);
-        if (self.input.existing_only and encoded == null) return error.MissingRecursiveNodeProof;
+    pub fn wrap(self: *ParallelExecution, a: std.mem.Allocator, ctx: *@import("common.zig").Context, digest: [32]u8, id: usize, name: []const u8, factory: ?Outer.Device.Factory, graph_ns: u64, timer: *std.time.Timer, prefix: ?std.fs.Dir) !Outcome {
+        const encoded = try cached(a, prefix orelse self.input.dir, name, prefix != null or self.input.allow_resume);
+        if ((prefix != null or self.input.existing_only) and encoded == null) return error.MissingRecursiveNodeProof;
         defer if (encoded) |bytes| a.free(bytes);
         const proof = try a.create(Outer.Wrapped);
         errdefer a.destroy(proof);
         const wrap_start = timer.read();
-        proof.* = try Outer.wrapGraphOrLoadWithFactory(a, ctx, digest, encoded, @intCast(id), factory);
+        proof.* = try Outer.wrapGraphOrLoadWithFactory(a, ctx, digest, encoded, @intCast(id), if (prefix != null) null else factory);
         errdefer proof.deinit();
         const wrapped = timer.read();
         var serialized = wrapped;
@@ -181,10 +222,14 @@ pub const ParallelExecution = struct {
 /// topological order, so a parent always follows all of its children.
 pub fn runPreparedSequential(input: PreparedExecution, arity: usize) !Report {
     const a = input.allocator;
-    const plan = try Dag.Plan.initArity(input.inventory.workers.len, arity);
+    const workers = input.inventory.workers.len;
+    const plan = if (input.service_group) |span| try span.terminalPlan(workers, arity) else try Dag.Plan.initArity(workers, arity);
     const nodes = try a.alloc(Node, plan.count);
     defer a.free(nodes);
-    var shared = ParallelExecution{ .input = input, .options = .{ .lanes = &.{}, .pool_worker_budget = 0 }, .plan = &plan, .dispatch = .{ .queue = .{ .plan = &plan, .limit = std.math.maxInt(usize) } }, .nodes = nodes };
+    // Destroy all wrapped proof loans before their immutable class owner.
+    var classes = if (input.existing_only) FoldClasses.fromEnv(a) else null;
+    defer if (classes) |*owner| owner.deinit();
+    var shared = ParallelExecution{ .input = input, .options = .{ .lanes = &.{}, .pool_worker_budget = 0 }, .plan = &plan, .dispatch = .{ .queue = .{ .plan = &plan, .limit = std.math.maxInt(usize) } }, .nodes = nodes, .receiver_fold_classes = if (classes) |*owner| owner else null };
     defer for (shared.proofs[0..plan.count]) |proof| if (proof) |p| p.deinit(a);
     for (0..plan.count) |id| {
         std.log.info("rv64 OM31 recursion m3 node {d}/{d}: arity={d}", .{ id + 1, plan.count, plan.nodes[id].arity });
@@ -194,7 +239,8 @@ pub fn runPreparedSequential(input: PreparedExecution, arity: usize) !Report {
         shared.dispatch.queue.status[id] = .done;
         shared.dispatch.queue.completed += 1;
     }
-    if (input.existing_only and (shared.restored_leaves != input.inventory.workers.len or shared.restored_leaves + shared.restored_folds != plan.count)) return error.RecursiveReceiverMustRestoreAll;
+    if (input.existing_only and (shared.restored_leaves != physicalLeaves(input) or shared.restored_leaves + shared.restored_folds != plan.count)) return error.RecursiveReceiverMustRestoreAll;
+    if (classes) |owner| std.log.info("RECURSION_RECEIVER_FOLD_CLASSES builds={d} reuses={d} checked={d}", .{ owner.misses, owner.hits, owner.checked });
     const backend: []const u8 = if (input.existing_only) "cpu_trace_only_receiver" else if (input.factory != null and input.factory.?.prepare_from_circuit != null) "cuda_trace_only" else if (input.factory != null) "cuda_from_host_assignment" else "cpu";
     return finishPlanned(&shared, &plan, backend, null);
 }
@@ -228,6 +274,10 @@ pub const SchedulerInfo = struct { options: ParallelOptions, budget: *SharedBudg
 /// Root admission and publication shared by the planned paths. Binary trees
 /// keep tree.json schema 2 byte for byte; k-ary trees publish schema 3 with
 /// ordered child lists.
+fn physicalLeaves(input: PreparedExecution) usize {
+    return input.inventory.workers.len - @as(usize, if (input.service_group != null) 2 else 0);
+}
+
 pub fn finishPlanned(shared: *ParallelExecution, plan: *const Dag.Plan, backend: []const u8, scheduler_info: ?SchedulerInfo) !Report {
     const input = shared.input;
     const a = input.allocator;
@@ -247,7 +297,7 @@ pub fn finishPlanned(shared: *ParallelExecution, plan: *const Dag.Plan, backend:
     const tree = try treeJson(a, plan, nodes, input.frames);
     defer a.free(tree);
     if (input.existing_only) try Pub.requireBytes(input.dir, "tree.json", tree) else try Pub.write(input.dir, "tree.json", tree);
-    const n = input.inventory.workers.len;
+    const n = physicalLeaves(input);
     const folds = plan.count - n;
     const from_gpu = scheduler_info != null or input.factory != null;
     const report = Report{ .outer_shape = @tagName(Outer.shape()), .fold_arity = plan.arity, .outer_backend = backend, .assignment_source = if (input.existing_only) "none_receiver_trace_only" else if (std.mem.eql(u8, backend, "cuda_trace_only")) "gpu_original_circuit_dag" else "cpu_circuit_builder", .gpu_new_leaf_proofs = if (from_gpu) n - shared.restored_leaves else 0, .gpu_new_fold_proofs = if (from_gpu) folds - shared.restored_folds else 0, .leaf_proofs = n, .restored_leaves = shared.restored_leaves, .fold_proofs = folds, .restored_folds = shared.restored_folds, .peak_pending_authorities = shared.dispatch.queue.peak, .retired_preprocessed_bytes = shared.retired_bytes, .root_node = plan.root, .root_digest = info.digest, .root_authority = info.authority, .manifest = metadata.manifest.digest, .graph_ns = shared.graph_ns, .wrap_ns = shared.wrap_ns, .fold_ns = shared.fold_ns, .root_verify_ns = verify_ns, .total_ns = input.timer.read(), .root_proof_bytes = bytes.len };

@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
     source_owner_test.linkLibC();
     b.step("test-native-source-owner-dword", "Execute the exact shrunk LS-D64 source OWNER regression without compiling unrelated generators").dependOn(jobTestStep(b, source_owner_test, check_only));
     const outer_codec_root = b.createModule(.{ .root_source_file = b.path("rv64_outer_codec_test_root.zig"), .target = target, .optimize = optimize });
+    outer_codec_root.addImport("stwo_core", b.dependency("stwo_core", options).module("stwo_core"));
     const outer_codec_tests = b.addTest(.{ .root_module = outer_codec_root, .filters = &.{ "outer encode:", "seed program:", "gn-pack v2:" } });
     b.step("test-rv64-outer-codecs", "Exercise native chunk capture and outer proof/seed codecs against independent host oracles").dependOn(jobTestStep(b, outer_codec_tests, check_only));
     const worker_lifecycle_root = b.createModule(.{ .root_source_file = b.path("rv64_worker_lifecycle_test_root.zig"), .target = target, .optimize = optimize });
@@ -144,6 +145,8 @@ pub fn build(b: *std.Build) void {
     // cache policy and staged image, host tests without a GPU.
     const jobs_outer_root = b.createModule(.{ .root_source_file = b.path("rv64_jobs_outer_test_root.zig"), .target = target, .optimize = optimize });
     jobs_outer_root.addImport("stwo_cuda_backend", backend);
+    for ([_][]const u8{ "stwo_core", "stwo_prover_engine" }) |name|
+        jobs_outer_root.addImport(name, integration.import_table.get(name).?);
     for ([_]*std.Build.Module{ outer_codec_root, jobs_root, recursion_jobs_root, jobs_truth_root, jobs_sched_root, jobs_parity_root, jobs_outer_root }) |root|
         root.addImport("stwo_circuit_frontend", integration.import_table.get("stwo_circuit_frontend").?);
     const jobs_outer_tests = b.addTest(.{ .root_module = jobs_outer_root });
@@ -221,6 +224,32 @@ pub fn build(b: *std.Build) void {
     const run_numerical = b.addRunArtifact(numerical);
     numerical_step.dependOn(&run_numerical.step);
     test_step.dependOn(&run_numerical.step);
+
+    const guest_execution = b.createModule(.{
+        .root_source_file = b.path("../../../tests/cuda/rv64/guest_execution_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    guest_execution.addImport("stwo_riscv_frontend", frontend);
+    const guest_test = b.addTest(.{ .root_module = guest_execution });
+    guest_test.addCSourceFile(.{
+        .file = b.path("../../../tests/cuda/rv64/guest_execution_host.cpp"),
+        .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" },
+    });
+    guest_test.addIncludePath(b.path("../../backends/cuda/native"));
+    guest_test.linkLibC();
+    const guest_test_step = jobTestStep(b, guest_test, check_only);
+    b.step("test-rv64-guest-execution", "Compare CUDA guest execution against the RV64 CPU reference").dependOn(guest_test_step);
+    test_step.dependOn(guest_test_step);
+    const guest_capture = b.createModule(.{ .root_source_file = b.path("rv64/guest_capture.zig"), .target = target, .optimize = optimize });
+    guest_capture.addImport("stwo_riscv_frontend", frontend);
+    guest_capture.addImport("stwo_riscv_cpu_integration", cpu_integration);
+    const guest_capture_tests = b.addTest(.{ .root_module = guest_capture });
+    guest_capture_tests.linkLibC();
+    const guest_capture_step = jobTestStep(b, guest_capture_tests, check_only);
+    b.step("test-rv64-guest-capture", "Check guest device trace projection into RAM and service proof inputs").dependOn(guest_capture_step);
+    test_step.dependOn(guest_capture_step);
+
     const fixture_root = b.createModule(.{
         .root_source_file = b.path("rv64_composition_fixture_main.zig"),
         .target = target,

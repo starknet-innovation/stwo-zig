@@ -8,6 +8,26 @@ const Fixed = @import("stwo_riscv_cpu_integration").rv64_gkr_fixed_authority.Fix
 const OmScheme = @import("stwo_riscv_cpu_integration").rv64_gkr_worker_protocol.Scheme;
 const M = core.fields.m31.M31;
 
+test "shared device truth setup keeps the class and replaces the live call span" {
+    const a = std.testing.allocator;
+    const Keys = @import("keys.zig").Owner;
+    const suite = Key.Suite.experimentalFold4();
+    const image: @import("../../word16_execution/expected_image.zig").Owner = undefined;
+    var shared: Keys = .{ .allocator = a, .cpus = &.{}, .truths = &.{} };
+    defer shared.deinit();
+    const setup = previous: {
+        var first = try Keys.initProducerTruths(a, &image, &.{.{ .family = .sha256, .first_id = 1, .calls = 1, .logs = .{ 6, 0 } }}, suite, &shared);
+        defer first.deinit();
+        break :previous first.truths[0].sha256.setup;
+    };
+    var next = try Keys.initProducerTruths(a, &image, &.{.{ .family = .sha256, .first_id = 31, .calls = 3, .logs = .{ 6, 0 } }}, suite, &shared);
+    defer next.deinit();
+    try std.testing.expectEqual(setup, next.truths[0].sha256.setup);
+    try std.testing.expectEqual(@as(u32, 31), next.truths[0].first());
+    try std.testing.expectEqual(@as(u32, 3), next.truths[0].count());
+    try std.testing.expectEqual(@as(usize, 1), shared.sha256_owners.items.len);
+}
+
 const Fixture = struct {
     first: [32]M,
     second: [64]M,
@@ -136,6 +156,42 @@ fn warm(a: std.mem.Allocator, dir: []const u8, mode: SetupCache.Mode, columns: [
             try std.testing.expectError(error.RootOnlyFixedSetupKey, appendDigest(a, lease.key));
         },
     }
+}
+
+test "resident request retires cold setup under pressure and preserves held proof authority" {
+    const a = std.testing.allocator;
+    const limit = 1 << 20;
+    var session = try @import("resident_session.zig").Session.init(a, limit);
+    defer session.deinit();
+    session.setup = try SetupCache.Cache.init(a, BETA, .{ .mode = .prover, .fixed_setup_bytes = limit });
+    const cache = &session.setup.?;
+    var f = Fixture.init(3);
+    const columns = f.columns();
+    const builder = Builder{ .a = a, .columns = &columns };
+    try session.beginRequest();
+    const original = try cache.obtain(Component, "test-component", .{ .n = 1 }, false, builder);
+    var held = try cache.fixed.acquireFromKey(&original.key, BETA);
+    defer held.deinit();
+    const expected = try appendDigest(a, held.key);
+    const budget = cache.fixed.budgetAllocator();
+    const occupied = try budget.alloc(u8, limit / 2);
+    defer budget.free(occupied);
+    try std.testing.expectError(error.ResidentRequestAlreadyActive, session.beginRequest());
+    try std.testing.expectEqual(@as(usize, 1), cache.resident.count());
+    session.active = false;
+    try session.beginRequest();
+    defer session.active = false;
+    try std.testing.expectEqual(@as(usize, 0), cache.resident.count());
+    try std.testing.expectEqual(@as(usize, 0), cache.fixed.snapshot().keys);
+    try std.testing.expect(cache.fixed.budgetAllocator().ptr == budget.ptr);
+    try std.testing.expect(cache.fixed.snapshot().live_bytes >= occupied.len);
+    const rebuilt = try cache.obtain(Component, "test-component", .{ .n = 1 }, false, builder);
+    var current = try cache.fixed.acquireFromKey(&rebuilt.key, BETA);
+    defer current.deinit();
+    try std.testing.expectEqual(held.key.root, current.key.root);
+    try std.testing.expectEqual(held.key.identity, current.key.identity);
+    try std.testing.expectEqual(expected, try appendDigest(a, current.key));
+    try std.testing.expectEqual(expected, try appendDigest(a, held.key));
 }
 
 fn artifactFile(a: std.mem.Allocator, dir: []const u8) ![]u8 {

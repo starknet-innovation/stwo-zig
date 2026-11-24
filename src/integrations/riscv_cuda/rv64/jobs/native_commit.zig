@@ -14,9 +14,8 @@
 //! coefficient image stays a job-arena buffer for the PCS (column views in
 //! ORIGINAL order).
 const std = @import("std");
-const core = @import("stwo_core");
-const engine = @import("stwo_prover_engine");
 const api = @import("api.zig");
+const Circle = @import("circle_twiddles.zig");
 
 pub const Encoding = enum { evaluations, coefficients };
 /// Geometry only: fixed per class, known at stage time.
@@ -24,6 +23,14 @@ pub const Shape = struct { log_size: u32, encoding: Encoding };
 /// One input column at enqueue: device words in the job's exec context
 /// (`device`) or host words staged by `CommitPlan.stage` (`host`).
 pub const Input = struct { device: ?[*]const u32 = null, host: []const u32 = &.{} };
+
+/// An independently admitted immutable image of selected columns' LDEs
+/// at this rate. Offsets use coefficient words in original column order.
+pub const FixedEvaluations = struct {
+    buffer: api.DeviceBuffer,
+    offsets: []const ?usize,
+    populate: bool,
+};
 
 pub const MixedSegment = extern struct {
     columns: [*]const u32,
@@ -40,6 +47,7 @@ pub const B2n = *const fn ([*]const u32, usize, [*]u32, usize, u32, u32, [*]cons
 pub const N2bColumns = *const fn ([*]const u32, usize, [*]const u32, [*]u32, usize, u32, u32, [*]const u32, u32, u32, *anyopaque, *u32) callconv(.c) c_int;
 pub const N2bCompact = *const fn ([*]const u32, usize, [*]const u32, [*]u32, usize, u32, u32, [*]const u32, u32, u32, usize, ?*anyopaque, *u32) callconv(.c) c_int;
 pub const Tree = *const fn (*anyopaque, u32, [*]const MixedSegment, u32, u32, [*]u32, u64) callconv(.c) c_int;
+pub const TreeSeparatePrefix = *const fn (*anyopaque, u32, [*]const MixedSegment, u32, u32, [*]u32, u64, ?[*]u32, u64) callconv(.c) c_int;
 pub const PrefixWorkspace = *const fn ([*]const MixedSegment, u32, *u64) callconv(.c) c_int;
 const Copies = @import("column_copy_runs.zig");
 pub const CopyD2d = Copies.Copy;
@@ -51,6 +59,7 @@ pub const Symbols = struct {
     n2b_addressed: ?N2bAddressed = null,
     n2b_compact: ?N2bCompact = null,
     tree: Tree,
+    tree_separate_prefix: ?TreeSeparatePrefix = null,
     prefix_workspace: ?PrefixWorkspace,
     copy_d2d: CopyD2d,
     validate_allocation: ?Copies.Validate = null,
@@ -59,6 +68,7 @@ pub const Symbols = struct {
             .b2n = base.lookup(B2n, "stwo_ntt_b2n_columns_compact_on") orelse return error.MissingTraceCommitSymbol,
             .n2b_columns = base.lookup(N2bColumns, "stwo_lde_n2b_columns_on") orelse return error.MissingTraceCommitSymbol,
             .tree = base.lookup(Tree, "stwo_rv64_trace_tree_on") orelse return error.MissingTraceCommitSymbol,
+            .tree_separate_prefix = base.lookup(TreeSeparatePrefix, "stwo_rv64_trace_tree_separate_prefix_on"),
             .prefix_workspace = base.lookup(PrefixWorkspace, "stwo_rv64_trace_prefix_workspace_words"),
             .copy_d2d = base.lookup(CopyD2d, "stwo_exec_context_memcpy_d2d_async") orelse return error.MissingTraceCommitSymbol,
             .validate_allocation = base.lookup(Copies.Validate, "stwo_exec_context_validate_allocation"),
@@ -73,6 +83,9 @@ pub const Symbols = struct {
 pub const Committed = struct {
     coefficients: api.DeviceBuffer,
     root: [*]const u32,
+    node_storage: ?api.DeviceBuffer = null,
+    /// Exact sorted evaluations followed by the complete Merkle tree.
+    opening_image: ?api.DeviceBuffer = null,
     pub fn column(self: Committed, plan: *const CommitPlan, original: usize) api.DeviceBuffer {
         return .{ .ptr = self.coefficients.ptr + plan.offsets[original], .words = @as(usize, 1) << @intCast(plan.shapes[original].log_size) };
     }
@@ -90,7 +103,6 @@ pub const CommitPlan = struct {
     eval_cells: usize,
     eval_log: u32,
     tree_words: usize,
-    tw: engine.poly.twiddles.TwiddleTree([]core.fields.m31.M31),
     // Staged in phase 1.
     twiddles: ?api.DeviceBuffer = null,
     logs_device: ?api.DeviceBuffer = null,
@@ -136,17 +148,14 @@ pub const CommitPlan = struct {
             log.* = s.log_size;
         }
         const eval_log = max_log + beta;
-        var tw = try engine.poly.twiddles.precomputeM31(a, core.poly.circle.canonic.CanonicCoset.new(eval_log).circleDomain().half_coset);
-        errdefer engine.poly.twiddles.deinitM31(a, &tw);
-        return .{ .a = a, .shapes = own, .order = order, .offsets = offsets, .logs = logs, .beta = beta, .coefficient_cells = cells, .eval_cells = try std.math.mul(usize, cells, @as(usize, 1) << @intCast(beta)), .eval_log = eval_log, .tree_words = ((@as(usize, 2) << @intCast(eval_log)) - 1) * 8, .tw = tw, .host_offsets = host_offsets };
+        return .{ .a = a, .shapes = own, .order = order, .offsets = offsets, .logs = logs, .beta = beta, .coefficient_cells = cells, .eval_cells = try std.math.mul(usize, cells, @as(usize, 1) << @intCast(beta)), .eval_log = eval_log, .tree_words = ((@as(usize, 2) << @intCast(eval_log)) - 1) * 8, .host_offsets = host_offsets };
     }
     pub fn deinit(self: *CommitPlan) void {
-        engine.poly.twiddles.deinitM31(self.a, &self.tw);
         inline for (.{ "shapes", "order", "offsets", "logs", "host_offsets" }) |f| self.a.free(@field(self, f));
         self.* = undefined;
     }
     pub fn twiddleWords(self: *const CommitPlan) usize {
-        return self.tw.twiddles.len + self.tw.itwiddles.len;
+        return @as(usize, 1) << @intCast(self.eval_log);
     }
     /// Upper bound of enqueue-time arena words (coefficients + LDE + tree + prefix banks).
     pub fn deviceWords(self: *const CommitPlan) usize {
@@ -163,15 +172,9 @@ pub const CommitPlan = struct {
     /// and every host-encoded column (`inputs[i].host`, original order).
     pub fn stage(self: *CommitPlan, s: *api.Stager, inputs: []const Input) !void {
         if (inputs.len != self.shapes.len) return error.TraceCommitInputCount;
-        var key: [32]u8 = @splat(0);
-        @memcpy(key[0..16], "rv64-m8-trace-tw");
-        key[16] = @intCast(self.eval_log);
-        const tw = try s.persistent(key, self.twiddleWords());
+        const tw = try s.persistent(Circle.pairKey(self.eval_log), self.twiddleWords());
         if (tw.fresh and self.require_warm) return error.GpuNativeTwiddlesNotWarmed;
-        if (tw.fresh) {
-            try s.upload(try tw.buffer.slice(0, self.tw.twiddles.len), mWords(self.tw.twiddles));
-            try s.upload(try tw.buffer.slice(self.tw.twiddles.len, self.tw.itwiddles.len), mWords(self.tw.itwiddles));
-        }
+        if (tw.fresh) try Circle.fill(self.a, s, tw.buffer, self.eval_log, .both);
         self.twiddles = tw.buffer;
         const logs = try s.alloc(self.logs.len);
         try s.upload(logs, self.logs);
@@ -205,7 +208,7 @@ pub const CommitPlan = struct {
     /// arena range (legacy co-locates them), so enqueue allocates an aux region
     /// {forward twiddles, descriptors} right after the evaluations.
     fn auxWords(self: *const CommitPlan) usize {
-        return self.tw.twiddles.len + 7 * self.order.len;
+        return self.twiddleWords() / 2 + 7 * self.order.len;
     }
     /// Word offsets {coefficients, evaluations, aux} inside the one region the
     /// addressed path allocates. The {evaluations, aux} tail sits on the side
@@ -240,18 +243,33 @@ pub const CommitPlan = struct {
         const bases = self.addressedBases(self.placement);
         return if (self.placement == .bottom) .{ .ptr = region.ptr + bases[1], .words = region.words - bases[1] } else .{ .ptr = region.ptr, .words = bases[0] };
     }
+    /// Two sequential commits can share one worker-owned LDE plane. The caller
+    /// keeps the plane live until both trees have consumed their evaluations.
+    pub fn enqueueUsingEvaluations(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, root_out: api.DeviceBuffer, retain: bool, shared: ?api.DeviceBuffer) !Committed {
+        const workspace = shared orelse return self.enqueueWithNodes(sym, e, inputs, root_out, true, retain);
+        if (self.beta != 1 and sym.n2b_compact == null) return error.UnsupportedTraceCommitGeometry;
+        const evaluations = try workspace.slice(0, self.eval_cells);
+        return self.enqueueIntoWithNodes(sym, e, inputs, try e.alloc(self.coefficient_cells), root_out, true, retain, null, null, evaluations);
+    }
+
     /// Phase 2. `root_out`: 8-word slab field. `mix`: mix the root into e.channel.
     pub fn enqueue(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, root_out: api.DeviceBuffer, mix: bool) !Committed {
+        return self.enqueueWithNodes(sym, e, inputs, root_out, mix, false);
+    }
+
+    /// Keep the Merkle nodes in their original allocation through openings.
+    /// On older images `node_storage` also owns the packed prefix tail.
+    pub fn enqueueWithNodes(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, root_out: api.DeviceBuffer, mix: bool, retain: bool) !Committed {
         if (self.beta != 1 and sym.n2b_compact == null) {
             const region = try e.alloc(self.regionWords());
-            return self.enqueueAddressed(sym, e, inputs, region, root_out, mix);
+            return self.enqueueAddressed(sym, e, inputs, region, root_out, mix, retain);
         }
-        return self.enqueueInto(sym, e, inputs, try e.alloc(self.coefficient_cells), root_out, mix);
+        return self.enqueueIntoWithNodes(sym, e, inputs, try e.alloc(self.coefficient_cells), root_out, mix, retain, null, null, null);
     }
     /// beta >= 2 (the D2 native profile, blowup 4): the legacy arena path, in
     /// one `regionWords` allocation {coefficients, evaluations, aux}. Returns
     /// the coefficient view; the evaluation/aux tail is freed after the tree.
-    fn enqueueAddressed(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, region: api.DeviceBuffer, root_out: api.DeviceBuffer, mix: bool) !Committed {
+    fn enqueueAddressed(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, region: api.DeviceBuffer, root_out: api.DeviceBuffer, mix: bool, retain: bool) !Committed {
         const n2b = sym.n2b_addressed orelse return error.MissingTraceCommitSymbol;
         const descriptors = self.descriptors_device orelse return error.TraceCommitNotStaged;
         const tw = self.twiddles orelse return error.TraceCommitNotStaged;
@@ -264,7 +282,7 @@ pub const CommitPlan = struct {
         try self.ingressAndInterpolate(sym, e.ctx(), stream, inputs, coefficients);
         const base = region.ptr;
         const span = region.words;
-        const tw_words = self.tw.twiddles.len;
+        const tw_words = self.twiddleWords() / 2;
         try check(sym.copy_d2d(e.ctx(), aux.ptr, tw.ptr, tw_words * 4));
         try check(sym.copy_d2d(e.ctx(), aux.ptr + tw_words, descriptors.ptr, 7 * self.order.len * 4));
         var launches: u32 = 0;
@@ -284,9 +302,9 @@ pub const CommitPlan = struct {
             eval_offset += rows * (end - first);
             first = end;
         }
-        try self.treeAndRoot(sym, e, segments[0..segment_count], root_out, mix);
+        const nodes = try self.treeAndRoot(sym, e, segments[0..segment_count], root_out, mix, retain, null);
         e.free(self.tail(region));
-        return .{ .coefficients = coefficients, .root = root_out.ptr };
+        return .{ .coefficients = coefficients, .root = root_out.ptr, .node_storage = nodes };
     }
     fn ingressAndInterpolate(self: *const CommitPlan, sym: Symbols, ctx: *anyopaque, stream: *anyopaque, inputs: []const Input, coefficients: api.DeviceBuffer) !void {
         const tw = self.twiddles orelse return error.TraceCommitNotStaged;
@@ -299,7 +317,6 @@ pub const CommitPlan = struct {
         }
         try copies.finish();
         var launches: u32 = 0;
-        const inv = tw.ptr + self.tw.twiddles.len;
         var first: usize = 0;
         while (first < self.order.len) {
             const shape = self.shapes[self.order[first]];
@@ -311,11 +328,11 @@ pub const CommitPlan = struct {
             while (end < self.order.len and self.shapes[self.order[end]].log_size == shape.log_size and self.shapes[self.order[end]].encoding == .evaluations) : (end += 1) {}
             const rows = @as(usize, 1) << @intCast(shape.log_size);
             const at = coefficients.ptr + self.offsets[self.order[first]];
-            try check(sym.b2n(at, rows, at, rows, shape.log_size, @intCast(end - first), inv + self.tw.itwiddles.len - rows / 2, @intCast(rows / 2), @intCast(rows / 2), stream, &launches));
+            try check(sym.b2n(at, rows, at, rows, shape.log_size, @intCast(end - first), tw.ptr + self.twiddleWords() - rows / 2, @intCast(rows / 2), @intCast(rows / 2), stream, &launches));
             first = end;
         }
     }
-    fn treeAndRoot(self: *const CommitPlan, sym: Symbols, e: anytype, segments: []const MixedSegment, root_out: api.DeviceBuffer, mix: bool) !void {
+    fn treeAndRoot(self: *const CommitPlan, sym: Symbols, e: anytype, segments: []const MixedSegment, root_out: api.DeviceBuffer, mix: bool, retain: bool, owned_nodes: ?api.DeviceBuffer) !?api.DeviceBuffer {
         var prefix_rows: usize = 0;
         for (segments[0 .. segments.len - 1]) |s| prefix_rows = @max(prefix_rows, s.source_size);
         var prefix_words = prefix_rows * 48;
@@ -325,11 +342,17 @@ pub const CommitPlan = struct {
             if (words > prefix_words) return error.InvalidTracePrefixWorkspace;
             prefix_words = @intCast(words);
         }
-        const tree = try e.alloc(self.tree_words + prefix_words);
-        try checkAt(@src().line, sym.tree(e.ctx(), 0, segments.ptr, @intCast(segments.len), self.eval_log, tree.ptr, tree.words));
+        const tree = owned_nodes orelse try e.alloc(self.tree_words + prefix_words);
+        if (owned_nodes != null) {
+            const prefix = if (prefix_words != 0) try e.alloc(prefix_words) else null;
+            try checkAt(@src().line, sym.tree_separate_prefix.?(e.ctx(), 0, segments.ptr, @intCast(segments.len), self.eval_log, tree.ptr, tree.words, if (prefix) |b| b.ptr else null, prefix_words));
+            if (prefix) |b| e.free(b);
+        } else try checkAt(@src().line, sym.tree(e.ctx(), 0, segments.ptr, @intCast(segments.len), self.eval_log, tree.ptr, tree.words));
         try check(sym.copy_d2d(e.ctx(), root_out.ptr, tree.ptr + self.tree_words - 8, 32));
         if (mix) try e.channel.mixRootFromTree(.{ .ptr = root_out.ptr, .words = 8 });
+        if (retain) return tree;
         e.free(tree);
+        return null;
     }
     /// An input can share its own sorted column. Any other overlap with the
     /// destination needs a gather before interpolation can start overwriting it.
@@ -348,13 +371,40 @@ pub const CommitPlan = struct {
     /// Commit in caller-owned storage, including a witness already written at
     /// the final sorted offsets. Older addressed images keep their original ABI.
     pub fn enqueueInto(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, coefficients: api.DeviceBuffer, root_out: api.DeviceBuffer, mix: bool) !Committed {
+        return self.enqueueIntoWithNodes(sym, e, inputs, coefficients, root_out, mix, false, null, null, null);
+    }
+
+    pub fn canRetainSeparateNodes(self: *const CommitPlan, sym: Symbols) bool {
+        return sym.tree_separate_prefix != null and (self.beta == 1 or sym.n2b_compact != null);
+    }
+
+    /// The request owns the node span through its Stage-2 opening.
+    pub fn enqueueIntoResident(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, coefficients: api.DeviceBuffer, root_out: api.DeviceBuffer, nodes: ?api.DeviceBuffer) !Committed {
+        if (nodes) |b| if (!self.canRetainSeparateNodes(sym) or b.words != self.tree_words) return error.TraceCommitInputCount;
+        return self.enqueueIntoWithNodes(sym, e, inputs, coefficients, root_out, true, nodes != null, nodes, null, null);
+    }
+
+    pub fn enqueueFixed(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, coefficients: api.DeviceBuffer, root_out: api.DeviceBuffer, cache: FixedEvaluations) !Committed {
+        if (cache.offsets.len != self.shapes.len or (self.beta != 1 and sym.n2b_compact == null))
+            return error.InvalidFixedEvaluationCache;
+        const scale = @as(usize, 1) << @intCast(self.beta);
+        for (self.shapes, cache.offsets) |shape, offset| if (offset) |at| {
+            if (!cache.populate and shape.encoding != .coefficients) return error.InvalidFixedEvaluationCache;
+            const start = try std.math.mul(usize, at, scale);
+            const rows = @as(usize, 1) << @intCast(shape.log_size + self.beta);
+            _ = cache.buffer.slice(start, rows) catch return error.InvalidFixedEvaluationCache;
+        };
+        return self.enqueueIntoWithNodes(sym, e, inputs, coefficients, root_out, false, false, null, cache, null);
+    }
+
+    fn enqueueIntoWithNodes(self: *const CommitPlan, sym: Symbols, e: anytype, inputs: []const Input, coefficients: api.DeviceBuffer, root_out: api.DeviceBuffer, mix: bool, retain: bool, resident_nodes: ?api.DeviceBuffer, fixed_evaluations: ?FixedEvaluations, shared_evaluations: ?api.DeviceBuffer) !Committed {
         if (inputs.len != self.shapes.len or root_out.words < 8 or coefficients.words < self.coefficient_cells) return error.TraceCommitInputCount;
         if (self.beta != 1 and sym.n2b_compact == null) {
             const region = try e.alloc(self.regionWords());
-            const scratch = try self.enqueueAddressed(sym, e, inputs, region, root_out, mix);
+            const scratch = try self.enqueueAddressed(sym, e, inputs, region, root_out, mix, retain);
             try check(sym.copy_d2d(e.ctx(), coefficients.ptr, scratch.coefficients.ptr, self.coefficient_cells * 4));
             e.free(.{ .ptr = scratch.coefficients.ptr, .words = std.mem.alignForward(usize, self.coefficient_cells, granule()) });
-            return .{ .coefficients = coefficients, .root = root_out.ptr };
+            return .{ .coefficients = coefficients, .root = root_out.ptr, .node_storage = scratch.node_storage };
         }
         const overlap = try self.needsStaging(inputs, coefficients);
         const gathered = if (overlap) try e.alloc(self.coefficient_cells) else coefficients;
@@ -362,10 +412,13 @@ pub const CommitPlan = struct {
         const tw = self.twiddles orelse return error.TraceCommitNotStaged;
         const logs = self.logs_device orelse return error.TraceCommitNotStaged;
         var launches: u32 = 0;
-        const evaluations = try e.alloc(self.eval_cells);
+        const owned_nodes: ?api.DeviceBuffer = resident_nodes orelse if (retain and sym.tree_separate_prefix != null) try e.alloc(self.tree_words) else null;
+        const evaluations = shared_evaluations orelse try e.alloc(self.eval_cells);
         var segments: [96]MixedSegment = undefined;
         var segment_count: usize = 0;
-        var eval_offset: usize = 0;
+        var copies = Copies.Runs{ .ctx = e.ctx(), .copy = sym.copy_d2d, .validate = sym.validate_allocation };
+        const scale = @as(usize, 1) << @intCast(self.beta);
+        const cached = if (fixed_evaluations) |cache| if (!cache.populate) cache else null else null;
         var first: usize = 0;
         while (first < self.order.len) {
             const log = self.shapes[self.order[first]].log_size + self.beta;
@@ -373,27 +426,45 @@ pub const CommitPlan = struct {
             while (end < self.order.len and self.shapes[self.order[end]].log_size + self.beta == log) : (end += 1) {}
             const rows = @as(usize, 1) << @intCast(log);
             const count = @as(usize, 1) << @intCast(self.shapes[self.order[first]].log_size);
-            const src = gathered.ptr + self.offsets[self.order[first]];
-            const dst = evaluations.ptr + eval_offset;
-            const fwd = tw.ptr + self.tw.twiddles.len - rows / 2;
-            const columns: u32 = @intCast(end - first);
+            const dst = evaluations.ptr + self.offsets[self.order[first]] * scale;
+            const fwd = tw.ptr + self.twiddleWords() / 2 - rows / 2;
             const half: u32 = @intCast(rows / 2);
-            if (self.beta != 1) {
-                try check(sym.n2b_compact.?(src, count, logs.ptr + first, dst, rows, log, columns, fwd, half, half, count, e.stream(), &launches));
-            } else try check(sym.n2b_columns(src, count, logs.ptr + first, dst, rows, log, columns, fwd, half, half, e.stream(), &launches));
+            var i = first;
+            while (i < end) {
+                const column = self.order[i];
+                const target = evaluations.ptr + self.offsets[column] * scale;
+                if (cached) |cache| if (cache.offsets[column]) |offset| {
+                    try copies.push(target, cache.buffer.ptr + offset * scale, rows);
+                    i += 1;
+                    continue;
+                };
+                const src = gathered.ptr + self.offsets[column];
+                var next = i + 1;
+                while (next < end and (cached == null or cached.?.offsets[self.order[next]] == null)) : (next += 1) {}
+                const columns: u32 = @intCast(next - i);
+                if (self.beta != 1) {
+                    try check(sym.n2b_compact.?(src, count, logs.ptr + i, target, rows, log, columns, fwd, half, half, count, e.stream(), &launches));
+                } else try check(sym.n2b_columns(src, count, logs.ptr + i, target, rows, log, columns, fwd, half, half, e.stream(), &launches));
+                i = next;
+            }
             if (segment_count == segments.len) return error.UnsupportedTraceCommitGeometry;
-            segments[segment_count] = .{ .columns = evaluations.ptr + eval_offset, .stride_words = rows, .capacity_words = rows * (end - first), .source_size = @intCast(rows) };
+            segments[segment_count] = .{ .columns = dst, .stride_words = rows, .capacity_words = rows * (end - first), .source_size = @intCast(rows) };
             segment_count += 1;
-            eval_offset += rows * (end - first);
             first = end;
         }
-        try self.treeAndRoot(sym, e, segments[0..segment_count], root_out, mix);
-        e.free(evaluations);
+        if (fixed_evaluations) |cache| if (cache.populate) for (self.order) |column| {
+            const at = cache.offsets[column] orelse continue;
+            const rows = @as(usize, 1) << @intCast(self.shapes[column].log_size + self.beta);
+            try copies.push(cache.buffer.ptr + at * scale, evaluations.ptr + self.offsets[column] * scale, rows);
+        };
+        try copies.finish();
+        const nodes = try self.treeAndRoot(sym, e, segments[0..segment_count], root_out, mix, retain, owned_nodes);
+        if (shared_evaluations == null) e.free(evaluations);
         if (overlap) {
             try check(sym.copy_d2d(e.ctx(), coefficients.ptr, gathered.ptr, self.coefficient_cells * 4));
             e.free(gathered);
         }
-        return .{ .coefficients = coefficients, .root = root_out.ptr };
+        return .{ .coefficients = coefficients, .root = root_out.ptr, .node_storage = nodes };
     }
 };
 
@@ -431,9 +502,6 @@ test "commit job copies keep staging offsets private while borrowing immutable g
     try std.testing.expect(one.twiddles == null and one.logs_device == null and one.host_staged == null and one.descriptors_device == null);
 }
 
-fn mWords(values: []const core.fields.m31.M31) []const u32 {
-    return @as([*]const u32, @ptrCast(values.ptr))[0..values.len];
-}
 fn check(code: c_int) !void {
     if (code != 0) return error.CudaEnqueueFailed;
 }
@@ -516,4 +584,17 @@ test "direct commitment stages permuted and partial overlaps and accepts exact c
     try std.testing.expect(try plan.needsStaging(&inputs, dst));
     inputs[1].device = base + 38;
     try std.testing.expect(try plan.needsStaging(&inputs, dst));
+}
+
+test "shared commitment LDE rejects unsupported and short workspaces before enqueue" {
+    const a = std.testing.allocator;
+    var plan = try CommitPlan.init(a, &.{.{ .log_size = 5, .encoding = .evaluations }}, 2);
+    defer plan.deinit();
+    var symbols: Symbols = undefined;
+    symbols.n2b_compact = null;
+    var e: api.Enqueue = undefined;
+    const root = api.DeviceBuffer{ .ptr = @ptrFromInt(256), .words = 8 };
+    try std.testing.expectError(error.UnsupportedTraceCommitGeometry, plan.enqueueUsingEvaluations(symbols, &e, &.{}, root, true, root));
+    plan.beta = 1;
+    try std.testing.expectError(error.DeviceBufferOutOfRange, plan.enqueueUsingEvaluations(symbols, &e, &.{}, root, true, root));
 }

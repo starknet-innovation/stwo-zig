@@ -19,6 +19,8 @@ const Execution = front.rv64.execution_profile;
 pub const Options = struct {
     deduplicate_binary: bool = true,
     deduplicate_shift: bool = false,
+    /// Compact device records can feed the CPU witness without host metadata.
+    retain_cpu_metadata: bool = true,
     /// Legacy wrapper keeps its caller-declared padded JALR geometry.
     jalr_log: ?u32 = null,
 };
@@ -279,7 +281,7 @@ pub const Prepared = struct {
         return captureRoute(a, program, public, epoch, cpu_log, tape, options, service, .{ .recorder = recorderEnabled() });
     }
     pub fn captureRoute(a: std.mem.Allocator, program: *const Program, public: A.word16_execution.types.Boundary, epoch: u16, cpu_log: u32, tape: *const front.rv64.compact_tape.Tape, options: Options, service: Service, route: Route) !Prepared {
-        var cpu = if (route.chunks) |chunks| try CPU.Source.captureChunkedRoute(a, program, public, epoch, cpu_log, tape, chunks, route.recorder) else try CPU.Source.captureRoute(a, program, public, epoch, cpu_log, tape, route.recorder);
+        var cpu = try CPU.Source.captureWithMetadata(a, program, public, epoch, cpu_log, tape, route.chunks, route.recorder, options.retain_cpu_metadata);
         errdefer cpu.deinit();
         for (cpu.services.items) |call| {
             const valid = switch (service) {

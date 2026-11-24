@@ -117,7 +117,7 @@ fn checkCpuFrames(a: std.mem.Allocator, setups: []const *const R.CpuSetup, reque
 }
 pub fn checkCpuFrame(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.Request, first: anytype, expected: M.ExpectedWorker, stage: M.StageOne, manifest: M.Commitment, frame: CpuFrame) !M.Claims {
     const local = stage.local orelse return error.ServicesRootReceiptMismatch;
-    var plan = try Components.Plan.init(a, setup);
+    var plan = try Components.Plan.initFor(expected.envelope, a, setup);
     defer plan.deinit();
     if (frame.physical_claims.len != plan.claim_count) return error.InvalidWideCpuClaims;
     for (frame.physical_claims) |claim| for (claim.toM31Array()) |coordinate| if (coordinate.v >= core.fields.m31.Modulus) return error.NoncanonicalWideCpuClaim;

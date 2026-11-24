@@ -9,7 +9,7 @@ const IO = @import("fixture_io.zig");
 const Oracle = @import("joined_fixture_support.zig");
 const Field = core.fields.om31.OM31;
 const M = core.fields.m31.M31;
-pub const count = 15;
+pub const count = T.role_count;
 pub const Record = struct { artifact: T.Artifact, widths: [3]usize, classic: ?T.Role.Component };
 pub fn record(a: std.mem.Allocator, id: u32) !Record {
     if (id < 3 or (id >= 7 and id < 10)) {
@@ -19,16 +19,14 @@ pub fn record(a: std.mem.Allocator, id: u32) !Record {
         widths[2] += 1;
         return .{ .artifact = try T.record(a, &c), .widths = widths, .classic = c };
     }
+    inline for (T.curve_ops, T.curve_start..) |op, kernel| {
+        if (id == kernel) return v3(a, T.V3Catalog.Curve(op), id);
+    }
     switch (id) {
         3 => return v3(a, T.V3Catalog.Sha(), id),
         4 => return v3(a, T.V3Catalog.Arith(), id),
         5 => return v3(a, T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.add), id),
         6 => return v3(a, T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.double), id),
-        10 => return v3(a, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_add), id),
-        11 => return v3(a, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_double), id),
-        12 => return v3(a, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_fp2_mul), id),
-        13 => return v3(a, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bls12_381_fp2_mul), id),
-        14 => return v3(a, T.V3Catalog.Curve(A.crypto.curves.spec.Op.arith384_mont), id),
         else => return error.InvalidTruthKernel,
     }
 }
@@ -147,12 +145,15 @@ pub fn write(a: std.mem.Allocator, dir: std.fs.Dir, id: u32) !void {
             4 => try nativeV3(T.V3Catalog.Arith(), sample, &params, &sink),
             5 => try nativeV3(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.add), sample, &params, &sink),
             6 => try nativeV3(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.double), sample, &params, &sink),
-            10 => try nativeV3(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_add), sample, &params, &sink),
-            11 => try nativeV3(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_double), sample, &params, &sink),
-            12 => try nativeV3(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_fp2_mul), sample, &params, &sink),
-            13 => try nativeV3(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bls12_381_fp2_mul), sample, &params, &sink),
-            14 => try nativeV3(T.V3Catalog.Curve(A.crypto.curves.spec.Op.arith384_mont), sample, &params, &sink),
-            else => return error.InvalidTruthKernel,
+            else => curves: {
+                inline for (T.curve_ops, T.curve_start..) |op, kernel| {
+                    if (id == kernel) {
+                        try nativeV3(T.V3Catalog.Curve(op), sample, &params, &sink);
+                        break :curves;
+                    }
+                }
+                return error.InvalidTruthKernel;
+            },
         }
         if (sink.count != native_values.len) return error.WrongTruthConstraintCount;
         for (inputs, artifact.program.inputs) |*v, input| v.* = try sample.get(input.tree, input.column, input.offset);

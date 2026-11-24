@@ -1,0 +1,48 @@
+--- a/src/pairing.c
++++ b/src/pairing.c
+@@ -332,6 +332,45 @@
+     post_add_n_dbl(ret, &Qlines[18], Px2, 32);  /* ..0xd20100000000     */
+     post_add_n_dbl(ret, &Qlines[51], Px2, 16);  /* ..0xd201000000010000 */
+     conjugate_fp12(ret);                /* account for z being negative */
++}
++
++// Compute conjugate(ML(a_lines, a)) * ML(b_lines, b) before final exponentiation.
++// For a prepared line (x,y,0; 0,z,0), extension conjugation changes only z.
++// The product recurrence therefore shares every Fp12 square between both terms.
++void stwo_miller_two_prepared(vec384fp12 ret, const vec384fp6 a_lines[68],
++    const POINTonE1_affine* a, const vec384fp6 b_lines[68], const POINTonE1_affine* b)
++{
++    POINTonE1_affine x, y;
++    vec384fp6 line;
++    add_fp(x.X, a->X, a->X);
++    neg_fp(x.X, x.X);
++    add_fp(x.Y, a->Y, a->Y);
++    neg_fp(x.Y, x.Y);
++    add_fp(y.X, b->X, b->X);
++    neg_fp(y.X, y.X);
++    add_fp(y.Y, b->Y, b->Y);
++    post_line_by_Px2(line, a_lines[0], &x);
++    vec_zero(ret, sizeof(vec384fp12));
++    vec_copy(ret[0][0], line[0], 2 * sizeof(vec384fp2));
++    vec_copy(ret[1][1], line[2], sizeof(vec384fp2));
++    post_line_by_Px2(line, b_lines[0], &y);
++    mul_by_xy00z0_fp12(ret, ret, line);
++    static const byte doubles[] = {2, 3, 9, 32, 16};
++    /* 1 initial line + 5 addition lines + 62 doubling lines = 68 prepared lines. */
++    size_t pos = 1;
++    for (size_t segment = 0; segment < sizeof(doubles); ++segment)
++    {
++        for (unsigned j = 0; j <= doubles[segment]; ++j, ++pos)
++        {
++            if (j != 0)
++                sqr_fp12(ret, ret);
++            post_line_by_Px2(line, a_lines[pos], &x);
++            mul_by_xy00z0_fp12(ret, ret, line);
++            post_line_by_Px2(line, b_lines[pos], &y);
++            mul_by_xy00z0_fp12(ret, ret, line);
++        }
++    }
++    conjugate_fp12(ret);
+ }
+
+ #ifdef INTERNAL_TESTMODE

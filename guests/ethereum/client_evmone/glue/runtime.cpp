@@ -88,11 +88,20 @@ __attribute__((always_inline)) inline bool v3_copy(void* dst, const void* src, s
     const size_t min = STWO_ADMITTED_COPY_MIN;
 #endif
     if (n < min || (d < s + n && s < d + n)) return false;
+    if (((d | n) & 7) == 0 && n <= kAdmittedMax) {
+        v3_bulk(stwo::kV3Memcpy, d, s, n);
+        return true;
+    }
     v3_copy_run(static_cast<uint8_t*>(dst), static_cast<const uint8_t*>(src), n);
     return true;
 }
 __attribute__((always_inline)) inline bool v3_set(void* dst, int c, size_t n) noexcept {
     if (n < STWO_ADMITTED_SET_MIN) return false;
+    const uintptr_t d = reinterpret_cast<uintptr_t>(dst);
+    if (((d | n) & 7) == 0 && n <= kAdmittedMax) {
+        v3_bulk(stwo::kV3Memset, d, static_cast<uint8_t>(c), n);
+        return true;
+    }
     v3_set_run(static_cast<uint8_t*>(dst), c, n);
     return true;
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build libstwo-rv64-jobs.so, the M8 job-runtime CUDA addon.
 
-Compiles every .cu under src/backends/cuda/native/rv64/jobs/ and links the
+Compiles the CUDA jobs and host witness under src/backends/cuda/native/rv64/jobs/ and links the
 objects against a frozen base image (libstwo-rv64-native.so) without copying
 or rebuilding it, following the libstwo-rv64-outer-fs-ops.so precedent
 (vectors/reports/rv64-m7-20261105/outer-fs-ops/build.json). Writes build.json
@@ -55,14 +55,14 @@ def main(argv=None):
     if out == base.parent or (out / base.name).exists():
         p.error('output directory must not hold the base image')
     out.mkdir(parents=True, exist_ok=True)
-    sources = sorted(SOURCES.glob('*.cu'))
+    sources = sorted([*SOURCES.glob('*.cu'), *SOURCES.glob('*.cpp')])
     if not sources:
         p.error(f'no addon sources under {SOURCES}')
     compile_argv, link_argv, objects = commands(base, out, sources, args.nvcc, args.arch)
     for step in compile_argv + [link_argv]:
         print(' '.join(step), flush=True)
         subprocess.run(step, check=True)
-    headers = sorted(SOURCES.glob('*.h')) + sorted(SOURCES.glob('*.cuh'))
+    headers = sorted(SOURCES.glob('*.h')) + sorted(SOURCES.glob('*.cuh')) + sorted(SOURCES.glob('*.hpp'))
     receipt = {
         'schema': 'rv64-m8-jobs-addon-build/v1',
         'scope': 'Additive M8 job-runtime addon; frozen base image unchanged and not copied',

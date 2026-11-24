@@ -3,6 +3,7 @@
 const std = @import("std");
 const A = @import("ethereum_frontend_component").rv64_air;
 const W = @import("stwo_riscv_cpu_integration").rv64_execution.services.wire;
+const ST = @import("stwo_riscv_cpu_integration").rv64_services_types;
 const Capture = @import("capture.zig").Owner;
 const Canon = @import("stwo_riscv_cpu_integration").rv64_native_schema;
 
@@ -33,7 +34,7 @@ pub const KeccakTruthOptions = struct {
     /// One physical truth per active family, bounded by existing source caps.
     /// May require a new canonical truth rung and more backend memory.
     one_per_family: bool = false,
-    /// Coalesce non-Keccak families while keeping the bounded Keccak partition.
+    /// Minimize bounded Keccak shard count and coalesce other families.
     coalesce_families: bool = false,
     /// M8 p-truth-split (`STWO_RV64_M8_TRUTH_SPLIT=1`, default off; coalesced
     /// plans only): a family whose single coalesced truth the profile refuses
@@ -154,7 +155,8 @@ pub fn keccakBestSplit(options: KeccakTruthOptions, calls: u32, max_log: u32, de
     return best;
 }
 pub fn appendKeccakSecp(a: std.mem.Allocator, out: *std.ArrayList(W.TruthDeclaration), total: [3]u32, max_log: u32, options: KeccakTruthOptions) !void {
-    if (max_log < 16 or max_log > 18) return error.UnsupportedEthereumKeccakShardLog;
+    const full_pairs = options.v3 and options.uniform_throughput and options.coalesce_families and !options.rung_bound;
+    if (max_log < 16 or max_log > 19 or (max_log == 19 and !full_pairs)) return error.UnsupportedEthereumKeccakShardLog;
     if (options.v3) return appendKeccakV3(a, out, total, max_log, options);
     // Keep full shard lengths even so partitioning preserves paired slots.
     const max_keccak: u32 = ((@as(u32, 1) << @intCast(max_log)) / A.crypto.keccak.layout.ROWS_PER_PAIR) * 2;
@@ -170,20 +172,33 @@ pub fn appendKeccakSecp(a: std.mem.Allocator, out: *std.ArrayList(W.TruthDeclara
     try appendSecp(a, out, total, options.v3);
 }
 /// v3 Keccak truths: full shards of the throughput profile's slot geometry,
-/// then the cheapest split of the remainder (`keccakBestSplit`).
+/// then fit the remainder into one recursive leaf when coalescing. The
+/// native-only policy minimizes committed cells across up to three spans.
 pub fn appendKeccakV3(a: std.mem.Allocator, out: *std.ArrayList(W.TruthDeclaration), total: [3]u32, max_log: u32, options: KeccakTruthOptions) !void {
     // Keep full shard lengths even so partitioning preserves paired slots.
     const throughput = options.throughput();
-    const max_keccak = keccakCapacity(throughput.geometry(), max_log);
+    const leaf_log = @min(max_log, 18);
+    const max_keccak = keccakCapacity(throughput.geometry(), leaf_log);
     var next: u32 = 1;
     while (next <= total[0]) {
         const remaining = total[0] - next + 1;
+        // Two full adjacent shards already pay for exactly 2^19 permutation
+        // rows. Their union pays for one set of fixed tables and one recursive
+        // leaf. Use the ordinary tail policy below for even one fewer call.
+        if (max_log == 19 and remaining >= 2 * max_keccak) {
+            const calls = 2 * max_keccak;
+            try A.crypto.keccak.layout.validateGeometryFor(throughput.geometry(), calls, next, max_log);
+            _ = try A.crypto.keccak.layout.admitRoster(&.{calls}, &.{});
+            try out.append(a, .{ .family = .keccak, .first_id = next, .calls = calls, .logs = .{ max_log, W.keccakProfileWord(throughput) } });
+            next = try std.math.add(u32, next, calls);
+            continue;
+        }
         if (remaining > max_keccak) {
-            try out.append(a, .{ .family = .keccak, .first_id = next, .calls = max_keccak, .logs = .{ max_log, W.keccakProfileWord(keccakTruthPolicyFor(options, max_log)) } });
+            try out.append(a, .{ .family = .keccak, .first_id = next, .calls = max_keccak, .logs = .{ leaf_log, W.keccakProfileWord(keccakTruthPolicyFor(options, leaf_log)) } });
             next = try std.math.add(u32, next, max_keccak);
             continue;
         }
-        const split = keccakBestSplit(options, remaining, max_log, 3);
+        const split = keccakBestSplit(options, remaining, leaf_log, if (options.coalesce_families) 1 else 3);
         if (split.len == 0) return error.EthereumTruthCapacityExceeded;
         for (split.pieces[0..split.len]) |piece| {
             try A.crypto.keccak.layout.validateGeometryFor(piece.policy.geometry(), piece.calls, next, piece.log);
@@ -265,38 +280,31 @@ pub fn secpRcbCells(kind: A.crypto.secp256k1.program.Kind, calls_total: u32) !u6
     return cells;
 }
 pub fn truthsWithOptions(a: std.mem.Allocator, captured: *const Capture, options: KeccakTruthOptions, max_log: u32) ![]W.TruthDeclaration {
-    if (options.one_per_family and options.coalesce_families) return error.ConflictingTruthFamilyPlans;
-    if (options.one_per_family or options.coalesce_families) {
-        const ST = @import("stwo_riscv_cpu_integration").rv64_services_types;
-        var total: [ST.FAMILIES]u32 = @splat(0);
-        for (captured.advice.keccak, captured.advice.secp, captured.advice.sha256, captured.advice.arith256_mod, captured.advice.curves, captured.advice.sponge) |keccak, secp, sha256, arith, curves, sponge| {
-            total[0] = try std.math.add(u32, total[0], try std.math.add(u32, @intCast(keccak.len), @intCast(sponge.inputs.len)));
-            total[1] = try std.math.add(u32, total[1], @intCast(secp[0].len));
-            total[2] = try std.math.add(u32, total[2], @intCast(secp[1].len));
-            total[3] = try std.math.add(u32, total[3], @intCast(sha256.len));
-            total[4] = try std.math.add(u32, total[4], @intCast(arith.len));
-            for (curves, 0..) |calls, index| total[ST.FIRST_CURVE + index] = try std.math.add(u32, total[ST.FIRST_CURVE + index], @intCast(calls.len));
-        }
-        return if (options.one_per_family) oneTruthPerFamily(a, total, options) else coalesceTruthFamilies(a, total, options, max_log);
+    var total: [ST.FAMILIES]u32 = @splat(0);
+    const advice = &captured.advice;
+    for (advice.keccak, advice.secp, advice.sha256, advice.arith256_mod, advice.curves, advice.sponge) |keccak, secp, sha256, arith, curves, sponge| {
+        // Sponge permutations follow the plain Keccak calls in one ID range.
+        const spans = [_]usize{ keccak.len + sponge.inputs.len, secp[0].len, secp[1].len, sha256.len, arith.len };
+        for (spans, total[0..ST.FIRST_CURVE]) |calls, *sum| sum.* = try std.math.add(u32, sum.*, std.math.cast(u32, calls) orelse return error.Overflow);
+        for (curves, total[ST.FIRST_CURVE..]) |calls, *sum| sum.* = try std.math.add(u32, sum.*, std.math.cast(u32, calls.len) orelse return error.Overflow);
     }
+    return truthsForServiceCounts(a, total, options, max_log);
+}
 
-    var total: [3]u32 = @splat(0);
-    for (captured.advice.keccak, captured.advice.secp) |k, s| {
-        total[0] = try std.math.add(u32, total[0], @intCast(k.len));
-        total[1] = try std.math.add(u32, total[1], @intCast(s[0].len));
-        total[2] = try std.math.add(u32, total[2], @intCast(s[1].len));
-    }
-    // Keccak-sponge permutations follow the Keccak-f calls in the IO11 ID space.
-    for (captured.advice.sponge) |z| total[0] = try std.math.add(u32, total[0], @intCast(z.inputs.len));
+/// Plan service proofs from ordered family totals. Keccak includes both
+/// direct calls and sponge permutations. The same rules apply to either
+/// capture source; the receiver checks coverage against the proved claims.
+pub fn truthsForServiceCounts(a: std.mem.Allocator, total: [ST.FAMILIES]u32, options: KeccakTruthOptions, max_log: u32) ![]W.TruthDeclaration {
+    if (options.one_per_family and options.coalesce_families) return error.ConflictingTruthFamilyPlans;
+    if (options.one_per_family) return oneTruthPerFamily(a, total, options);
+    if (options.coalesce_families) return coalesceTruthFamilies(a, total, options, max_log);
     var out: std.ArrayList(W.TruthDeclaration) = .{};
     errdefer out.deinit(a);
-    try appendKeccakSecp(a, &out, total, max_log, options);
-    var next: u32 = 1;
+    try appendKeccakSecp(a, &out, total[0..3].*, max_log, options);
     // SHA-256: one compression per row plus a padding row; bounded log13 spans.
-    var sha256: u32 = 0;
-    for (captured.advice.sha256) |calls| sha256 = try std.math.add(u32, sha256, @intCast(calls.len));
+    const sha256 = total[@intFromEnum(ST.Family.sha256)];
     const capacity: u32 = (@as(u32, 1) << @intCast(@import("stwo_riscv_cpu_integration").rv64_execution.services.sha256.roster.MAX_LOG)) - 1;
-    next = 1;
+    var next: u32 = 1;
     while (next <= sha256) {
         const calls: u32 = @min(capacity, sha256 - next + 1);
         try out.append(a, .{ .family = .sha256, .first_id = next, .calls = calls, .logs = .{ try A.crypto.sha256.layout.logSize(calls), 0 } });
@@ -304,8 +312,7 @@ pub fn truthsWithOptions(a: std.mem.Allocator, captured: *const Capture, options
     }
     // arith256_mod: one call per row plus a padding row (>= 256 rows for the
     // local BYTE table); bounded log16 spans.
-    var arith: u32 = 0;
-    for (captured.advice.arith256_mod) |calls| arith = try std.math.add(u32, arith, @intCast(calls.len));
+    const arith = total[@intFromEnum(ST.Family.arith256_mod)];
     const arith_capacity: u32 = (@as(u32, 1) << @intCast(@import("stwo_riscv_cpu_integration").rv64_execution.services.arith256.roster.MAX_LOG)) - 1;
     next = 1;
     while (next <= arith) {
@@ -315,12 +322,9 @@ pub fn truthsWithOptions(a: std.mem.Allocator, captured: *const Capture, options
     }
     // Curve/field families 5..11: one call per row plus a padding row
     // (>= 256 rows for the local BYTE table); bounded log16 spans.
-    const ST = @import("stwo_riscv_cpu_integration").rv64_services_types;
     const CR = @import("stwo_riscv_cpu_integration").rv64_execution.services.curves.roster;
     const curve_capacity: u32 = (@as(u32, 1) << @intCast(CR.MAX_LOG)) - 1;
-    for (0..ST.CURVES) |c| {
-        var curve_total: u32 = 0;
-        for (captured.advice.curves) |shard| curve_total = try std.math.add(u32, curve_total, @intCast(shard[c].len));
+    for (total[ST.FIRST_CURVE..], 0..) |curve_total, c| {
         const family: ST.Family = @enumFromInt(ST.FIRST_CURVE + c);
         next = 1;
         while (next <= curve_total) {
@@ -336,7 +340,6 @@ pub fn truthsWithOptions(a: std.mem.Allocator, captured: *const Capture, options
 /// silently restores a split roster. CPU geometry/authority is unchanged.
 pub fn oneTruthPerFamily(a: std.mem.Allocator, total: [@import("stwo_riscv_cpu_integration").rv64_services_types.FAMILIES]u32, options: KeccakTruthOptions) ![]W.TruthDeclaration {
     if (!options.v3) return error.OneTruthPerFamilyRequiresV3;
-    const ST = @import("stwo_riscv_cpu_integration").rv64_services_types;
     var out: std.ArrayList(W.TruthDeclaration) = .empty;
     errdefer out.deinit(a);
     for (std.enums.values(ST.Family), total) |family, calls| {
@@ -358,7 +361,6 @@ pub fn oneTruthPerFamily(a: std.mem.Allocator, total: [@import("stwo_riscv_cpu_i
 /// Wire logs of one non-Keccak V3 truth over `calls` (the single-truth sizing
 /// of `oneTruthPerFamily`; source caps return OneTruthPerFamilySourceCapacity).
 pub fn nonKeccakLogs(family: @import("stwo_riscv_cpu_integration").rv64_services_types.Family, calls: u32) ![2]u32 {
-    const ST = @import("stwo_riscv_cpu_integration").rv64_services_types;
     return switch (family) {
         .keccak => error.NotV3Truth,
         .add, .double => .{ try SecpRow.logSize(if (family == .add) .add else .double, calls), SecpRow.PROFILE_WORD },
@@ -443,7 +445,6 @@ pub fn coalesceTruthFamilies(a: std.mem.Allocator, total: [@import("stwo_riscv_c
         // Per family, in family order (the receiver's span order): the single
         // admitted truth where the profile plans it today, bounded spans only
         // where it refuses.
-        const ST = @import("stwo_riscv_cpu_integration").rv64_services_types;
         for (std.enums.values(ST.Family)[1..], total[1..]) |family, calls| {
             if (calls == 0) continue;
             if (admittedSingle(family, calls, options.rung_bound)) |declaration| {
@@ -458,4 +459,44 @@ pub fn coalesceTruthFamilies(a: std.mem.Allocator, total: [@import("stwo_riscv_c
     defer a.free(rest);
     try out.appendSlice(a, rest);
     return out.toOwnedSlice(a);
+}
+
+test "resident Keccak pairs preserve exact ID coverage without widening a partial shard" {
+    const a = std.testing.allocator;
+    const o = KeccakTruthOptions{ .v3 = true, .uniform_throughput = true, .coalesce_families = true };
+    const cap = keccakCapacity(o.throughput().geometry(), 18);
+    for ([_]u32{ 0, 1, cap, cap + 1, 2 * cap - 1, 2 * cap, 2 * cap + 1, 4 * cap + 5259 }) |n| {
+        var base: std.ArrayList(W.TruthDeclaration) = .empty;
+        defer base.deinit(a);
+        try appendKeccakSecp(a, &base, .{ n, 0, 0 }, 18, o);
+        var merged: std.ArrayList(W.TruthDeclaration) = .empty;
+        defer merged.deinit(a);
+        try appendKeccakSecp(a, &merged, .{ n, 0, 0 }, 19, o);
+        var consumed: usize = 0;
+        var next: u32 = 1;
+        for (merged.items) |d| {
+            try std.testing.expectEqual(next, d.first_id);
+            try std.testing.expectEqual(base.items[consumed].logs[1], d.logs[1]);
+            const k = A.crypto.keccak.layout;
+            try k.validateGeometryFor(o.throughput().geometry(), d.calls, next, d.logs[0]);
+            _ = try k.admitRoster(&.{d.calls}, &.{});
+            if (d.logs[0] == 19) {
+                try std.testing.expectEqual(2 * cap, d.calls);
+                try std.testing.expectEqual(cap, base.items[consumed].calls);
+                try std.testing.expectEqual(cap, base.items[consumed + 1].calls);
+                consumed += 2;
+            } else {
+                try std.testing.expectEqualDeep(base.items[consumed], d);
+                consumed += 1;
+            }
+            next += d.calls;
+        }
+        try std.testing.expectEqual(n + 1, next);
+        try std.testing.expectEqual(base.items.len, consumed);
+        try std.testing.expectEqual(base.items.len - n / (2 * cap), merged.items.len);
+    }
+    var empty: std.ArrayList(W.TruthDeclaration) = .empty;
+    defer empty.deinit(a);
+    try std.testing.expectError(error.UnsupportedEthereumKeccakShardLog, appendKeccakSecp(a, &empty, .{ cap, 0, 0 }, 19, .{}));
+    try std.testing.expectError(error.UnsupportedEthereumKeccakShardLog, appendKeccakSecp(a, &empty, .{ cap, 0, 0 }, 20, o));
 }

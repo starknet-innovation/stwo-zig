@@ -36,13 +36,23 @@ pub const Prover = struct {
     /// (FixedReport.handoff_written says whether it happened).
     pub const FixedReport = struct { receipt: api.Receipt = .{}, launches: u32 = 0, body_launches: u32 = 0, outcome: Graphs.Outcome = .direct, gpu_ns: u64 = 0, coefficient_words: u64 = 0, handoff_written: bool = false };
     pub fn fixedRoot(self: *Prover, a: std.mem.Allocator, pp: *const @import("stwo_circuit_frontend").common.preprocessed.PreprocessedCircuit, handoff: ?FixedJob.Handoff, report: ?*FixedReport) ![32]u8 {
+        return self.commitFixed(a, pp, handoff, report, null);
+    }
+    /// Setup runs before the final two-phase request arena is installed.
+    pub fn fixedRootForInstall(self: *Prover, a: std.mem.Allocator, pp: *const @import("stwo_circuit_frontend").common.preprocessed.PreprocessedCircuit, capacity: api.SetupCapacity) ![32]u8 {
+        return self.commitFixed(a, pp, null, null, capacity);
+    }
+    fn commitFixed(self: *Prover, a: std.mem.Allocator, pp: *const @import("stwo_circuit_frontend").common.preprocessed.PreprocessedCircuit, handoff: ?FixedJob.Handoff, report: ?*FixedReport, setup_capacity: ?api.SetupCapacity) ![32]u8 {
         var host = try Prestage.FixedPrecommit.init(a, pp);
         defer host.deinit();
-        var job = try FixedJob.FixedJob.init(try host.inputs(), &self.shared.kernels);
+        var job = try FixedJob.FixedJob.init(try host.inputs(setup_capacity != null), &self.shared.kernels);
+        defer job.deinit(a);
+        if (setup_capacity != null) try job.boundScratch(a);
         job.graphs = &self.graphs;
         if (handoff) |h| if (h.words >= host.plan.coefficient_words) {
             job.handoff = h;
         };
+        if (setup_capacity) |capacity| try self.worker.admitInstallArena(job.footprint(), job.persistentWords(), capacity);
         var timer: ?Timer.GpuTimer = if (self.shared.events) |*ev| Timer.GpuTimer{ .api = ev } else null;
         defer if (timer) |*t| t.deinit();
         if (timer) |*t| job.timing = t.timing();
@@ -354,16 +364,57 @@ pub const NodeClasses = struct {
         statement: Seed.Statement,
         program: []u32 = &.{},
         max_encoded_bytes: usize,
+        /// Geometry of the proof produced by this node, for its parent.
+        own_shape: []const u32 = &.{},
+        authority: Seed.Hash = @splat(0),
+        metadata: ?std.heap.ArenaAllocator = null,
         /// Owned copy of the Authority's FIXED column logs (Staged.fixed_logs).
         fixed_logs: []u32 = &.{},
         owns_template: bool = false,
         resources_warmed: bool = false,
         compressed: ?@import("jobs/outer_packed_class.zig").Class = null,
+        pack_ns: u64 = 0,
         /// Per device: the worker's whole-node graph cache (the Prover of that
         /// GPU; set by the binder). With it every node of the class replays
         /// the class's captured body graph (rebinding only node buffers).
         graphs: [OuterDevice.max_graph_devices]?*Graphs.Cache = @splat(null),
         assignment_graphs: [OuterDevice.max_graph_devices]?*@import("assignment_graph_cache.zig").Cache = @splat(null),
+        pub const FixedValidation = enum { commit, resident, request };
+
+        /// Installation stages only persistent inputs. Imported packed classes
+        /// also allocate the decoder window for their cold FIXED check.
+        pub fn installFootprint(self: *const Entry, validation: FixedValidation) !api.Footprint {
+            const Staged = @import("jobs/outer_staged.zig");
+            const Packed = @import("jobs/outer_packed_class.zig");
+            const aligned = @import("jobs/resources.zig").aligned;
+            const words = self.staged.image.words;
+            var fp = api.Footprint{ .device_words = 0, .pinned_words = self.desc.len + self.program.len };
+            if (self.runtime_symbols.oods != null) fp.pinned_words += self.oods_program.len;
+            if (!self.staged.statics.device_twiddles) fp.pinned_words += @intCast(words[@intFromEnum(Staged.Region.twiddles)]);
+            if (self.compressed) |*packed_class| {
+                if (validation != .resident) fp.pinned_words += packed_class.words.len;
+                if (validation == .commit) fp.staged_words = try aligned(packed_class.outputWords()) + try aligned(Packed.scratch_words);
+            } else fp.pinned_words += @intCast(words[@intFromEnum(Staged.Region.class)]);
+            fp.device_words = fp.staged_words;
+            try fp.validate();
+            return fp;
+        }
+
+        pub fn stageInstall(self: *const Entry, s: *api.Stager, validation: FixedValidation) !?@import("jobs/outer_packed_class.zig").Staged {
+            if (self.program.len == 0) return error.GnNodeClassProgramNotLaidOut;
+            _ = self.runtime_symbols.encode orelse return error.GnNodeEncoderUnloaded;
+            var decoded: ?@import("jobs/outer_packed_class.zig").Staged = null;
+            if (self.compressed) |*packed_class| {
+                const launch = self.runtime_symbols.compressed orelse return error.PackedClassDecoderMissing;
+                const program = try packed_class.stageProgram(s, validation == .resident);
+                if (validation == .commit) decoded = try packed_class.stageDecode(s, program, launch);
+            } else _ = try self.staged.stageRegion(s, .class, true, false);
+            _ = try self.staged.stageRegion(s, .twiddles, true, false);
+            try EncJob.warmPrograms(s, self.desc, if (self.runtime_symbols.oods != null) self.oods_program else null);
+            _ = try self.node.stageProgram(s, false);
+            return decoded;
+        }
+
         /// The seed program for children regions of `region_words` words
         /// each (1 + the child class's encoded capacity), image at the end.
         /// Same encoder + seed wrappers as the actual request adapter.
@@ -375,31 +426,95 @@ pub const NodeClasses = struct {
             fp.pinned_words = std.math.add(usize, fp.pinned_words, self.program.len) catch return error.ResourceSizeOverflow;
             return fp.pinnedWords();
         }
+
+        /// The caller has checked the child proof shapes. A different slab
+        /// capacity still needs rebinding even when the circuit is identical.
+        pub fn seedRegionsMatch(self: *const Entry, regions: []const u32) bool {
+            if (self.program.len == 0 or regions.len == 0) return false;
+            const program = Seed.Program{ .words = self.program };
+            if (program.header(Seed.P.n_children) != regions.len) return false;
+            const kind = program.header(Seed.P.statement);
+            const outputs = if (self.leaf) self.staged.expected.len else 0;
+            const tail: u64 = if (self.leaf) 4 * @as(u64, self.tail) + outputs else 0;
+            for (regions, 0..) |words, i| {
+                const child = program.child(i);
+                if (@as(u64, child[Seed.C.image]) + child[Seed.C.image_words] + tail != words) return false;
+            }
+            return kind != 2 or program.header(Seed.P.outputs_at) == regions[0] - @as(u32, @intCast(outputs));
+        }
+        /// Bind an admitted native leaf without recovering its child shape
+        /// from a previous witness. Its output/tail contract and seed origins
+        /// still belong to the independently recorded verifier circuit.
+        pub fn programForLeaf(self: *Entry, region_words: u32, shape: Seed.Shape) !void {
+            if (!self.leaf or self.n_outputs.len != 1 or self.identities.len != 1 or self.fixed_roots.len != 1)
+                return error.GnNodeChildCount;
+            const a = std.heap.c_allocator;
+            const region = try Seed.ChildRegion.of(region_words, (try Seed.Layout.of(shape)).words, self.tail, @intCast(self.staged.expected.len));
+            const child = Seed.ChildClass{ .shape = shape, .wire_words = region.wire_words, .n_outputs = self.n_outputs[0], .identity = self.identities[0], .fixed_root = self.fixed_roots[0] };
+            var statement = self.statement;
+            statement.outputs_at = region.outputs_at;
+            const built = try Seed.buildLeaf(a, child, Checks.GnCheck.leaf_cap_log, self.tail, self.vars, self.constants, statement);
+            self.replaceProgram(built);
+        }
         pub fn programFor(self: *Entry, region_words: []const u32) !void {
             const a = std.heap.c_allocator;
             if (region_words.len != self.shapes.len) return error.GnNodeChildCount;
+            const group = self.statement.kind == 3;
+            if (self.leaf and !group) {
+                if (region_words.len != 1) return error.GnNodeChildCount;
+                var at: usize = 0;
+                const shape = try Seed.Shape.parse(a, self.shapes[0], &at);
+                defer a.free(shape.trees);
+                return self.programForLeaf(region_words[0], shape);
+            }
             var classes: [Seed.max_children]Seed.ChildClass = undefined;
             var parsed: [Seed.max_children]Seed.Shape = undefined;
             var n: usize = 0;
+            if (group and (!self.leaf or region_words.len != Seed.service_group_members or self.tail != Seed.service_group_tail_seeds)) return error.GnNodeChildCount;
             defer for (parsed[0..n]) |p| a.free(p.trees);
             for (self.shapes, 0..) |sw, k| {
                 var at: usize = 0;
                 parsed[k] = try Seed.Shape.parse(a, sw, &at);
                 n += 1;
                 const L = try Seed.Layout.of(parsed[k]);
-                const region = try Seed.ChildRegion.of(region_words[k], L.words, if (self.leaf) self.tail else 0, if (self.leaf) @intCast(self.staged.expected.len) else 0);
+                const region = try Seed.ChildRegion.of(region_words[k], L.words, if (group) self.tail else 0, if (group) @intCast(self.staged.expected.len) else 0);
                 classes[k] = .{ .shape = parsed[k], .wire_words = region.wire_words, .n_outputs = self.n_outputs[k], .identity = self.identities[k], .fixed_root = self.fixed_roots[k] };
             }
-            var st = self.statement;
-            const prog = if (self.leaf) blk: {
-                // leaf: [len][native bytes][image][statement tail][outputs]
-                st.outputs_at = (try Seed.ChildRegion.of(region_words[0], (try Seed.Layout.of(parsed[0])).words, self.tail, @intCast(self.staged.expected.len))).outputs_at;
-                break :blk try Seed.buildLeaf(a, classes[0], Checks.GnCheck.leaf_cap_log, self.tail, self.vars, self.constants, st);
-            } else try Seed.buildFold(a, classes[0..n], Checks.GnCheck.cap_log, self.vars, self.constants, st);
-            if (self.program.len != 0) a.free(self.program);
-            self.program = prog.words;
-            self.node.program = prog.words;
-            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(prog.words), &self.node.prog_key, .{});
+            const built = if (group)
+                try Seed.buildServiceGroup(a, classes[0..Seed.service_group_members].*, self.statement.outputs_at, Checks.GnCheck.leaf_cap_log, self.vars, self.constants, self.statement)
+            else
+                try Seed.buildFold(a, classes[0..n], Checks.GnCheck.cap_log, self.vars, self.constants, self.statement);
+            self.replaceProgram(built);
+        }
+        /// The returned Shape owns its tree descriptors; their columns
+        /// borrow this class, as do all child views used to compile a fold.
+        pub fn childClass(self: *const Entry, a: std.mem.Allocator, wire_words: u32) !Seed.ChildClass {
+            return .{
+                .shape = try parseShape(a, self.own_shape),
+                .wire_words = wire_words,
+                .n_outputs = @intCast(self.staged.expected.len / 4),
+                .identity = self.authority,
+                .fixed_root = Recorder.words8(self.staged.fixed_root),
+            };
+        }
+        fn destroy(self: *Entry) void {
+            const a = std.heap.c_allocator;
+            a.free(self.program);
+            if (self.compressed) |*p| p.deinit(a);
+            if (self.owns_template) self.staged.deinit();
+            if (self.metadata) |*owned| owned.deinit();
+            a.destroy(self);
+        }
+        fn replaceProgram(self: *Entry, built: Seed.Program) void {
+            var key: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(built.words), &key, .{});
+            self.setProgram(built, key);
+        }
+        fn setProgram(self: *Entry, built: Seed.Program, key: [32]u8) void {
+            if (self.program.len != 0) std.heap.c_allocator.free(self.program);
+            self.program = built.words;
+            self.node.program = built.words;
+            self.node.prog_key = key;
         }
     };
     var mutex: std.Thread.Mutex = .{};
@@ -428,7 +543,6 @@ pub const NodeClasses = struct {
     pub fn releaseInstalled() void {
         mutex.lock();
         defer mutex.unlock();
-        const a = std.heap.c_allocator;
         install_nodes.clearRetainingCapacity();
         var keep: usize = 0;
         for (entries.items) |e| {
@@ -437,20 +551,7 @@ pub const NodeClasses = struct {
                 keep += 1;
                 continue;
             }
-            for (e.shapes) |shape| a.free(shape);
-            a.free(e.shapes);
-            a.free(e.desc);
-            a.free(e.oods_program);
-            a.free(e.vars);
-            a.free(e.constants);
-            a.free(e.identities);
-            a.free(e.fixed_roots);
-            a.free(e.n_outputs);
-            a.free(e.program);
-            a.free(e.fixed_logs);
-            if (e.compressed) |*p| p.deinit(a);
-            e.staged.deinit();
-            a.destroy(e);
+            e.destroy();
         }
         entries.shrinkRetainingCapacity(keep);
     }
@@ -484,7 +585,11 @@ pub const NodeClasses = struct {
         return find(entries.items, class_key);
     }
     pub fn pack(entry: *Entry) !void {
-        if (entry.compressed == null) entry.compressed = try Prestage.packTemplate(std.heap.c_allocator, entry.staged);
+        if (entry.compressed == null) {
+            var timer = try std.time.Timer.start();
+            entry.compressed = try Prestage.packTemplate(std.heap.c_allocator, entry.staged);
+            entry.pack_ns = timer.read();
+        }
         entry.node.compressed = true;
     }
     pub fn count() usize {
@@ -492,88 +597,229 @@ pub const NodeClasses = struct {
         defer mutex.unlock();
         return entries.items.len;
     }
+    pub const SetupBinding = struct {
+        children: []const Seed.ChildClass,
+        tail: u32 = 0,
+        statement: Seed.Statement,
+        packed_image: bool = false,
+    };
+
+    /// Compile a reusable node from its authorized verifier graph and child
+    /// geometries. No evaluated witness, sample proof, or runtime graph is
+    /// retained. The caller keeps the input graph/authority through this call.
+    pub fn createFromSetup(shared: *const Schema.Shared, input: Prestage.Input, binding: SetupBinding) !*Entry {
+        const a = std.heap.c_allocator;
+        var owned_preparation = input.prepared;
+        errdefer if (owned_preparation) |*prepared| prepared.deinit();
+        const group = binding.statement.kind == 3;
+        const shape_matches = switch (binding.statement.kind) {
+            1 => !input.is_leaf and binding.children.len <= Seed.max_children and binding.children.len >= 2 and binding.tail == 0,
+            2 => input.is_leaf and binding.children.len == 1,
+            3 => input.is_leaf and binding.children.len == Seed.service_group_members and binding.tail == Seed.service_group_tail_seeds,
+            else => false,
+        };
+        if (!shape_matches or
+            binding.statement.n_outputs != input.expected.len or !std.mem.eql(u32, &binding.statement.identity, &Recorder.words8(input.key.identity)) or
+            !std.mem.eql(u32, &binding.statement.fixed_root, &Recorder.words8(input.key.fixedRoot())))
+            return error.GnNodeClassSetupMismatch;
+        var admitted_input = input;
+        admitted_input.require_device_checks = true;
+        owned_preparation = null;
+        const staged = try Prestage.prestage(a, admitted_input);
+        defer staged.deinit();
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const seeds = staged.assignment.seeds;
+        const n_seeds = seeds.len / 5;
+        const n_constants = input.graph.constants.count();
+        if (seeds.len % 5 != 0 or n_constants > n_seeds or input.child_proof_starts.len != binding.children.len)
+            return error.GnNodeSeedLayout;
+        var at = n_constants;
+        for (binding.children, input.child_proof_starts) |child, start| {
+            if (at >= n_seeds or seeds[5 * at] != start) return error.GnNodeSeedLayout;
+            at += if (input.is_leaf) try Seed.leafTapeLength(scratch, child, Checks.GnCheck.leaf_cap_log) else try Seed.tapeLength(&.{child}, Checks.GnCheck.cap_log, scratch);
+            if (group) at += binding.tail;
+        }
+        if (at > n_seeds or n_seeds - at != (if (group) 0 else binding.tail)) return error.GnNodeSeedLayout;
+        const vars = try scratch.alloc(u32, n_seeds);
+        const constants = try scratch.alloc([4]u32, n_constants);
+        for (vars, 0..) |*v, i| v.* = seeds[i * 5];
+        for (constants, 0..) |*c, i| c.* = seeds[i * 5 + 1 ..][0..4].*;
+        var job = try Job.OuterNodeJob.initWhole(staged, &shared.kernels, shared.whole());
+        defer job.deinit();
+        try job.requireDeviceChecks();
+        const program = if (group)
+            try Seed.buildServiceGroup(a, binding.children[0..Seed.service_group_members].*, binding.statement.outputs_at, Checks.GnCheck.leaf_cap_log, vars, constants, binding.statement)
+        else if (input.is_leaf)
+            try Seed.buildLeaf(a, binding.children[0], Checks.GnCheck.leaf_cap_log, binding.tail, vars, constants, binding.statement)
+        else
+            try Seed.buildFold(a, binding.children, Checks.GnCheck.cap_log, vars, constants, binding.statement);
+        var program_owned = true;
+        defer if (program_owned) program.deinit(a);
+        var program_key: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(program.words), &program_key, .{});
+        const class_key = bindingKey(staged.class_key, program_key);
+        if (get(class_key)) |known| {
+            if (!known.owns_template) return error.GpuNativeBorrowedRecursionTemplate;
+            return known;
+        }
+        var shapes: [Seed.max_children][]const u32 = undefined;
+        var ids: [Seed.max_children]Seed.Hash = undefined;
+        var roots: [Seed.max_children]Seed.Hash = undefined;
+        var outputs: [Seed.max_children]u32 = undefined;
+        for (binding.children, 0..) |child, i| {
+            var words: std.ArrayListUnmanaged(u32) = .empty;
+            try child.shape.append(scratch, &words);
+            shapes[i] = words.items;
+            ids[i] = child.identity;
+            roots[i] = child.fixed_root;
+            outputs[i] = child.n_outputs;
+        }
+        const child_count = binding.children.len;
+        const candidate = try buildEntry(shared, input, staged, &job, class_key, true, binding.packed_image, .{
+            .vars = vars,
+            .constants = constants,
+            .shapes = shapes[0..child_count],
+            .identities = ids[0..child_count],
+            .fixed_roots = roots[0..child_count],
+            .n_outputs = outputs[0..child_count],
+            .tail = binding.tail,
+            .statement = binding.statement,
+        });
+        var owned = true;
+        defer if (owned) candidate.destroy();
+        candidate.setProgram(program, program_key);
+        program_owned = false;
+        mutex.lock();
+        defer mutex.unlock();
+        if (find(entries.items, class_key)) |known| {
+            if (!known.owns_template) return error.GpuNativeBorrowedRecursionTemplate;
+            return known;
+        }
+        try entries.append(a, candidate);
+        owned = false;
+        return candidate;
+    }
+
+    const ClassData = struct {
+        vars: []const u32,
+        constants: []const [4]u32,
+        shapes: []const []const u32,
+        identities: []const Seed.Hash,
+        fixed_roots: []const Seed.Hash,
+        n_outputs: []const u32,
+        tail: u32,
+        statement: Seed.Statement,
+    };
+
     /// Returns true when `staged` became the class template (the caller
     /// must not deinit it).
     fn harvest(shared: *const Schema.Shared, input: Prestage.Input, staged: *@import("jobs/outer_staged.zig").Staged, job: *Job.OuterNodeJob, g: *const Checks.GnCheck) !bool {
         const class_key = bindingKey(staged.class_key, g.prog_key);
+        const own = installing();
         if (get(class_key)) |known| {
-            if (installing()) try installNode(input.ordinal, known);
+            if (own) try installNode(input.ordinal, known);
             return false;
         }
+        const n = g.regions.len;
+        var shapes: [Seed.max_children][]const u32 = undefined;
+        for (shapes[0..n], g.harvest.shapes[0..n]) |*dst, src| dst.* = src;
+        const e = try buildEntry(shared, input, staged, job, class_key, own, false, .{
+            .vars = g.harvest.vars,
+            .constants = g.harvest.constants,
+            .shapes = shapes[0..n],
+            .identities = g.harvest.identities[0..n],
+            .fixed_roots = g.harvest.fixed_roots[0..n],
+            .n_outputs = g.harvest.n_outputs[0..n],
+            .tail = g.harvest.tail,
+            .statement = g.harvest.statement,
+        });
+        var registered = false;
+        defer if (!registered) e.destroy();
+        mutex.lock();
+        defer mutex.unlock();
+        const a = std.heap.c_allocator;
+        if (find(entries.items, class_key)) |known| {
+            if (own) {
+                const slot = try install_nodes.getOrPut(a, input.ordinal);
+                if (slot.found_existing and slot.value_ptr.* != known) return error.GnNodeInstallOrdinal;
+                slot.value_ptr.* = known;
+            }
+            return false;
+        }
+        try entries.ensureUnusedCapacity(a, 1);
+        if (own) {
+            const slot = try install_nodes.getOrPut(a, input.ordinal);
+            if (slot.found_existing) return error.GnNodeInstallOrdinal;
+            slot.value_ptr.* = e;
+        }
+        entries.appendAssumeCapacity(e);
+        registered = true;
+        std.debug.print("GN_NODE_CLASS harvested ordinal={d} class={x} leaf={} children={d} classes={d}\n", .{ input.ordinal, class_key[0..8].*, input.is_leaf, n, entries.items.len });
+        return !own;
+    }
+
+    fn buildEntry(shared: *const Schema.Shared, input: Prestage.Input, staged: *@import("jobs/outer_staged.zig").Staged, job: *Job.OuterNodeJob, key: [32]u8, own: bool, packed_image: bool, data: ClassData) !*Entry {
         if (staged.image.expected.words == 0) return error.GnNodeClassNeedsDeviceChecks;
         const a = std.heap.c_allocator;
+        var metadata = std.heap.ArenaAllocator.init(a);
+        errdefer metadata.deinit();
+        const storage = metadata.allocator();
         const shape = job.pcs.?.prepared.metadata.shape;
-        const desc = try EncJob.descriptorFor(a, shape, try EncJob.envelopeFor(input.key.identity, staged.expected.len / 4), staged.fixed_root);
-        errdefer a.free(desc);
-        const counts = try a.alloc([]const u32, shape.trees.len);
-        defer a.free(counts);
-        for (counts, shape.trees) |*c, t| c.* = t.sample_counts;
-        const program = try Prestage.oodsProgram(a, input.key, counts);
-        errdefer a.free(program);
+        const desc = try EncJob.descriptorFor(storage, shape, try EncJob.envelopeFor(input.key.identity, staged.expected.len / 4), staged.fixed_root);
+        var counts: [Enc.max_trees][]const u32 = undefined;
+        for (counts[0..shape.trees.len], shape.trees) |*c, tree| c.* = tree.sample_counts;
+        const oods = try Prestage.oodsProgram(storage, input.key, counts[0..shape.trees.len]);
+        var retained = if (own) try Prestage.retainTemplate(a, input, staged, packed_image) else Prestage.Template{ .staged = staged };
+        const template = retained.staged;
+        errdefer if (own) template.deinit();
+        errdefer if (retained.compressed) |*image| image.deinit(a);
+        var tree_storage: Seed.Shape.TreeStorage = undefined;
+        const own_shape = try Seed.Shape.fromPcs(shape, &tree_storage);
+        var encoded: std.ArrayListUnmanaged(u32) = .empty;
+        try own_shape.append(storage, &encoded);
+        const shapes = try storage.alloc([]u32, data.shapes.len);
+        for (shapes, data.shapes) |*dst, src| dst.* = try storage.dupe(u32, src);
         const e = try a.create(Entry);
         errdefer a.destroy(e);
-        const own_template = installing();
-        const template = if (own_template) try Prestage.retainTemplate(a, input, staged) else staged;
-        errdefer if (own_template) template.deinit();
-        // Worker admission follows the binding; body graph/statics stay shared.
-        if (own_template) template.class_key = class_key;
-        const nk = g.regions.len;
         e.* = .{
-            .class_key = class_key,
-            .node = .{ .program = &.{}, .prog_key = @splat(0), .n_children = @intCast(nk), .output_words = @intCast(staged.expected.len), .ctx = e, .make = Runtime.Adapter(Entry).make },
+            .class_key = key,
+            .node = .{ .program = &.{}, .prog_key = @splat(0), .n_children = @intCast(shapes.len), .output_words = @intCast(staged.expected.len), .ctx = e, .make = Runtime.Adapter(Entry).make, .compressed = retained.compressed != null },
             .shared = shared,
             .runtime_symbols = .{ .kernels = &shared.kernels, .whole = shared.whole(), .encode = shared.encode, .oods = shared.oods },
             .staged = template,
             .desc = desc,
-            .oods_program = program,
-            .vars = try a.dupe(u32, g.harvest.vars),
-            .constants = try a.dupe([4]u32, g.harvest.constants),
-            .shapes = try a.alloc([]u32, nk),
-            .identities = try a.dupe([8]u32, g.harvest.identities[0..nk]),
-            .fixed_roots = try a.dupe([8]u32, g.harvest.fixed_roots[0..nk]),
-            .n_outputs = try a.dupe(u32, g.harvest.n_outputs[0..nk]),
+            .oods_program = oods,
+            .vars = try storage.dupe(u32, data.vars),
+            .constants = try storage.dupe([4]u32, data.constants),
+            .shapes = shapes,
+            .identities = try storage.dupe(Seed.Hash, data.identities),
+            .fixed_roots = try storage.dupe(Seed.Hash, data.fixed_roots),
+            .n_outputs = try storage.dupe(u32, data.n_outputs),
             .leaf = input.is_leaf,
-            .tail = g.harvest.tail,
-            .statement = g.harvest.statement,
-            .max_encoded_bytes = 0,
-            .owns_template = own_template,
+            .tail = data.tail,
+            .statement = data.statement,
+            .max_encoded_bytes = 4 * (@as(usize, desc[Enc.D.max_payload_words]) + (try Seed.Layout.of(own_shape)).words),
+            .own_shape = encoded.items,
+            .authority = Recorder.words8(input.key.identity),
+            .fixed_logs = try storage.dupe(u32, template.fixed_logs),
+            .owns_template = own,
+            .compressed = retained.compressed,
+            .pack_ns = retained.pack_ns,
         };
-        {
-            var sw: std.ArrayListUnmanaged(u32) = .empty;
-            defer sw.deinit(a);
-            try GnRecord.appendShape(a, &sw, shape);
-            const own = try parseShape(a, sw.items);
-            defer a.free(own.trees);
-            // Region capacity: the wire bytes, then this node's PCS image (its
-            // parent's seed source) in the last image words.
-            e.max_encoded_bytes = 4 * (@as(usize, desc[Enc.D.max_payload_words]) + (try Seed.Layout.of(own)).words);
+        e.metadata = metadata;
+        if (own) {
+            // Worker admission follows the binding. The retained template's
+            // statics own their layout and its seed values are cleared.
+            template.class_key = key;
         }
-        for (e.shapes, g.harvest.shapes[0..nk]) |*dst, src| dst.* = try a.dupe(u32, src);
-        // The template outlives the node's Authority / PP: own what the
-        // Staged borrowed from them. FIXED raw evaluations are not kept (the
-        // class FIXED tree comes from its persistent region or the lane's
-        // precommit handoff; packFixed refuses rather than read freed PP).
-        e.fixed_logs = try a.dupe(u32, template.fixed_logs);
-        template.fixed_logs = e.fixed_logs;
-        // (fixed_raw stays this node's until its job-mode check ends; see
-        // Prover.gnJob, which then erases it.)
-        // The template carries no host value: the device writes seeds,
-        // checkpoint and outputs per node.
         @memset(@constCast(template.expected), 0);
-        // A leaf's schedule (tasks, indices, chain ends) is a class constant
-        // of the template too: move it from the node region (re-packed and
-        // uploaded per node, ~75 MB for a 2.4 M-task leaf) to the class
-        // region (uploaded once per worker). Layout only, proof-neutral.
         if (!template.assignment.reusable) {
             template.assignment.reusable = true;
             template.image = @import("jobs/outer_staged.zig").Staged.layoutWith(&template.assignment, template.statics, if (template.lookup != null) template.expected.len else 0);
         }
-        mutex.lock();
-        defer mutex.unlock();
-        try entries.append(a, e);
-        if (own_template) try install_nodes.put(a, input.ordinal, e);
-        std.debug.print("GN_NODE_CLASS harvested ordinal={d} class={x} leaf={} children={d} classes={d}\n", .{ input.ordinal, class_key[0..8].*, input.is_leaf, nk, entries.items.len });
-        return !own_template;
+        return e;
     }
     fn parseShape(a: std.mem.Allocator, words: []const u32) !Seed.Shape {
         var at: usize = 0;
@@ -758,6 +1004,76 @@ test "installed recursion cache distinguishes bindings of the same verifier body
     try t.expect(NodeClasses.find(&entries, first.class_key) == &first);
     try t.expect(NodeClasses.find(&entries, NodeClasses.bindingKey(body, @splat(3))) == null);
     try t.expectEqual(first.class_key, NodeClasses.bindingKey(body, @splat(1)));
+}
+
+test "generated packed recursion installs once without a decoded image or request scratch" {
+    const Fake = @import("jobs/fake.zig");
+    const Staged = @import("jobs/outer_staged.zig");
+    const Packed = @import("jobs/outer_packed_class.zig");
+    const WarmJob = struct {
+        entry: *const NodeClasses.Entry,
+        validation: NodeClasses.Entry.FixedValidation,
+        ingress: api.Footprint,
+        fn encode(_: *anyopaque, _: u32, _: *const Enc.Io) callconv(.c) c_int {
+            return 1;
+        }
+        fn decode(_: *anyopaque, _: u32, _: *const Packed.Run) callconv(.c) c_int {
+            return 1;
+        }
+        pub fn classKey(_: *@This()) [32]u8 {
+            return @splat(0);
+        }
+        pub fn footprint(self: *@This()) api.Footprint {
+            return self.ingress;
+        }
+        pub fn stage(self: *@This(), s: *api.Stager) !void {
+            try std.testing.expect((try self.entry.stageInstall(s, self.validation)) == null);
+        }
+        pub fn enqueue(_: *@This(), e: *api.Enqueue) !void {
+            try e.waitStaged();
+        }
+        pub fn finish(_: *@This(), _: api.SlabView) !void {}
+        pub fn abort(_: *@This()) void {}
+    };
+    var statics: Staged.Statics = undefined;
+    statics.device_twiddles = false;
+    statics.tables = @splat(null);
+    var staged: Staged.Staged = undefined;
+    staged.statics = &statics;
+    staged.image = .{};
+    staged.shared_twiddle_log = null;
+    var entry: NodeClasses.Entry = undefined;
+    entry.staged = &staged;
+    var program = [_]u32{ 1, 2 };
+    var descriptor = [_]u32{ 3, 4, 5 };
+    var packed_words = [_]u32{ 7, 8, 9, 10 };
+    entry.program = &program;
+    entry.desc = &descriptor;
+    entry.node.program = entry.program;
+    entry.node.prog_key = @splat(0x13);
+    entry.runtime_symbols.oods = null;
+    entry.runtime_symbols.encode = .{ .encode = WarmJob.encode };
+    entry.runtime_symbols.compressed = WarmJob.decode;
+    entry.compressed = .{ .words = &packed_words, .key = @splat(0x17), .class_words = 4096, .fixed_words = 8192, .channel_count = 1 };
+    Fake.reset();
+    const worker = try Worker.Worker.create(std.testing.allocator, &Fake.ops, .{ .device = 0, .arena_words = 256, .pinned_slot_words = 64, .plan_from_env = false });
+    defer worker.destroy();
+    var driver: Prover = undefined;
+    driver.worker = worker;
+    for ([_]NodeClasses.Entry.FixedValidation{ .resident, .request, .resident }, 0..) |validation, i| {
+        var warm = WarmJob{ .entry = &entry, .validation = validation, .ingress = try entry.installFootprint(validation) };
+        var receipt = Prover.Done{};
+        try driver.submitWait(api.Job.from(WarmJob, &warm), &receipt);
+        if (i == 0) {
+            try std.testing.expectError(error.GpuNativeRecursionClassCold, receipt.result);
+            try std.testing.expectEqual(@as(usize, 0), Fake.counters.h2d_bytes);
+        } else {
+            try receipt.result;
+            try std.testing.expectEqual(@as(usize, (2 + 3 + 4) * 4), Fake.counters.h2d_bytes);
+            try std.testing.expectEqual(@as(u64, 0), receipt.receipt.d2h_bytes);
+            try std.testing.expectEqual(@as(u64, 0), receipt.receipt.staged_words);
+        }
+    }
 }
 
 test "installed graph owners share within one worker and destroy before their live contexts" {

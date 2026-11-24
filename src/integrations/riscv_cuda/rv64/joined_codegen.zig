@@ -19,6 +19,7 @@ fn authority(descriptor: Source.Descriptor) ![32]u8 {
         hash.update(&bytes);
     }
     hash.update(&.{ @intFromBool(descriptor.cpu_u8_pairs), @intFromBool(descriptor.cpu_compact_decode) });
+    if (descriptor.cpu_wide_clock) hash.update("wide-clock-u16");
     return hash.finalResult();
 }
 fn parameter(slot: u32) F {
@@ -105,7 +106,7 @@ pub fn record(a: std.mem.Allocator, descriptor: Source.Descriptor) !Artifact {
     for (&public.cpu.initial_pc, 0..) |*v, i| v.* = parameter(Parameters.initial_pc + @as(u32, @intCast(i)));
     for (&public.cpu.final_pc, 0..) |*v, i| v.* = parameter(Parameters.final_pc + @as(u32, @intCast(i)));
     public.cpu.epoch = parameter(Parameters.epoch);
-    public.cpu.wide_clock = false;
+    public.cpu.wide_clock = descriptor.cpu_wide_clock;
     public.rows = parameter(Parameters.rows);
     public.nonempty = parameter(Parameters.nonempty);
     public.span = .{ .calls = parameter(Parameters.calls), .first_id = parameter(Parameters.first_id), .nonempty = parameter(Parameters.calls_nonempty) };

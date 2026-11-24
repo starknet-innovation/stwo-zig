@@ -107,7 +107,7 @@ pub const Component = struct {
     /// MAIN row (its ROM pc coordinate); every other role ignores `previous`.
     pub fn emitLocalWithPreviousFor(self: *const @This(), comptime F: type, fixed: []const F, main: []const F, previous: []const F, sink: anytype) void {
         switch (self.main.public) {
-            .cpu_compact => |p| Fns.cpuCompactFor(F, fixed, main, previous, E.scalarFor(F, self.epoch), A.word16_execution.types.pcFelt(F, p.initial_pc), sink),
+            .cpu_compact => |p| Fns.cpuCompactClockFor(F, fixed, main, previous, E.scalarFor(F, self.epoch), A.word16_execution.types.pcFelt(F, p.initial_pc), p.wide_clock, sink),
             else => self.emitLocalFor(F, fixed, main, sink),
         }
     }
@@ -117,7 +117,7 @@ pub const Component = struct {
             const previous = [_]F{F.zero()} ** A.word16_execution.layout.compact.COUNT;
             return self.emitLocalWithPreviousFor(F, fixed, main, &previous, sink);
         }
-        if (self.main.role() == .cpu) return Fns.cpuModeFor(F, fixed, main, E.scalarFor(F, self.epoch), self.data.cpu_u8_pairs, sink);
+        if (self.main.role() == .cpu) return Fns.cpuClockFor(F, fixed, main, E.scalarFor(F, self.epoch), if (self.main.public.cpu.wide_clock) .wide else if (self.data.cpu_u8_pairs) .pair else .byte, sink);
         @import("role.zig").emitLocalFor(F, self.main.role(), fixed, main, E.scalarFor(F, self.epoch), sink);
     }
     main: A.main_only.component.Component,
@@ -153,14 +153,14 @@ pub const Component = struct {
     }
     pub fn validate(self: *const @This()) !void {
         try self.main.validate();
-        if ((self.main.role() == .cpu or self.main.role() == .cpu_compact) and self.main.log_size > 22) return error.UnqualifiedWideClockGkr;
+        if (self.main.log_size > 22 and self.data.cpu_u8_pairs) return error.UnqualifiedWideClockGkr;
         const globals = @import("global_cpu.zig");
         const global_width = globals.layout(self.data.instance.origin).width();
         if ((global_width != 0) != (self.global != null)) return error.MissingWideGlobalRole;
         if (self.global) |g| try globals.validateClaims(self.data.instance.origin, g.claims);
 
         if (self.data.instance.row_log != self.main.log_size or self.data.point.n != self.main.log_size or self.data.instance.origin != .core) return error.LocalGkrRoleMismatch;
-        if (self.data.cpu_compact_decode and !self.data.cpu_u8_pairs) return error.LocalGkrRoleMismatch;
+        if (self.data.cpu_compact_decode and !self.data.cpu_u8_pairs and !A.word16_execution.layout.wideClock(self.main.log_size)) return error.LocalGkrRoleMismatch;
         const expected = try mainRoleFor(self.data.instance.origin.core, self.data.cpu_compact_decode);
         if (expected != self.main.role() or self.data.instance.main_offset != self.main.offsets[1] or self.data.instance.fixed_offset != self.main.offsets[0] or self.data.instance.terms != (if ((self.main.role() == .cpu or self.main.role() == .cpu_compact) and self.data.cpu_u8_pairs) @as(u32, 14) else @import("roster.zig").terms(self.data.instance.origin.core))) return error.LocalGkrRoleMismatch;
         if (self.data.lane_count != @as(usize, 1) << @intCast(try self.data.instance.laneLog())) return error.LocalGkrRoleMismatch;

@@ -27,6 +27,10 @@ pub fn Adapter(comptime Entry: type) type {
                 m.job.packed_verdict = target.class_unpack_status;
                 _ = try m.job.layout.add(.opaque_words, @import("jobs/outer_packed_class.zig").field_index, 1);
             }
+            // Proofless installation warms immutable leaf data in the same
+            // persistent regions that request jobs bind. Packed leaves use
+            // their compressed region in either mode.
+            m.job.leaf_persistent = e.staged.statics.device_twiddles;
             m.job.require_warm = e.resources_warmed;
             m.job.defer_decode = true;
             if (target.device < e.graphs.len) {
@@ -44,7 +48,7 @@ pub fn Adapter(comptime Entry: type) type {
             const m: *Made = @ptrCast(@alignCast(raw));
             const st = m.job.staged;
             const b = m.job.bases;
-            const out = OD.Inputs{ .packed_input = m.job.staged_packed, .seeds = .{ .ptr = @constCast(b.at(st.image.seeds)), .words = st.assignment.seeds.len }, .channel_seed = .{ .ptr = @constCast(b.at(st.image.channel_seed)), .words = 9 }, .outputs = .{ .ptr = @constCast(b.at(st.image.expected)), .words = st.expected.len } };
+            const out = OD.Inputs{ .seeds = .{ .ptr = @constCast(b.at(st.image.seeds)), .words = st.assignment.seeds.len }, .channel_seed = .{ .ptr = @constCast(b.at(st.image.channel_seed)), .words = 9 }, .outputs = .{ .ptr = @constCast(b.at(st.image.expected)), .words = st.expected.len } };
             m.enc.outputs_device = out.outputs;
             return out;
         }

@@ -96,6 +96,11 @@ fn pairedCounts(comptime cpu: bool) Counts {
     if (cpu) Fns.cpuModeFor(M, &fixed, &main, M.zero(), true, &sink) else Fns.andTableModeFor(M, &fixed, &main, true, &sink);
     return sink.counts;
 }
+pub const WIDE_CPU = blk: {
+    var sink = Counter{};
+    Fns.cpuClockFor(M, &([_]M{M.zero()} ** 3), &([_]M{M.zero()} ** A.word16_execution.layout.main.COUNT), M.zero(), .wide, &sink);
+    break :blk sink.counts;
+};
 pub const PAIRED_CPU = pairedCounts(true);
 pub const PAIRED_AND = pairedCounts(false);
 pub const DWORD = blk: {

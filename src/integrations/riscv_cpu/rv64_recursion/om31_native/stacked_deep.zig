@@ -12,42 +12,60 @@ pub const Pair = struct { value: Base, adjacent: Base };
 
 pub const Cohort = struct {
     weights: []const F,
-    re: []const F,
+    intercept: []const F,
     im: []const F,
-    point: C.Point,
+    determinant: I,
+    x_im: I,
+    y_im: I,
 
     /// Samples are group-major, followed within each group by source ordinal.
     pub fn init(ctx: *C.Context, width: usize, weights: []const F, samples: []const F, point: C.Point) !Cohort {
         if (width == 0 or !std.math.isPowerOfTwo(width) or width > @as(usize, 1) << max_log or
             weights.len == 0 or samples.len % width != 0 or samples.len / width != weights.len)
             return error.ShapeMismatch;
-        const re = try ctx.scratch().alloc(F, width);
+        const intercept = try ctx.scratch().alloc(F, width);
         const im = try ctx.scratch().alloc(F, width);
-        @memset(re, F.zero());
+        @memset(intercept, F.zero());
         @memset(im, F.zero());
         _ = point.y.c1.inv();
-        for (weights, 0..) |weight, group| {
-            for (samples[group * width ..][0..width], re, im) |v, *r, *i| {
+        const row_weights = try ctx.scratch().alloc(F, weights.len);
+        const scale = if (width == 1) point.y.c1 else point.y.c1.mul(I.fromBase(core.fields.m31.M31.fromCanonical(1 << 30)));
+        // The line normalization is a fixed OM31 multiplier. Move it into
+        // every source weight once, before folding the conjugate samples.
+        for (weights, 0..) |raw_weight, group| {
+            const weight = lineScale(raw_weight);
+            row_weights[group] = weight.mulInner(scale);
+            for (samples[group * width ..][0..width], intercept, im) |v, *r, *i| {
                 r.* = r.add(weight.mulInner(v.c0));
                 i.* = i.add(weight.mulInner(v.c1));
             }
         }
-        return .{ .weights = weights, .re = re, .im = im, .point = point };
+        // The OODS point and coefficients are fixed before any query. Form
+        // the constant part of the conjugate line once in each basis lane.
+        for (intercept, im) |*r, i| r.* = i.mulInner(point.y.c0).sub(r.mulInner(point.y.c1));
+        return .{
+            .weights = row_weights,
+            .intercept = intercept,
+            .im = im,
+            .x_im = point.x.c1,
+            .y_im = point.y.c1,
+            .determinant = point.x.c0.mul(point.y.c1).sub(point.y.c0.mul(point.x.c1)),
+        };
     }
 
-    pub fn answer(self: Cohort, x: I, y: I, rows: []const Pair) !F {
+    pub fn answer(self: Cohort, x: I, y: I, rows: []const Pair, odd_weight: ?F) !F {
         if (rows.len != self.weights.len) return error.ShapeMismatch;
-        const z = self.point;
         var plus = F.zero();
         for (self.weights, rows) |weight, row| plus = plus.add(weight.mulInner(I.wire(row.value.get())));
-        if (self.re.len == 1) {
-            const line = plus.sub(self.re[0]).mulInner(z.y.c1).add(self.im[0].mulInner(z.y.c0.sub(y)));
-            const den = z.x.c0.sub(x).mul(z.y.c1).sub(z.y.c0.sub(y).mul(z.x.c1));
-            return lineScale(line.mulInner(den.inv()));
+        if (self.intercept.len == 1) {
+            if (odd_weight != null) return error.ShapeMismatch;
+            const line = plus.add(self.intercept[0]).sub(self.im[0].mulInner(y));
+            const den = self.determinant.sub(x.mul(self.y_im)).add(y.mul(self.x_im));
+            return line.mulInner(den.inv());
         }
         var minus = F.zero();
         for (self.weights, rows) |weight, row| minus = minus.add(weight.mulInner(I.wire(row.adjacent.get())));
-        const log = std.math.log2_int(usize, self.re.len);
+        const log = std.math.log2_int(usize, self.intercept.len);
         var factors: [max_log]I = undefined;
         var folded_x = x;
         var ratio = I.one();
@@ -57,18 +75,26 @@ pub const Cohort = struct {
             folded_x = folded_x.square().double().sub(I.one());
         }
         const folded_y = y.mul(ratio);
-        _ = folded_y.inv();
-        const h = I.fromBase(core.fields.m31.M31.fromCanonical(1 << 30));
-        const re = basis(self.re, factors[0..log]);
+
+        const intercept = basis(self.intercept, factors[0..log]);
         const im = basis(self.im, factors[0..log]);
         // Project the even and odd parts separately before dividing on each fiber.
-        const center = plus.add(minus).mulInner(h).sub(re).mulInner(z.y.c1).add(im.mulInner(z.y.c0));
-        const delta = plus.sub(minus).mulInner(h.mul(ratio)).mulInner(z.y.c1).sub(im.mulInner(folded_y));
-        const den = z.x.c0.sub(folded_x).mul(z.y.c1).sub(z.y.c0.mul(z.x.c1));
-        const dy = folded_y.mul(z.x.c1);
-        const q0 = center.add(delta).mulInner(den.add(dy).inv());
-        const q1 = center.sub(delta).mulInner(den.sub(dy).inv());
-        return lineScale(q0.add(q1).add(q0.sub(q1).mulInner(ratio.inv())).mulInner(h));
+        const center = plus.add(minus).add(intercept);
+        const delta = plus.sub(minus).sub(im.mulInner(y));
+        const den = self.determinant.sub(folded_x.mul(self.y_im));
+        const slope = y.mul(self.x_im);
+        const dy = folded_y.mul(self.x_im);
+        // The product is nonzero exactly when the fiber and both conjugate
+        // denominators are nonsingular. One inverse witness enforces all three.
+        const norm = den.square().sub(dy.square());
+        const inverse_norm = norm.mul(folded_y).inv().mul(folded_y);
+        const lower = dy.mul(ratio);
+        const numerator = if (odd_weight) |weight| blk: {
+            const even = center.mulInner(den).sub(delta.mulInner(lower));
+            const odd = delta.mulInner(den).sub(center.mulInner(slope));
+            break :blk even.add(odd.mul(weight));
+        } else center.mulInner(den.sub(slope)).add(delta.mulInner(den.sub(lower)));
+        return numerator.mulInner(inverse_norm);
     }
 };
 

@@ -146,6 +146,9 @@ pub fn firstIds(requests: []const Request, index: usize) ![T.FAMILIES]u32 {
     return out;
 }
 pub fn admit(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, requests: []const Request, expected: Expected) ![T.FAMILIES]u32 {
+    return admitFor(.classic, a, setups, truths, requests, expected);
+}
+pub fn admitFor(projection: G.Projection, a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, requests: []const Request, expected: Expected) ![T.FAMILIES]u32 {
     if (setups.len == 0 or setups.len > 65535 or truths.len > 65535 - setups.len or setups.len != requests.len) return error.InvalidCombinedInventory;
     const suite = setups[0].materials.suite;
     try suite.validate();
@@ -209,7 +212,7 @@ pub fn admit(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []
         ram = try std.math.add(u64, ram, bulk.ram);
         ram = try std.math.add(u64, ram, sponge.ram);
     }
-    try G.validateMaterials(mats, rr, expected);
+    try G.validateMaterialsFor(projection, mats, rr, expected);
     ram = try std.math.add(u64, ram, rr[0].memory.initial.len + rr[rr.len - 1].memory.terminal.len);
     if (ram >= core.fields.m31.Modulus) return error.GlobalRamCharacteristicBound;
     if (50 * totals[0] >= core.fields.m31.Modulus) return error.CombinedLookupMassExceeded;

@@ -39,6 +39,26 @@ pub fn parsePinnedAir(a: std.mem.Allocator, bytes: []const u8) !Air.Bundle {
     if (!std.mem.eql(u8, &actual, Air.bundle_sha256)) return error.InvalidOm31CircuitAirAuthority;
     return Air.parse(a, bytes);
 }
+/// Emit the same mixed arithmetic polynomial as the live binder. AOT only
+/// reads component-local masks, so no physical FIXED order is assigned here.
+pub fn bindMixedAot(a: std.mem.Allocator, bundle: *Air.Bundle) !void {
+    try @import("arithmetic/air.zig").bind(a, bundle, null);
+}
+
+fn bindArithmetic(a: std.mem.Allocator, template: *const Air.Bundle, pp: *const Preprocessed, logs: List.PerComponent(u32), layout: *const circuit.common.preprocessed.ColumnLayout) !Air.Bundle {
+    const mass = try validateGatherMass(logs, pp.n_outputs);
+    var bound = try Air.bind(a, template, logs, layout);
+    errdefer bound.deinit();
+    if (pp.mixed_arithmetic) {
+        if (P.active() != .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1)
+            return error.MixedArithmeticProfileRequired;
+        if (mass + (@as(u64, 1) << @intCast(logs.get(.qm31_ops))) >= core.fields.m31.Modulus)
+            return error.Om31CircuitCharacteristicBound;
+        try @import("arithmetic/air.zig").bind(a, &bound, layout);
+    }
+    return bound;
+}
+
 pub const Authority = struct {
     allocator: std.mem.Allocator,
     pp: *const Preprocessed,
@@ -82,15 +102,13 @@ pub const Authority = struct {
         }
     };
     pub fn prepareForDeviceProver(a: std.mem.Allocator, pp: *const Preprocessed) !DevicePrepared {
-        if (pp.mixed_arithmetic) return error.MixedArithmeticRequiresHost;
         const bytes = try std.fs.cwd().readFileAlloc(a, Air.bundle_path, 64 << 20);
         defer a.free(bytes);
         var template = try parsePinnedAir(a, bytes);
         defer template.deinit();
         const layout = pp.layout();
         const logs = try List.circuitComponentLogSizes(&layout);
-        _ = try validateGatherMass(logs, pp.n_outputs);
-        const bound = try Air.bind(a, &template, logs, &layout);
+        const bound = try bindArithmetic(a, &template, pp, logs, &layout);
         var fixed_logs: [circuit.common.preprocessed.N_PREPROCESSED_COLUMNS]u32 = undefined;
         for (pp.columns, &fixed_logs) |column, *log| log.* = column.logSize();
         return .{ .allocator = a, .pp = pp, .layout = layout, .logs = logs, .fixed_logs = fixed_logs, .bound = bound };
@@ -110,11 +128,10 @@ pub const Authority = struct {
         var template = try parsePinnedAir(a, bytes);
         defer template.deinit();
         const logs = try List.circuitComponentLogSizes(&layout);
-        _ = try validateGatherMass(logs, stub.n_outputs);
-        const bound = try Air.bind(a, &template, logs, &layout);
+        const bound = try bindArithmetic(a, &template, stub, logs, &layout);
         var fixed_logs: [circuit.common.preprocessed.N_PREPROCESSED_COLUMNS]u32 = undefined;
         for (layout.entries, &fixed_logs) |entry, *log| log.* = entry.log_size;
-        return .{ .allocator = a, .pp = stub, .layout = layout, .logs = logs, .fixed_logs = fixed_logs, .bound = bound, .fixed = null, .fixed_root = root, .retired = true, .identity = identityOf(root, logs, stub.n_outputs, false) };
+        return .{ .allocator = a, .pp = stub, .layout = layout, .logs = logs, .fixed_logs = fixed_logs, .bound = bound, .fixed = null, .fixed_root = root, .retired = true, .identity = identityOf(root, logs, stub.n_outputs, stub.mixed_arithmetic) };
     }
     fn identityOf(root: P.H.Hash, logs: List.PerComponent(u32), n_outputs: usize, mixed: bool) [32]u8 {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
@@ -138,18 +155,8 @@ pub const Authority = struct {
         defer template.deinit();
         const layout = pp.layout();
         const logs = try List.circuitComponentLogSizes(&layout);
-        const original_mass = try validateGatherMass(logs, pp.n_outputs);
-        var bound = try Air.bind(a, &template, logs, &layout);
+        var bound = try bindArithmetic(a, &template, pp, logs, &layout);
         errdefer bound.deinit();
-        if (pp.mixed_arithmetic) {
-            if (device_root != null) return error.MixedArithmeticRequiresHost;
-            if (P.active() != .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1)
-                return error.MixedArithmeticProfileRequired;
-            const arithmetic_log = logs.get(.qm31_ops);
-            if (original_mass + (@as(u64, 1) << @intCast(arithmetic_log)) >= core.fields.m31.Modulus)
-                return error.Om31CircuitCharacteristicBound;
-            try @import("arithmetic/air.zig").bind(a, &bound, &layout);
-        }
         var fixed: ?P.Scheme.CommittedTree = null;
         errdefer if (fixed) |*tree| tree.deinit(a);
         var fixed_logs: [circuit.common.preprocessed.N_PREPROCESSED_COLUMNS]u32 = undefined;
@@ -331,9 +338,5 @@ pub fn selectMixed(a: std.mem.Allocator, graph: *const circuit.builder.Circuit, 
     return Mixed.Plan.select(a, graph, largest_other);
 }
 pub fn prepareMixed(a: std.mem.Allocator, graph: *const circuit.builder.Circuit, plan: *const Mixed.Plan) !Preprocessed {
-    var block = try plan.assemble(a, graph);
-    defer block.deinit();
-    var output: Preprocessed.ArithmeticBlock = .{ .columns = undefined, .first_permutation_row = block.first_permutation_row };
-    for (&output.columns, 0..) |*column, i| column.* = block.column(i);
-    return Preprocessed.fromCircuitWithArithmetic(a, circuit.common.preprocessed.CircuitView.fromBuilder(graph), output);
+    return Preprocessed.fromCircuitWithArithmeticWriter(a, circuit.common.preprocessed.CircuitView.fromBuilder(graph), @as(?*const Mixed.Plan, plan));
 }

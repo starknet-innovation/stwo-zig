@@ -350,6 +350,7 @@ test "OM31 frame worker framing shared draws and public digest match native auth
 
 test {
     _ = @import("truth_leaf_test.zig");
+    _ = @import("truth_group_test.zig");
 }
 
 test {

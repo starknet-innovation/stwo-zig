@@ -185,3 +185,61 @@ test "wide route fails closed on every v3 bridge, call, bulk/sponge row and trut
     metadata.truths = &keccak_truths;
     try std.testing.expectError(error.GkrV3ServiceUnsupported, Wire.validate(metadata, .{}));
 }
+
+test "compact-wide wire scope binds even a short terminal worker before loading proof files" {
+    var setup: R.CpuSetup = undefined;
+    setup.bridges = .{};
+    setup.materials.geometry = .{ .cpu_log = 23, .cpu_fused_tail = true, .cpu_compact_decode = true };
+    var tail = setup;
+    tail.materials.geometry = .{ .cpu_log = 5, .cpu_fused_tail = true, .cpu_u8_pairs = true, .cpu_compact_decode = true };
+    const Compact = @import("../wire.zig").CompactRequest;
+    var packet: Compact = .{ .cpu = .{ .steps = 1, .initial_pc = 4, .final_pc = 8, .initial_registers = @splat(0), .final_registers = @splat(0), .register_clocks = @splat(0) }, .epoch = 1, .memory_epoch = 1, .division_requests = 0, .multiplication_requests = 0, .ls_count = 0, .calls = @splat(0) };
+    var requests = [_]@import("../protocol.zig").Request{ packet.expand(&.{}, &.{}), undefined };
+    requests[0].base.cpu.steps = (1 << 23) - 1;
+    requests[0].base.cpu.register_clocks[1] = 4 * requests[0].base.cpu.steps;
+    packet.epoch = 2;
+    packet.memory_epoch = 2;
+    requests[1] = packet.expand(&.{}, &.{});
+    const Worker = @import("cpu_worker.zig");
+    var claims = [_]core.fields.om31.OM31{core.fields.om31.OM31.zero()} ** 3;
+    var body = [_]u8{11};
+    var proofs = [_]Worker.CpuEncoded{.{ .bytes = &body, .claims = &claims }} ** 2;
+    var bundle: @import("coordinator.zig").Bundle = .{ .requests = &requests, .cpus = &proofs, .truths = &.{}, .stage_one_bytes = &body };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try Wire.writeFor(.compact_wide, a, tmp.dir, &.{ &setup, &tail }, &.{}, &bundle);
+    var loaded = try Wire.readFor(.compact_wide, a, tmp.dir, .{});
+    defer loaded.deinit(a);
+    try std.testing.expectEqual(@as(u32, 23), loaded.cpu_declarations[0].geometry.cpu_log);
+    try std.testing.expectEqual(@as(u32, 5), loaded.cpu_declarations[1].geometry.cpu_log);
+    try tmp.dir.deleteFile("cells.bin");
+    try std.testing.expectError(error.WideBundleProfile, Wire.read(a, tmp.dir, .{}));
+
+    // A wide request may halt within its first short window. Both directions
+    // still distinguish request scope before attempting to read the RAM file.
+    requests[0].base.cpu.steps = 1;
+    requests[0].base.cpu.register_clocks[1] = 4;
+    bundle.requests = requests[0..1];
+    bundle.cpus = proofs[0..1];
+    var short = std.testing.tmpDir(.{});
+    defer short.cleanup();
+    try Wire.writeFor(.compact_wide, a, short.dir, &.{&tail}, &.{}, &bundle);
+    try short.dir.deleteFile("cells.bin");
+    try std.testing.expectError(error.WideBundleProfile, Wire.read(a, short.dir, .{}));
+    var old = std.testing.tmpDir(.{});
+    defer old.cleanup();
+    try Wire.write(a, old.dir, &.{&tail}, &.{}, &bundle);
+    try old.dir.deleteFile("cells.bin");
+    try std.testing.expectError(error.WideBundleProfile, Wire.readFor(.compact_wide, a, old.dir, .{}));
+
+    // Only the physical CPU MAIN earns the extra degree of width. A service
+    // bridge and an arithmetic family keep their existing limits.
+    setup.bridges.keccak = 23;
+    try std.testing.expectError(error.InvalidLocalGkrGeometry, Wire.writeFor(.compact_wide, a, short.dir, &.{&setup}, &.{}, &bundle));
+    setup.bridges = .{};
+    setup.materials.geometry.multiplication_log = 23;
+    try std.testing.expectError(error.CandidateSourceShapeExceeded, Wire.writeFor(.compact_wide, a, short.dir, &.{&setup}, &.{}, &bundle));
+    setup.materials.geometry.multiplication_log = 5;
+    setup.materials.geometry.alu_log = 23;
+    try std.testing.expectError(error.InvalidExecutionGeometry, Wire.writeFor(.compact_wide, a, short.dir, &.{&setup}, &.{}, &bundle));
+}

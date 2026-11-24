@@ -91,7 +91,7 @@ pub fn metadata(comptime T: type, c: *const T, d: G.Source.Descriptor) [P.count]
 }
 pub fn descriptor(comptime T: type, c: *const T) G.Source.Descriptor {
     if (comptime @hasField(T, "data")) {
-        var result = G.Source.Descriptor{ .origin = c.data.instance.origin };
+        var result = G.Source.Descriptor{ .origin = c.data.instance.origin, .cpu_wide_clock = c.data.instance.origin == .core and c.data.instance.origin.core == .cpu and c.data.instance.row_log == 23 };
         if (comptime @hasField(@TypeOf(c.data), "cpu_u8_pairs")) {
             if (result.origin == .core and (result.origin.core == .cpu or result.origin.core == .and_table)) result.cpu_u8_pairs = c.data.cpu_u8_pairs;
         }

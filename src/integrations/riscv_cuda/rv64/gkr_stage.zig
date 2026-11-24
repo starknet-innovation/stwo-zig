@@ -48,7 +48,7 @@ const Functions = struct {
     channel_init: *const @TypeOf(@import("abi.zig").stwo_rv64_channel_init_on),
     channel_mix: *const @TypeOf(@import("abi.zig").stwo_rv64_channel_mix_on),
     channel_draw: *const @TypeOf(@import("abi.zig").stwo_rv64_channel_draw_on),
-    launch: [@import("projection_fixture_support.zig").count]Launch,
+    launch: [@import("projection_fixture_support.zig").count]?Launch,
 };
 fn symbol(comptime T: type, library: *std.DynLib, name: [:0]const u8) !T {
     return library.lookup(T, name) orelse return error.MissingCudaGkrSymbol;
@@ -114,7 +114,7 @@ pub const Backend = struct {
         for (&functions.launch, 0..) |*launch, i| {
             var name: [32]u8 = undefined;
             const text = try std.fmt.bufPrintZ(&name, "launch_{}", .{i});
-            launch.* = try symbol(Launch, library, text);
+            launch.* = if (i < @import("projection_fixture_support.zig").standard_count) try symbol(Launch, library, text) else library.lookup(Launch, text);
         }
         const numerical = try N.Api.load(library);
         const batch_available = numerical.stwo_rv64_batch_sum_on != null and numerical.stwo_rv64_batch_fold_on != null;
@@ -394,7 +394,8 @@ const Job = struct {
         for (source.items, packets) |item, *packet| {
             const artifact = &b.catalogue.artifacts[item.kernel];
             try checked(b.functions.gather(raw_context, 1, @ptrFromInt(reservoir.address), @constCast(packet.parameters), artifact.source_slots.ptr, @intCast(artifact.source_slots.len), relation_count, @ptrFromInt(status.address)));
-            try checked(b.functions.launch[item.kernel](assigned_stream, packet));
+            const launch = b.functions.launch[item.kernel] orelse return error.MissingWideGkrProjection;
+            try checked(launch(assigned_stream, packet));
         }
         try events.mark(.projection, true, assigned_stream);
         // Projection is the last reader of decoded MAIN/FIXED and FFT scratch.

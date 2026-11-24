@@ -16,6 +16,8 @@ pub const Writer = struct {
     chunks: u32 = 0,
     /// Arena words Stage 1 allocates for the declared buffers (= Program.arenaWords).
     arena_words: u64 = 0,
+    retained_words: u64 = 0,
+    uncounted_words: [Schema.max_buffers]u64 = @splat(0),
 
     pub fn init(out: G.ChunkWriter) Writer {
         return .{ .out = out };
@@ -70,7 +72,11 @@ pub const Writer = struct {
         self.at += body;
         self.next_id += 1;
         self.buffers += 1;
-        if (init_kind != .persistent) self.arena_words += std.mem.alignForward(u64, n, 64);
+        if (init_kind != .persistent) {
+            const aligned = std.mem.alignForward(u64, n, 64);
+            self.arena_words += aligned;
+            self.uncounted_words[id] = aligned;
+        }
         return id;
     }
     /// Data words into `buffer` at word `offset` (split across buffers).
@@ -108,9 +114,13 @@ pub const Writer = struct {
         self.data_words += n;
         return out;
     }
+    pub fn supportsUnit(self: *const Writer, words: usize) bool {
+        return self.buf.len >= Schema.chunk_header_words + Schema.record_header_words + words;
+    }
     /// As `reserve`, in whole units of `unit` words (records never split a
     /// unit): at most `max_units` units, at least one.
     pub fn reserveUnits(self: *Writer, buffer: u16, offset: usize, max_units: usize, unit: usize) ![]u32 {
+        if (max_units == 0 or unit == 0) return error.GnPackEmptyReservation;
         if (self.buf.len == 0) try self.open();
         if (self.at + Schema.record_header_words + unit > self.buf.len) {
             try self.flush(0, false);
@@ -140,6 +150,11 @@ pub const Writer = struct {
         self.header(.status, 2, 0, 0);
         self.buf[self.at..][0..2].* = .{ @truncate(word), @truncate(word >> 32) };
         self.at += 2;
+        const id = word >> 48;
+        if (id < self.next_id) {
+            self.retained_words += self.uncounted_words[id];
+            self.uncounted_words[id] = 0;
+        }
     }
     /// Close the segment: the end record and the last chunk (all `rows`).
     pub fn end(self: *Writer, columns: u32, rows: u64) !void {

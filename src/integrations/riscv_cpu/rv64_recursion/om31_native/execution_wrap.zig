@@ -14,6 +14,20 @@ const CpuLeaf = @import("cpu_leaf.zig");
 const TruthLeaf = @import("truth_leaf.zig");
 const KeccakLeaf = @import("keccak_leaf.zig");
 const Graph = @import("leaf_graph.zig");
+pub const ClassSetup = struct {
+    pub const Leaf = Graph.Graph;
+    pub const Cpu = Graph.CpuRecipe;
+    pub const Truth = Graph.TruthRecipe;
+    pub const ServiceGroup = Graph.TruthGroupRecipe;
+    pub const ServiceGroupSpan = @import("truth_group.zig").Span;
+    pub const Fold = @import("../om31_outer.zig").buildFoldRecipe;
+    pub const fold_key = @import("../om31_outer.zig").setupClassKey;
+    pub const fold_message = @import("../om31_outer.zig").setupMessage;
+    pub const Parameters = @import("outer_wrap.zig").HostPrep;
+    pub const prepare = @import("outer_wrap.zig").prepareClass;
+    pub const prepareAndNotify = @import("outer_wrap.zig").prepareClassAndNotify;
+    pub const protocol = @import("stwo_circuit_cpu_integration").om31.protocol;
+};
 const Outer = @import("outer_wrap.zig");
 const Bridge = @import("../om31_outer.zig");
 const Prove = @import("stwo_circuit_cpu_integration").om31.prove;
@@ -188,7 +202,7 @@ pub const ScheduleInspection = struct {
 };
 
 pub fn run(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: ?*const FixedSet, dir: std.fs.Dir, allow_resume: bool, factory: ?Outer.Device.Factory) !Report {
-    return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, allow_resume, factory, null, false);
+    return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, allow_resume, factory, null, false, null);
 }
 /// Explicit candidate route. Hardware admission remains with the caller; every
 /// supplied lane must own a distinct physical device and an atomic GPU factory.
@@ -200,7 +214,7 @@ pub fn runWithFactories(a: std.mem.Allocator, setups: []const *const R.CpuSetup,
     defer budget.destroy();
     var stacks = try StackReservations.init(a, options);
     defer stacks.deinit();
-    return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, allow_resume, null, options, false);
+    return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, allow_resume, null, options, false, null);
 }
 /// Reserves existing OS helper stacks as well as newly spawned coordinators.
 /// A borrowed caller reservation is validated, never consumed or double charged.
@@ -233,24 +247,37 @@ pub const StackReservations = struct {
 /// invokes a factory or rewrites the producer's proof/tree/report artifacts.
 pub fn verifyExisting(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: ?*const FixedSet, dir: std.fs.Dir) !Report {
     try @import("publication.zig").requireExisting(dir, try Dag.Plan.initArity(setups.len + truths.len, try foldArity()));
-    return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, true, null, null, true);
+    return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, true, null, null, true, null);
 }
+/// Explicit full-tree qualification route for the measured three-service tail.
+/// The independent receiver always reads every required node under freshly
+/// constructed authorities. Canonical singleton routes keep their own plan.
+pub fn qualifyServiceGroup(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: *const FixedSet, dir: std.fs.Dir, operation: union(enum) { produce: struct { prefix: std.fs.Dir, factory: ?Outer.Device.Factory }, verify }) !Report {
+    if (truths.len < 3 or setups.len == 0) return error.ServiceGroupSpan;
+    const workers = try std.math.add(usize, setups.len, truths.len);
+    if (workers > Dag.max_leaves) return error.ServiceGroupSpan;
+    const span = try @import("truth_group.zig").Span.init(@intCast(workers - 3), workers);
+    for (truths[truths.len - 3 ..], 0..) |truth, i| try span.checkRole(i, truth, span.first + @as(u32, @intCast(i)));
+    const plan = try span.terminalPlan(workers, try foldArity());
+    if (operation == .verify) try @import("publication.zig").requireExisting(dir, plan);
+    return runImpl(a, setups, truths, bundle, expected, config, fixed, dir, operation == .verify, if (operation == .produce) operation.produce.factory else null, null, operation == .verify, .{ .span = span, .prefix = if (operation == .produce) operation.produce.prefix else null });
+}
+
 fn mixedArithmetic() bool {
     return @import("stwo_circuit_cpu_integration").om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1;
 }
 
 pub fn validateLanes(options: ParallelOptions) !void {
-    if (mixedArithmetic()) return error.CpuRecursionProfileRequiresCpu;
     if (options.lanes.len == 0 or options.lanes.len > 4) return error.InvalidRecursionAdmission;
     var identities: [4]Dag.LaneIdentity = undefined;
     for (options.lanes, 0..) |lane, i| {
+        if (mixedArithmetic() and lane.factory.precommit_fixed == null) return error.MixedArithmeticRequiresDeviceFixed;
         if (lane.factory.prepare_from_circuit == null) return error.TraceOnlySourceRequired;
         identities[i] = .{ .device = lane.physical_device, .factory = @intFromPtr(lane.factory.context), .pool = @intFromPtr(lane.pool), .workers = lane.pool.workerCount() };
     }
     try Dag.validateLanes(identities[0..options.lanes.len], options.pool_worker_budget, options.max_pending_authorities);
 }
-fn runImpl(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: ?*const FixedSet, dir: std.fs.Dir, allow_resume: bool, factory: ?Outer.Device.Factory, parallel: ?ParallelOptions, existing_only: bool) !Report {
-    if (mixedArithmetic() and (factory != null or parallel != null)) return error.CpuRecursionProfileRequiresCpu;
+fn runImpl(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: ?*const FixedSet, dir: std.fs.Dir, allow_resume: bool, factory: ?Outer.Device.Factory, parallel: ?ParallelOptions, existing_only: bool, group: ?struct { span: @import("truth_group.zig").Span, prefix: ?std.fs.Dir }) !Report {
     var timer = try std.time.Timer.start();
     var inventory = try Execution.Inventory.initWithAuthority(a, setups, truths, bundle.requests, expected, config, fixed);
     defer inventory.deinit();
@@ -301,7 +328,7 @@ fn runImpl(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []co
     // Reuse the admitted inventory and stage decode. Check frame closure here
     // for early refusal and again after freshly verifying the recursive tree.
     const metadata = try Root.checkPrepared(a, setups, truths, bundle.requests, &inventory, stages.stages, frames, .{}, 1);
-    const prepared = PreparedExecution{ .allocator = a, .setups = setups, .truths = truths, .bundle = bundle, .expected = expected, .config = config, .fixed = fixed, .dir = dir, .allow_resume = allow_resume, .inventory = &inventory, .stages = &stages, .manifest = &manifest, .words = words, .frames = frames, .timer = &timer, .existing_only = existing_only, .factory = factory };
+    const prepared = PreparedExecution{ .allocator = a, .setups = setups, .truths = truths, .bundle = bundle, .expected = expected, .config = config, .fixed = fixed, .dir = dir, .allow_resume = allow_resume, .inventory = &inventory, .stages = &stages, .manifest = &manifest, .words = words, .frames = frames, .timer = &timer, .existing_only = existing_only, .factory = factory, .service_group = if (group) |g| g.span else null, .prefix_source = if (group) |g| g.prefix else null };
     if (parallel) |options| return runPreparedParallel(prepared, options, null, arity);
     // m3 k-ary trees use the plan-driven path; binary r1 keeps the original
     // streaming carry below byte for byte.
@@ -454,5 +481,8 @@ pub fn treeJson(a: std.mem.Allocator, plan: *const Dag.Plan, nodes: []const Node
     const wide = try a.alloc(WideNode, plan.count);
     defer a.free(wide);
     for (wide, nodes, plan.nodes[0..plan.count]) |*out, node, *spec| out.* = .{ .first_leaf = node.first_leaf, .leaf_count = node.leaf_count, .children = spec.kids(), .authority = node.authority, .digest = node.digest };
-    return std.json.Stringify.valueAlloc(a, .{ .schema = 3, .fold_arity = plan.arity, .outer_profile = @import("stwo_circuit_cpu_integration").om31.protocol.active().name(), .nodes = wide, .root = plan.root, .cpu_frames = frames.cpus, .truth_frames = frames.truths }, .{ .whitespace = .indent_2 });
+    const schema: u32 = for (plan.nodes[0..plan.count]) |node| {
+        if (node.isLeaf() and node.leaf_count != 1) break 4;
+    } else 3;
+    return std.json.Stringify.valueAlloc(a, .{ .schema = schema, .fold_arity = plan.arity, .outer_profile = @import("stwo_circuit_cpu_integration").om31.protocol.active().name(), .nodes = wide, .root = plan.root, .cpu_frames = frames.cpus, .truth_frames = frames.truths }, .{ .whitespace = .indent_2 });
 }

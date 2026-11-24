@@ -308,7 +308,7 @@ pub const World = struct {
     }
     /// One chunk per segment through the ring writer; the native tag is the rows.
     fn nPack(raw: *anyopaque, _: *const G.RequestContext, cs: G.CapturedSegment, wr: G.ChunkWriter) anyerror!u64 {
-        const rows: *const u64 = @ptrCast(@alignCast(cs.native));
+        const rows: *const u64 = @ptrCast(@alignCast(cs.native orelse return error.DeviceFixtureMissingNativeInput));
         const b = try wr.next();
         b[0] = cs.segment;
         try wr.put(1, @intCast(rows.*), true);

@@ -201,7 +201,7 @@ pub const Stage1ParityJob = struct {
         const bind_words = if (self.binding) |b| b.plan.output_words + b.plan.enqueueWords() + bindingTreeWords(b.plan) + 4 * 64 else 0;
         const peak = @max(fixed.deviceWords(), @max(mp.deviceWords(), mp.coefficient_cells + 64 + g.enqueueWords() + bind_words));
         const bind_pinned = if (self.binding) |b| b.plan.pinnedWords() else 0;
-        return .{ .device_words = staged + mirror + peak + 8 * 64, .staged_words = staged, .slab_words = self.layout.words, .pinned_words = self.fixed_host_words + 2 * (fixed.tw.twiddles.len + fixed.tw.itwiddles.len + mp.tw.twiddles.len + mp.tw.itwiddles.len) + 8 * (fixed.logs.len + mp.logs.len) + g.pinnedWords() + bind_pinned + 256 };
+        return .{ .device_words = staged + mirror + peak + 8 * 64, .staged_words = staged, .slab_words = self.layout.words, .pinned_words = self.fixed_host_words + 2 * (fixed.twiddleWords() + mp.twiddleWords()) + 8 * (fixed.logs.len + mp.logs.len) + g.pinnedWords() + bind_pinned + 256 };
     }
     pub fn stage(self: *Stage1ParityJob, s: *api.Stager) !void {
         try self.s1.stage(s, self.fixed_inputs, self.main_inputs);

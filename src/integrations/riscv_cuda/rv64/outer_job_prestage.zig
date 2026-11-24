@@ -29,6 +29,7 @@ const TC = @import("jobs/outer_trace_commit.zig");
 const K = @import("jobs/outer_kernels.zig");
 const Job = @import("jobs/outer_job.zig");
 const Checks = @import("jobs/outer_checks.zig");
+const PackedClass = @import("jobs/outer_packed_class.zig");
 
 /// Circuit constants of the om31 LogUp closure (witness.zig lookupSum).
 fn lookupStatic() Checks.LookupStatic {
@@ -105,12 +106,16 @@ pub const Input = struct {
     class: ?[32]u8 = null,
     is_leaf: bool = false,
     seed_tape: ?*Dev.SeedTape = null,
+    child_proof_starts: []const u32 = &.{},
     blake_sample_inputs: ?[]const [26]u32 = null,
     /// Base image handle; Prepared.init resolves its launch symbols from it.
     library: *std.DynLib,
     /// Build the composition statics (whole-node jobs; prefix-only parity
     /// runs may skip them).
     composition: bool = true,
+    device_twiddles: bool = false,
+    /// Device-generated inputs always carry in-circuit output and relation checks.
+    require_device_checks: bool = false,
     /// A host-prepared assignment plan for exactly `graph` (the request
     /// layer's prepare_host, built on the prep thread with the node's hints
     /// installed; required for seed-tape stub graphs). Moved into the Staged
@@ -141,6 +146,130 @@ const Hints = struct {
         Dev.class_is_leaf = self.class_is_leaf;
         Dev.seed_tape = self.seed_tape;
         Dev.blake_sample_inputs = self.blake_sample_inputs;
+    }
+};
+
+fn prepareAssignment(a: std.mem.Allocator, graph: *const circuit.builder.Context(Q), library: *std.DynLib, hints: Hints) !Assignment.Prepared {
+    const previous = Hints.get();
+    defer previous.install();
+    if (hints.seed_tape == null) if (@import("assignment_padding.zig").prefix(graph)) |prefix| trimmed: {
+        var compact = hints;
+        if (hints.class_hint) |key| {
+            // A prefix plan is private to staged jobs. A graph or seed tape
+            // using the ordinary device executor requires the complete plan.
+            var h = std.crypto.hash.sha2.Sha256.init(.{});
+            h.update("rv64/staged-zero-variables/v1");
+            h.update(&key);
+            h.update(std.mem.asBytes(&[_]u32{ prefix.graph.circuit.n_vars, prefix.twos, prefix.zeros }));
+            compact.class_hint = h.finalResult();
+        }
+        compact.install();
+        var result = Assignment.Prepared.init(a, &prefix.graph, library) catch |err| switch (err) {
+            // A forward dependency into an otherwise zero suffix requires the
+            // original scheduler. It independently validates the entire graph.
+            error.InvalidWitnessVariable => break :trimmed,
+            else => return err,
+        };
+        result.staged_zero_variables = prefix.zeros;
+        result.staged_two_variables = prefix.twos;
+        result.count = graph.circuit.n_vars;
+        const rows = @as(usize, prefix.twos) + graph.circuit.blake_g_gate.items.len - prefix.graph.circuit.blake_g_gate.items.len +
+            graph.circuit.triple_xor.items.len - prefix.graph.circuit.triple_xor.items.len +
+            graph.circuit.m31_to_u32.items.len - prefix.graph.circuit.m31_to_u32.items.len;
+        std.debug.print("GPU_OUTER_PADDING zero_variables={} two_variables={} omitted_tasks={} omitted_task_bytes={}\n", .{ prefix.zeros, prefix.twos, rows, rows * @sizeOf(Assignment.Task) });
+        return result;
+    };
+    hints.install();
+    return Assignment.Prepared.init(a, graph, library);
+}
+
+/// The finalized class graph is read-only during FIXED commitment. Reserve a
+/// single helper to build its assignment schedule while the installer waits
+/// on the worker. On teardown, join before releasing the graph or library.
+pub const SetupAssignment = struct {
+    a: std.mem.Allocator,
+    graph: *const circuit.builder.Context(Q),
+    library: *std.DynLib,
+    class: [32]u8,
+    is_leaf: bool,
+    group: std.Thread.WaitGroup = .{},
+    lease: ?engine.work_pool.WorkLease = null,
+    pool: ?*engine.work_pool.WorkPool = null,
+    result: ?anyerror!Assignment.Prepared = null,
+    plan_ns: u64 = 0,
+    wait_ns: u64 = 0,
+
+    pub fn start(self: *SetupAssignment) !void {
+        const pool = engine.work_pool.currentScopedPool() orelse return;
+        self.lease = pool.acquire(try engine.work_pool.WorkerBudget.init(2)) catch |err| switch (err) {
+            error.WorkerBudgetUnavailable => return,
+            else => return err,
+        };
+        self.pool = pool;
+        errdefer self.release();
+        try self.lease.?.spawnWg(&self.group, run, .{self});
+    }
+
+    fn run(self: *SetupAssignment) void {
+        // Schedule hashing borrows only the still-available helpers from the
+        // same pool. The enclosing lease owns this worker until take/deinit.
+        var scope = engine.work_pool.ScopedPoolBinding.init(self.pool.?) catch |err| {
+            self.result = err;
+            return;
+        };
+        defer scope.deinit();
+        var timer = std.time.Timer.start() catch |err| {
+            self.result = err;
+            return;
+        };
+        self.result = self.prepareNow();
+        self.plan_ns = timer.read();
+    }
+
+    /// For an already leased installer worker holding a finalized class graph.
+    pub fn prepareNow(self: *const SetupAssignment) !Assignment.Prepared {
+        return prepareAssignment(self.a, self.graph, self.library, .{
+            .class_hint = self.class,
+            .class_is_leaf = self.is_leaf,
+            .seed_tape = null,
+            .blake_sample_inputs = null,
+        });
+    }
+
+    fn release(self: *SetupAssignment) void {
+        if (self.lease) |*lease| {
+            self.group.wait();
+            lease.completeWave();
+            lease.deinit();
+            self.lease = null;
+            self.pool = null;
+        }
+    }
+
+    pub fn take(self: *SetupAssignment) !?Assignment.Prepared {
+        if (self.lease == null) return null;
+        var timer = try std.time.Timer.start();
+        self.release();
+        self.wait_ns = timer.read();
+        const result = self.result orelse return error.OuterAssignmentSetupMissing;
+        self.result = null;
+        // The ordinary assignment path can retry after transient FIXED
+        // submission and hash buffers have been freed.
+        if (result) |prepared| return prepared else |err| switch (err) {
+            error.OutOfMemory => return null,
+            else => return err,
+        }
+    }
+
+    pub fn deinit(self: *SetupAssignment) void {
+        self.release();
+        if (self.result) |result| {
+            if (result) |prepared| {
+                var owned = prepared;
+                owned.deinit();
+            } else |_| {}
+        }
+        self.result = null;
     }
 };
 
@@ -198,19 +327,19 @@ pub fn prestage(a: std.mem.Allocator, input: Input) !*St.Staged {
     owner.prepared = if (adopted) |*p| blk: {
         try p.rebind(input.library);
         break :blk p.*;
-    } else blk: {
-        const previous = Hints.get();
-        (Hints{ .class_hint = input.class, .class_is_leaf = input.is_leaf, .seed_tape = input.seed_tape, .blake_sample_inputs = input.blake_sample_inputs }).install();
-        defer previous.install();
-        break :blk try Assignment.Prepared.init(a, graph, input.library);
-    };
+    } else try prepareAssignment(a, graph, input.library, .{
+        .class_hint = input.class,
+        .class_is_leaf = input.is_leaf,
+        .seed_tape = input.seed_tape,
+        .blake_sample_inputs = input.blake_sample_inputs,
+    });
     adopted = null;
     errdefer owner.prepared.deinit();
     const prepared = &owner.prepared;
     if (prepared.reference != null or prepared.count == 0 or prepared.count > std.math.maxInt(u32) / 4) return error.TraceOnlySourceRequired;
     // The statics cache already uses the process allocator; retained native
     // templates take a counted pin rather than borrowing request custody.
-    const acquired = try StaticsCache.acquire(key, !input.is_leaf and input.class != null, input.library, input.composition);
+    const acquired = try StaticsCache.acquire(key, !input.is_leaf and input.class != null, input.library, input.composition, input.device_twiddles);
     errdefer if (acquired.owned) acquired.statics.destroy() else if (acquired.counted) StaticsCache.unref(acquired.statics);
     owner.statics = acquired.statics;
     owner.owns_statics = acquired.owned;
@@ -244,6 +373,8 @@ pub fn prestage(a: std.mem.Allocator, input: Input) !*St.Staged {
     if (prepared.blake_sample_outputs) |map| if (prepared.blake_sample_inputs == null or prepared.blake_sample_inputs.?.len != map.len) return error.BlakeSampleInputCountMismatch;
     const assignment = St.Assignment{
         .count = prepared.count,
+        .zero_variables = prepared.staged_zero_variables,
+        .two_variables = prepared.staged_two_variables,
         .seeds = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(prepared.seeds)),
         .tasks = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(prepared.tasks)),
         .indices = prepared.indices,
@@ -262,13 +393,14 @@ pub fn prestage(a: std.mem.Allocator, input: Input) !*St.Staged {
         .reusable = prepared.reusable and !input.is_leaf,
     };
     if (sample_tape != null and prepared.blake_sample_span == null) return error.MissingBlakeSampleClassSpan;
-    const device_checks = try Checks.selected();
+    const device_checks = input.require_device_checks or try Checks.selected();
     var class_key: [32]u8 = undefined;
     {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         h.update("rv64/m8/outer-job/class/v1\x00");
         h.update(&key.identity);
         h.update(&prepared.identity);
+        if (prepared.staged_zero_variables != 0 or prepared.staged_two_variables != 0) h.update(std.mem.asBytes(&[_]u32{ prepared.staged_two_variables, prepared.staged_zero_variables }));
         class_key = h.finalResult();
     }
     var graph_key: [32]u8 = undefined;
@@ -282,6 +414,7 @@ pub fn prestage(a: std.mem.Allocator, input: Input) !*St.Staged {
         // The device checks add one kernel to the body (topology).
         // v2: the body also clears the check words (one memset node).
         if (device_checks) h.update("device-checks/v2");
+        if (prepared.staged_zero_variables != 0 or prepared.staged_two_variables != 0) h.update(std.mem.asBytes(&[_]u32{ prepared.staged_two_variables, prepared.staged_zero_variables }));
         graph_key = h.finalResult();
     }
     owner.staged = .{
@@ -325,27 +458,55 @@ pub fn prestageHook(_: ?*anyopaque, a: std.mem.Allocator, input: *const anyopaqu
 /// Own the class schedule and statics after a real install-time proof. The
 /// retained template has no seed values, public outputs, channel checkpoint,
 /// sample tape or pointer into the warm request's authority/allocator.
-pub fn packTemplate(a: std.mem.Allocator, source: *St.Staged) !@import("jobs/outer_packed_class.zig").Class {
+pub fn packTemplate(a: std.mem.Allocator, source: *St.Staged) !PackedClass.Class {
     if (source.release != TemplateOwner.release) return error.GnPackedTemplateNotOwned;
     const owner: *TemplateOwner = @ptrCast(@alignCast(source.owner));
     const class_words: usize = @intCast(source.image.words[@intFromEnum(St.Region.class)]);
-    const fixed_words: usize = @intCast((source.statics.fixed_plan orelse return error.OuterJobWholeStagingMissing).coefficient_words);
-    const raw = try a.alloc(u32, class_words + fixed_words);
-    defer a.free(raw);
-    @memset(raw, 0);
-    try source.pack(.class, raw[0..class_words]);
-    try source.packFixed(raw[class_words..]);
+    const fixed = &(source.statics.fixed_plan orelse return error.OuterJobWholeStagingMissing);
+    const fixed_words: usize = @intCast(fixed.coefficient_words);
+    const total = try std.math.add(usize, class_words, fixed_words);
+    if (source.fixed_raw.len != fixed.offsets.len or source.fixed_raw.len != fixed.logs.len)
+        return error.OuterStagedImageTooSmall;
+    const Span = Outer.cache_pack.ImageSpan;
+    const sections = source.sections();
+    var spans: std.ArrayListUnmanaged(Span) = .empty;
+    defer spans.deinit(a);
+    try spans.ensureTotalCapacity(a, sections.len + source.fixed_raw.len);
+    for (sections) |entry| {
+        const range, const words = entry;
+        if (range.region != .class or range.words == 0) continue;
+        if (range.words != words.len or range.offset > class_words or range.words > class_words - range.offset)
+            return error.OuterStagedSectionMismatch;
+        spans.appendAssumeCapacity(.{ .offset = @intCast(range.offset), .words = words });
+    }
+    for (source.fixed_raw, fixed.offsets, fixed.logs) |column, off, log| {
+        if (log >= @bitSizeOf(usize) or column.len != @as(usize, 1) << @intCast(log) or
+            off > fixed_words or column.len > fixed_words - off)
+            return error.InvalidOuterFixedGather;
+        spans.appendAssumeCapacity(.{ .offset = class_words + @as(usize, @intCast(off)), .words = column });
+    }
+    std.mem.sort(Span, spans.items, {}, struct {
+        fn less(_: void, left: Span, right: Span) bool {
+            return left.offset < right.offset;
+        }
+    }.less);
     // Assignment tasks have eight fields. Preserve those predictors instead
     // of delta-coding adjacent fields against each other. All class ranges
     // are granule-aligned; scalar-only odd images retain one channel.
-    var compressed = try Outer.cache_pack.pack(a, raw, if (raw.len % 8 == 0) 8 else 1);
+    var compressed = try Outer.cache_pack.packImage(a, total, spans.items, if (total % 8 == 0) 8 else 1);
     defer compressed.deinit(a);
-    const result = try @import("jobs/outer_packed_class.zig").build(a, compressed, class_words, fixed_words);
+    const result = try PackedClass.build(a, compressed, class_words, fixed_words);
     owner.releasePackedSources();
     return result;
 }
 
-pub fn retainTemplate(a: std.mem.Allocator, input: Input, source: *const St.Staged) !*St.Staged {
+pub const Template = struct {
+    staged: *St.Staged,
+    compressed: ?PackedClass.Class = null,
+    pack_ns: u64 = 0,
+};
+
+pub fn retainTemplate(a: std.mem.Allocator, input: Input, source: *const St.Staged, packed_image: bool) !Template {
     if (source.assignment.sample_tape != null or source.assignment.sample_map != null) return error.GnTemplateContainsSampleWitness;
     const owner = try a.create(TemplateOwner);
     errdefer a.destroy(owner);
@@ -358,7 +519,7 @@ pub fn retainTemplate(a: std.mem.Allocator, input: Input, source: *const St.Stag
         owner.pin = pin;
         break :blk source.statics;
     } else |_| blk: {
-        const s = try Statics.init(a, input.key, input.library, true);
+        const s = try Statics.init(a, input.key, input.library, true, input.device_twiddles);
         s.public.class_plan = @ptrCast(&s.slot);
         owner.statics = s;
         break :blk &s.public;
@@ -372,16 +533,21 @@ pub fn retainTemplate(a: std.mem.Allocator, input: Input, source: *const St.Stag
     if (seeds.len % 5 != 0) return error.InvalidOuterSeedLayout;
     for (0..seeds.len / 5) |i| @memset(seeds[5 * i + 1 ..][0..4], 0);
     assignment.seeds = seeds;
-    assignment.tasks = try raw.dupe(u32, assignment.tasks);
-    assignment.indices = try raw.dupe(u32, assignment.indices);
+    if (!packed_image) {
+        assignment.tasks = try raw.dupe(u32, assignment.tasks);
+        assignment.indices = try raw.dupe(u32, assignment.indices);
+    }
     assignment.runs = try ar.dupe(St.Run, assignment.runs);
     assignment.level_ends = try ar.dupe(usize, assignment.level_ends);
     assignment.ends = try ar.dupe(u32, assignment.ends);
     assignment.reusable = true;
     const expected = try ar.alloc(u32, source.expected.len);
     @memset(expected, 0);
-    const fixed = try raw.alloc([]const u32, source.fixed_raw.len);
-    for (fixed, source.fixed_raw) |*out, column| out.* = try raw.dupe(u32, column);
+    const fixed = if (packed_image) source.fixed_raw else blk: {
+        const copies = try raw.alloc([]const u32, source.fixed_raw.len);
+        for (copies, source.fixed_raw) |*out, column| out.* = try raw.dupe(u32, column);
+        break :blk copies;
+    };
     owner.staged = source.*;
     owner.staged.assignment = assignment;
     owner.staged.statics = statics;
@@ -393,7 +559,11 @@ pub fn retainTemplate(a: std.mem.Allocator, input: Input, source: *const St.Stag
     owner.staged.image = St.Staged.layoutWith(&assignment, statics, expected.len);
     owner.staged.owner = owner;
     owner.staged.release = TemplateOwner.release;
-    return &owner.staged;
+    if (!packed_image) return .{ .staged = &owner.staged };
+    // Compression joins every reader before we retire the borrowed spans.
+    var timer = try std.time.Timer.start();
+    const compressed = try packTemplate(a, &owner.staged);
+    return .{ .staged = &owner.staged, .compressed = compressed, .pack_ns = timer.read() };
 }
 const TemplateOwner = struct {
     a: std.mem.Allocator,
@@ -454,7 +624,8 @@ pub const FixedPrecommit = struct {
         for (raw, pp.columns) |*dst, column| dst.* = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(column.values));
         return .{ .allocator = a, .plan = plan, .sorted = sorted, .raw = raw };
     }
-    pub fn inputs(self: *const FixedPrecommit) !@import("jobs/outer_fixed_job.zig").Inputs {
+    pub fn inputs(self: *const FixedPrecommit, device_twiddles: bool) !@import("jobs/outer_fixed_job.zig").Inputs {
+        if (device_twiddles) return .{ .plan = &self.plan, .raw = self.raw, .sorted_logs = self.sorted, .device_twiddles = true };
         const tw = try Twiddles.get(self.plan.eval_log);
         return .{ .plan = &self.plan, .raw = self.raw, .sorted_logs = self.sorted, .twiddles = tw.twiddles, .itwiddles = tw.itwiddles };
     }
@@ -642,4 +813,8 @@ test "packed template releases host sources and preserves device extents" {
     try std.testing.expectEqual(@as(u64, 7), owner.staged.image.indices.words);
     try std.testing.expectEqual(@as(usize, 0), owner.staged.fixed_raw.len);
     try std.testing.expectEqualSlices(u32, &.{17}, owner.staged.expected);
+}
+
+test {
+    _ = @import("assignment_padding.zig");
 }

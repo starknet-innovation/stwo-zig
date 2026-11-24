@@ -108,13 +108,30 @@ test "class build: keys of one class (stage-1 fixed region, stage-2 framing, reg
     const fk = NCB.Class.framingKey(key);
     try testing.expect(!std.mem.eql(u8, &fk, &key));
     try testing.expectEqualSlices(u8, &fk, &NCB.Class.framingKey(key));
-    // native_device_stage1 Class.fixed_key formula.
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("rv64-m8-n1-fixed-v1");
-    h.update(&key);
+    const CommitShape = std.meta.Elem(@FieldType(NCB.Class, "fixed_shapes"));
+    var shapes = [_]CommitShape{
+        .{ .log_size = 7, .encoding = .coefficients },
+        .{ .log_size = 5, .encoding = .coefficients },
+    };
     var cl: NCB.Class = undefined;
     cl.key = key;
-    try testing.expectEqualSlices(u8, &h.finalResult(), &cl.fixedKey());
+    cl.fixed_shapes = &shapes;
+    cl.fixed_root = @splat(1);
+    cl.fixed_region_key = null;
+    cl.beta = 2;
+    const fixed = cl.fixedKey();
+    cl.key[0] ^= 1;
+    try testing.expectEqual(fixed, cl.fixedKey());
+    cl.fixed_root[0] ^= 1;
+    try testing.expect(!std.mem.eql(u8, &fixed, &cl.fixedKey()));
+    cl.fixed_root[0] ^= 1;
+    cl.beta = 1;
+    try testing.expect(!std.mem.eql(u8, &fixed, &cl.fixedKey()));
+    cl.beta = 2;
+    std.mem.swap(CommitShape, &shapes[0], &shapes[1]);
+    try testing.expect(!std.mem.eql(u8, &fixed, &cl.fixedKey()));
+    cl.fixed_region_key = key;
+    try testing.expectEqual(key, cl.fixedKey());
     // The token never collides with a real row count (< 2^63).
     try testing.expect(NCB.rowsToken(key) >= @as(u64, 1) << 63);
 }

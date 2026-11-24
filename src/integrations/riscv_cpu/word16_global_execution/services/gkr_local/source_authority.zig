@@ -33,8 +33,21 @@ pub const Descriptor = struct {
     origin: Frame.Origin,
     cpu_u8_pairs: bool = false,
     cpu_compact_decode: bool = false,
+    cpu_wide_clock: bool = false,
+
+    pub fn forGeometry(origin: Frame.Origin, geometry: @import("../../../word16_execution/geometry.zig").Geometry) Descriptor {
+        const cpu = origin == .core and origin.core == .cpu;
+        return .{
+            .origin = origin,
+            .cpu_u8_pairs = geometry.cpu_u8_pairs,
+            .cpu_compact_decode = geometry.cpu_compact_decode and (cpu or !geometry.wideClock()),
+            .cpu_wide_clock = cpu and geometry.wideClock(),
+        };
+    }
+
     pub fn validate(self: Descriptor) !void {
-        if (self.cpu_compact_decode and !self.cpu_u8_pairs) return error.InvalidSourceAuthorityLayout;
+        if (self.cpu_wide_clock and (self.origin != .core or self.origin.core != .cpu or self.cpu_u8_pairs)) return error.InvalidSourceAuthorityLayout;
+        if (self.cpu_compact_decode and !self.cpu_u8_pairs and !self.cpu_wide_clock) return error.InvalidSourceAuthorityLayout;
         if (self.origin == .core and (self.origin.core == .initial or self.origin.core == .terminal)) return error.NoLocalGkrSource;
     }
     fn arithmetic(self: Descriptor) ?Main.Role {
@@ -76,8 +89,8 @@ pub const Descriptor = struct {
         const s = try self.shape();
         if (fixed.len != s.fixed or main.len != s.main or previous_main.len != s.main or public.len != Public.count) return error.InvalidSourceAuthorityShape;
         if (self.arithmetic()) |role| {
-            if (role == .cpu_compact) return Fractions.cpuCompactFor(F, fixed, main, previous_main, public[Public.epoch], public[Public.initial_pc], sink);
-            if (role == .cpu) return Fractions.cpuModeFor(F, fixed, main, public[Public.epoch], self.cpu_u8_pairs, sink);
+            if (role == .cpu_compact) return Fractions.cpuCompactClockFor(F, fixed, main, previous_main, public[Public.epoch], public[Public.initial_pc], self.cpu_wide_clock, sink);
+            if (role == .cpu) return Fractions.cpuClockFor(F, fixed, main, public[Public.epoch], if (self.cpu_wide_clock) .wide else if (self.cpu_u8_pairs) .pair else .byte, sink);
             return Role.emitLocalFor(F, role, fixed, main, public[Public.epoch], sink);
         }
         switch (self.origin) {

@@ -135,6 +135,27 @@ for T ≤ 2^120 under the ethSTARK conjecture and ideal hashes. Comparison: the 
 profile's bounded review gives 2^-129.7 per query from a proven unique-decoding
 query term (18·(41/64)^256 = 2^-160.3).
 
+## D2 device FIXED authority
+
+D2 uses the `EXPERIMENTAL-v2-fixed-root` transcript domain. Its FIXED
+identity is SHA-256 of the domain-separated canonical FIXED commitment
+root. The receiver still reconstructs the FIXED tree from its pinned
+program and admitted column geometry, and authenticates the proof against
+that root. It derives the same identity itself. The host coefficient
+digest remains available as a private CPU cache key.
+
+The device producer can interpolate the evaluator's canonical columns
+directly in the persistent FIXED allocation. Service proofs reuse those
+coefficients for the source-rate and candidate-rate commitments. The source
+root remains bound by the service statement. Receiver admission requires
+its independently derived commitment and key.
+
+The change affects D2 statements, native verifying-key identities and
+their recursive consumers. Archived D2 proofs from the earlier domain
+need the original verifier. D2 uses blowup four, 54 queries, 20 grinding
+bits and fold step four. The qualification gate includes new recursive roots and a
+fresh receiver, with an independently changed FIXED root rejected.
+
 ## What this does not cover
 
 - The ethSTARK conjecture itself (no proof for circle FRI at rate 1/2 exists here).

@@ -12,6 +12,7 @@ const Global = @import("global_cpu.zig");
 const Manifest = @import("manifest.zig");
 const Main = A.main_only.authority;
 const Geo = @import("../../../word16_execution/geometry.zig");
+const Scope = @import("service_scope.zig");
 const Role = @import("role.zig");
 const Table = @import("table_role.zig");
 const Boundary = @import("boundary_role.zig");
@@ -19,12 +20,17 @@ const Service = @import("service_role.zig");
 pub const Slot = struct { origin: Frame.Origin, log: u32, fixed_offset: usize, main_offset: usize, inter_offset: usize, binding_index: ?usize, claim_offset: usize };
 pub const Plan = struct {
     allocator: std.mem.Allocator,
+    envelope: Scope.Envelope,
     slots: []Slot,
     inter_columns: usize,
     claim_count: usize,
     binding_count: usize,
     pub fn init(a: std.mem.Allocator, setup: *const R.CpuSetup) !Plan {
-        try @import("service_scope.zig").setup(setup);
+        return initFor(.admitted, a, setup);
+    }
+    pub fn initFor(envelope: Scope.Envelope, a: std.mem.Allocator, setup: *const R.CpuSetup) !Plan {
+        try envelope.validateGeometry(setup.materials.geometry);
+        try Scope.bridges(setup.bridges);
         var slots = std.ArrayList(Slot).empty;
         errdefer slots.deinit(a);
         var inter: usize = 0;
@@ -67,7 +73,7 @@ pub const Plan = struct {
             claims = try std.math.add(usize, claims, Global.claimCount(origin));
             bindings += 1;
         };
-        return .{ .allocator = a, .slots = try slots.toOwnedSlice(a), .inter_columns = inter, .claim_count = claims, .binding_count = bindings };
+        return .{ .allocator = a, .envelope = envelope, .slots = try slots.toOwnedSlice(a), .inter_columns = inter, .claim_count = claims, .binding_count = bindings };
     }
     pub fn deinit(self: *Plan) void {
         self.allocator.free(self.slots);
@@ -89,10 +95,10 @@ pub const Set = struct {
     pub fn init(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.Request, first_ids: anytype, plan: *const Plan, pending: *const @import("child.zig").Pending, shared: Manifest.Shared, values: []const O) !Set {
         const ids = @import("cpu_worker.zig").firstVector(first_ids);
         if (values.len != plan.claim_count or pending.artifact.claims_to_verify_by_instance.len != plan.binding_count) return error.InvalidWideCpuClaims;
-        try setup.materials.geometry.validate();
-        try @import("../../../word16_execution/protocol.zig").validateArithmeticRequests(setup.materials.geometry, request.base);
+        try plan.envelope.validateGeometry(setup.materials.geometry);
+        try @import("../../../word16_execution/protocol.zig").validateArithmeticRequestsFor(plan.envelope.projection(), setup.materials.geometry, request.base);
         const ls_counts = try setup.materials.geometry.lsCounts(request.base.memory.ls_count);
-        const instances = try @import("roster.zig").fromSetup(a, setup);
+        const instances = try @import("roster.zig").fromSetupFor(plan.envelope, a, setup);
         defer a.free(instances);
         const items = try a.alloc(Item, plan.slots.len);
         errdefer a.free(items);
@@ -129,8 +135,9 @@ pub const Set = struct {
                 continue;
             }
             var data = try Role.Data.init(instances[slot.binding_index.?], pending, slot.binding_index.?);
-            data.cpu_u8_pairs = setup.materials.geometry.cpu_u8_pairs;
-            data.cpu_compact_decode = setup.materials.geometry.cpu_compact_decode;
+            const source_layout = @import("source_authority.zig").Descriptor.forGeometry(slot.origin, setup.materials.geometry);
+            data.cpu_u8_pairs = source_layout.cpu_u8_pairs;
+            data.cpu_compact_decode = source_layout.cpu_compact_decode;
             switch (role) {
                 .rom, .boundary, .range16, .range8, .and_table, .shift_table, .selection => {
                     const kind = try Table.kindForRole(role);
@@ -141,7 +148,7 @@ pub const Set = struct {
                     const public: Main.PublicFor(O) = switch (role) {
                         .cpu => blk: {
                             const old = try A.word16_execution.types.inputs(request.base.cpu, request.base.epoch, slot.log);
-                            const inputs: A.word16_execution.types.InputsFor(O) = .{ .steps = old.steps, .initial_pc = old.initial_pc, .final_pc = old.final_pc, .epoch = old.epoch };
+                            const inputs: A.word16_execution.types.InputsFor(O) = .{ .steps = old.steps, .initial_pc = old.initial_pc, .final_pc = old.final_pc, .epoch = old.epoch, .wide_clock = old.wide_clock };
                             break :blk if (setup.materials.geometry.cpu_compact_decode) .{ .cpu_compact = inputs } else .{ .cpu = inputs };
                         },
                         .alu, .alu_tail => .{ .alu = {} },

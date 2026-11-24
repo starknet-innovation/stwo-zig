@@ -4,14 +4,51 @@ const A = @import("stwo_riscv_frontend").rv64_air;
 const T = @import("../types.zig");
 const R = @import("../roster.zig");
 const P = @import("../protocol.zig");
-pub fn geometry(g: @import("../../../word16_execution/geometry.zig").Geometry) !void {
-    // These classic encodings change provider-query authority. GKR keeps its
-    // separately qualified query authority until both projections are adapted.
-    // Compact decode has GKR-local CPU/ROM projections (fractions.cpuCompactFor,
-    // main_only `.cpu_compact`) and is admitted on top of byte pairs only.
-    if (g.mul_u8_pairs or g.ls_fused_pairs or g.alu_fused_tail or g.ls_dword_fused_pairs) return error.UnsupportedClassicEncodingInLocalGkr;
-    try g.validate();
-    if (g.cpu_log > 22) return error.InvalidLocalGkrGeometry;
+const Geometry = @import("../../../word16_execution/geometry.zig").Geometry;
+const Policy = @import("../../../word16_execution/om31_security_candidate.zig");
+
+/// Selected by the receiver. A CPU declaration cannot opt itself into a wider envelope.
+pub const Envelope = enum {
+    admitted,
+    compact_wide,
+
+    /// The caller owns the request limit and PCS selection. Neither is read
+    /// from a proof declaration or the number of steps actually retired.
+    pub fn forRequest(max_prefix_steps: u32, profile_: ?Policy.Profile) !Envelope {
+        if (max_prefix_steps == 0 or max_prefix_steps >= 1 << A.word16_execution.layout.MAX_LOG) return error.InvalidExecutionBudget;
+        if (max_prefix_steps < 1 << Policy.MAX_TRACE_LOG) return .admitted;
+        if (profile_ != .d2_native_b4_q54_p20_fold4) return error.WideCandidateProfileMismatch;
+        return .compact_wide;
+    }
+
+    pub fn projection(self: Envelope) Geometry.Projection {
+        return if (self == .compact_wide) .gkr_main else .classic;
+    }
+
+    pub fn identity(self: Envelope, profile_: Policy.Profile) [32]u8 {
+        const base = Policy.profileIdentity(profile_);
+        if (self == .admitted) return base;
+        var h = @import("std").crypto.hash.sha2.Sha256.init(.{});
+        h.update("rv64-services-gkr/compact-wide-main/v1");
+        h.update(&base);
+        const L = A.word16_execution.layout;
+        h.update(&[_]u8{ L.MAX_LOG, @intCast(L.ramStride(L.MAX_LOG)), L.WIDE_GAP_SCALE });
+        return h.finalResult();
+    }
+
+    pub fn validateGeometry(self: Envelope, g: Geometry) !void {
+        if (g.mul_u8_pairs or g.ls_fused_pairs or g.alu_fused_tail or g.ls_dword_fused_pairs) return error.UnsupportedClassicEncodingInLocalGkr;
+        if (self == .compact_wide and g.cpu_log == A.word16_execution.layout.MAX_LOG) {
+            if (!g.cpu_compact_decode or !g.cpu_fused_tail or g.cpu_u8_pairs) return error.InvalidLocalGkrGeometry;
+            return g.validateMainProjection();
+        }
+        try g.validate();
+        if (g.cpu_log > Policy.MAX_TRACE_LOG) return error.InvalidLocalGkrGeometry;
+    }
+};
+
+pub fn geometry(g: Geometry) !void {
+    return Envelope.admitted.validateGeometry(g);
 }
 pub fn bridges(logs: T.Logs) !void {
     // The Zbb BINARY component (ethereum_services_v3_zbb) has no GKR role.

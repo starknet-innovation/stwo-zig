@@ -18,9 +18,10 @@
 //!     stwo_rv64_prefix_scan_on            (prefix scan, logical coset)
 //!     stwo_ntt_b2n_columns_compact_on     (16 planes -> coefficients)
 //!
-//! Output: 16 coefficient columns per instance, `[Eq 8 | prefix 8]`, each
-//! `rows` words, instances back to back (exactly the legacy `Owner.finalize`
-//! Completion column order). The verdict is one device word (0 = accepted);
+//! The standalone job emits 16 coefficient columns per instance, in
+//! [Eq | prefix] order. The resident job carries only the prefix coefficients
+//! and GKR row points. Stage 2 builds Eq at its INTER commitment offsets.
+//! The verdict is one device word (0 = accepted);
 //! a nonzero verdict is the legacy terminal `DeviceBindingWitnessRejected`.
 //! The host authority check of the legacy path (device_binding_runtime.zig
 //! validateArtifact: artifact point/claims and eta against the device state)
@@ -31,7 +32,6 @@
 //! No join, no lease, no D2H.
 const std = @import("std");
 const core = @import("stwo_core");
-const engine = @import("stwo_prover_engine");
 const api = @import("api.zig");
 const G = @import("native_gkr.zig");
 const R = @import("../resident.zig");
@@ -54,12 +54,13 @@ const FinalizeFn = *const fn (*anyopaque, u32, *const Finalize) callconv(.c) c_i
 const B2n = *const fn ([*]const u32, usize, [*]u32, usize, u32, u32, [*]const u32, u32, u32, *anyopaque, *u32) callconv(.c) c_int;
 const Memset = *const fn (*anyopaque, *anyopaque, u8, usize) callconv(.c) c_int;
 const CopyD2d = *const fn (*anyopaque, *anyopaque, *const anyopaque, usize) callconv(.c) c_int;
+pub const BuildEq = *const @TypeOf(A.stwo_rv64_binding_eq_on);
 
 /// Binding metadata scratch (the `metadata` packet field; resident.zig
 /// deriveBindingMetadata's `reservoir`): 260 OM31 words.
 pub const metadata_words = 260 * 8;
 /// Largest binding row log (the row point / carry buffers' capacity).
-pub const max_row_log = 22;
+pub const max_row_log = A.binding_max_row_log;
 pub const point_words = max_row_log * 8;
 pub const carry_words = max_row_log * 16;
 
@@ -95,7 +96,7 @@ pub const Plan = struct {
     layers: u32,
 
     pub fn init(a: std.mem.Allocator, instances: []const G.Instance, layers: u32) !Plan {
-        if (instances.len == 0 or instances.len > A.batch_max_oracles or layers == 0) return error.InvalidNativeBindingGeometry;
+        if (instances.len == 0 or instances.len > A.batch_max_oracles or layers == 0 or layers > 28) return error.InvalidNativeBindingGeometry;
         const row_logs = try a.alloc(u32, instances.len);
         errdefer a.free(row_logs);
         const lane_logs = try a.alloc(u32, instances.len);
@@ -105,6 +106,7 @@ pub const Plan = struct {
         var words: usize = 0;
         var max_log: u32 = 0;
         for (instances, row_logs, lane_logs, offsets) |instance, *rl, *ll, *o| {
+            if (instance.row_log == 0 or instance.row_log > max_row_log) return error.InvalidNativeBindingGeometry;
             rl.* = instance.row_log;
             ll.* = try instance.laneLog();
             _ = try instance.rows();
@@ -126,12 +128,24 @@ pub const Plan = struct {
     pub fn columns(self: *const Plan, output: api.DeviceBuffer, instance: usize) !api.DeviceBuffer {
         return output.slice(self.offsets[instance], 16 * (@as(usize, 1) << @intCast(self.row_logs[instance])));
     }
+    pub fn retainedWords(self: *const Plan) usize {
+        return self.output_words / 2 + self.row_logs.len * point_words;
+    }
+    pub fn retainedPrefix(self: *const Plan, output: api.DeviceBuffer, instance: usize) !api.DeviceBuffer {
+        return output.slice(self.offsets[instance] / 2, 8 * (@as(usize, 1) << @intCast(self.row_logs[instance])));
+    }
+    pub fn retainedPoint(self: *const Plan, output: api.DeviceBuffer, instance: usize) !api.DeviceBuffer {
+        return output.slice(self.output_words / 2 + instance * point_words, 8 * @as(usize, self.row_logs[instance]));
+    }
     /// Stream-ordered working words of `enqueue` beyond the output
     /// (metadata, row point, carry, seed, claim, prefix scratch, one P plane set).
     pub fn enqueueWords(self: *const Plan) usize {
         const g = 64;
         return std.mem.alignForward(usize, metadata_words, g) + std.mem.alignForward(usize, point_words, g) + std.mem.alignForward(usize, carry_words, g) + 2 * g +
             std.mem.alignForward(usize, self.scratch_words, g) + std.mem.alignForward(usize, 8 * self.max_rows, g) + 4 * g;
+    }
+    pub fn retainedEnqueueWords(self: *const Plan) usize {
+        return self.enqueueWords() + 8 * self.max_rows;
     }
     /// Class-persistent inverse twiddles (half coset of the largest log).
     pub fn persistentWords(self: *const Plan) usize {
@@ -147,6 +161,27 @@ pub const Plan = struct {
         return 9 + 16 * self.row_logs.len + 8 * @as(usize, self.layers);
     }
 };
+
+fn interpolate(b2n: B2n, e: *api.Enqueue, cols: api.DeviceBuffer, log: u32, tw: api.DeviceBuffer, launches: *u32) !void {
+    const rows = @as(usize, 1) << @intCast(log);
+    const half: u32 = @intCast(rows / 2);
+    const inverse = try tw.slice(tw.words -| half, half);
+    if (b2n(cols.ptr, rows, cols.ptr, rows, log, @intCast(cols.words / rows), inverse.ptr, half, half, e.stream(), launches) != 0)
+        return error.CudaEnqueueFailed;
+}
+
+/// Evaluate the exact Stage-1 row point, then interpolate the eight planes
+/// in place. Both stages use the canonical inverse circle twiddle suffix.
+pub fn replayEq(build: BuildEq, b2n: B2n, e: *api.Enqueue, point: api.DeviceBuffer, log: u32, out: api.DeviceBuffer, tw: api.DeviceBuffer, status: api.DeviceBuffer) !void {
+    if (log == 0 or log > max_row_log) return error.NativeStage2BindingShape;
+    const rows = @as(u32, 1) << @intCast(log);
+    if (out.words != 8 * @as(usize, rows) or point.words != 8 * @as(usize, log)) return error.NativeStage2BindingShape;
+    var device = G.DeviceContext{ .native = e.ctx() };
+    const plane = R.Plane{ .data = G.DeviceContext.slice(out), .stride = rows, .coordinates = 8 };
+    if (build(e.ctx(), 0, point.ptr, log, try plane.bind(&device), status.ptr) != 0) return error.CudaEnqueueFailed;
+    var launches: u32 = 0;
+    try interpolate(b2n, e, out, log, tw, &launches);
+}
 
 /// Finish-time legacy authority check (device_binding_runtime.zig
 /// validateArtifact) of the authority words against the host partial
@@ -177,16 +212,9 @@ pub const Binding = struct {
     /// `precomputeM31(CanonicCoset(max_log).circleDomain().half_coset)`).
     pub fn stage(self: *Binding, a: std.mem.Allocator, s: *api.Stager) !void {
         const p = self.plan;
-        var key: [32]u8 = @splat(0);
-        @memcpy(key[0..16], "rv64-m8-bind-itw");
-        key[16] = @intCast(p.max_log);
+        const key = @import("circle_twiddles.zig").tableKey(p.max_log, .inverse);
         const tw = try s.persistent(key, p.twiddle_words);
-        if (tw.fresh) {
-            var tree = try engine.poly.twiddles.precomputeM31(a, core.poly.circle.canonic.CanonicCoset.new(p.max_log).circleDomain().half_coset);
-            defer engine.poly.twiddles.deinitM31(a, &tree);
-            if (tree.itwiddles.len != p.twiddle_words) return error.InvalidNativeBindingTwiddles;
-            try s.upload(tw.buffer, @as([*]const u32, @ptrCast(tree.itwiddles.ptr))[0..tree.itwiddles.len]);
-        }
+        if (tw.fresh) try @import("circle_twiddles.zig").fill(a, s, tw.buffer, p.max_log, .inverse);
         self.twiddles = tw.buffer;
     }
 
@@ -207,11 +235,11 @@ pub const Binding = struct {
         if (semantic) |s| if (s.words != Semantic.words(p.row_logs)) return error.NativeSemanticShape;
         const traversal = gkr.traversal orelse return error.NativeGkrNotEnqueued;
         const tw = self.twiddles orelse return error.NativeBindingNotStaged;
-        if (output.words < p.output_words or verdict.words < 1) return error.InvalidNativeBindingOutput;
+        const retained = semantic != null;
+        if (output.words < (if (retained) p.retainedWords() else p.output_words) or verdict.words < 1) return error.InvalidNativeBindingOutput;
         if (authority) |out| if (out.words < p.authorityWords()) return error.InvalidNativeBindingOutput;
         if (gkr.fractions.len != p.row_logs.len or traversal.traversal.layers != p.layers) return error.InvalidNativeBindingGeometry;
         const ctx = e.ctx();
-        const stream = e.stream();
         const metadata = try e.alloc(metadata_words);
         const point = try e.alloc(point_words);
         const carry = try e.alloc(carry_words);
@@ -219,6 +247,7 @@ pub const Binding = struct {
         const claim = try e.alloc(8);
         const scratch = try e.alloc(@max(1, p.scratch_words));
         const projection = try e.alloc(8 * p.max_rows);
+        const eq_scratch = if (retained) try e.alloc(8 * p.max_rows) else null;
         var device = G.DeviceContext{ .native = ctx };
         var commands = R.Commands(G.DeviceContext, N.Api){ .context = &device, .api = &gkr.sym.numerical, .lane_index = 0 };
         const S = G.DeviceContext.slice;
@@ -243,17 +272,24 @@ pub const Binding = struct {
             const proj = R.Plane{ .data = S(try projection.slice(0, 8 * @as(usize, rows))), .stride = rows, .coordinates = 8 };
             const deferred = Deferred{ .n = try fraction.n.bind(&device), .d = try fraction.d.bind(&device), .output = try proj.bind(&device), .metadata = metadata.ptr, .status = verdict.ptr, .row_log = row_log, .lane_log = lane_log };
             if (self.sym.deferred(ctx, 0, &deferred) != 0) return error.CudaEnqueueFailed;
-            const cols = try p.columns(output, i);
-            const eq = R.Plane{ .data = S(try cols.slice(0, 8 * @as(usize, rows))), .stride = rows, .coordinates = 8 };
-            const prefix = R.Plane{ .data = S(try cols.slice(8 * @as(usize, rows), 8 * @as(usize, rows))), .stride = rows, .coordinates = 8 };
+            const words = 8 * @as(usize, rows);
+            const cols = if (retained) try p.retainedPrefix(output, i) else try p.columns(output, i);
+            const eq_words = try (eq_scratch orelse cols).slice(0, words);
+            const prefix_words = if (retained) cols else try cols.slice(words, words);
+            if (retained) {
+                const dst = try p.retainedPoint(output, i);
+                if (self.sym.copy_d2d(ctx, dst.ptr, point.ptr, dst.bytes()) != 0) return error.CudaEnqueueFailed;
+            }
+            const eq = R.Plane{ .data = S(eq_words), .stride = rows, .coordinates = 8 };
+            const prefix = R.Plane{ .data = S(prefix_words), .stride = rows, .coordinates = 8 };
             try commands.buildBindingEq(S(point), row_log, eq, status);
             const fin = Finalize{ .projection = try proj.bind(&device), .eq = try eq.bind(&device), .output = try prefix.bind(&device), .metadata = metadata.ptr, .status = verdict.ptr, .row_log = row_log };
             if (self.sym.finalize(ctx, 0, &fin) != 0) return error.CudaEnqueueFailed;
             try commands.scanPrefix(prefix, S(scratch), S(claim), status, row_log, false);
-            const half = rows / 2;
-            if (self.sym.b2n(cols.ptr, rows, cols.ptr, rows, row_log, 16, tw.ptr + (tw.words - half), half, half, stream, &launches) != 0) return error.CudaEnqueueFailed;
+            try interpolate(self.sym.b2n, e, cols, row_log, tw, &launches);
         }
         self.launches = commands.launches + launches + 2 * p.row_logs.len;
+        if (eq_scratch) |b| e.free(b);
         e.free(projection);
         e.free(scratch);
         e.free(claim);
@@ -279,6 +315,34 @@ test "binding plan geometry: [Eq 8 | prefix 8] per instance, back to back" {
     try std.testing.expectEqual(@as(u32, 2), plan.lane_logs[0]);
     try std.testing.expectEqual(@as(usize, 32), plan.twiddle_words);
     try std.testing.expectError(error.InvalidNativeBindingGeometry, Plan.init(a, &instances, 7));
+    const prefixes = 8 * (64 + 32);
+    try std.testing.expectEqual(@as(usize, prefixes + 2 * point_words), plan.retainedWords());
+    try std.testing.expectEqual(plan.enqueueWords() + 8 * 64, plan.retainedEnqueueWords());
+    const words = try a.alloc(u32, plan.retainedWords());
+    defer a.free(words);
+    const retained = api.DeviceBuffer{ .ptr = words.ptr, .words = words.len };
+    const p0 = try plan.retainedPrefix(retained, 0);
+    const p1 = try plan.retainedPrefix(retained, 1);
+    const x0 = try plan.retainedPoint(retained, 0);
+    const x1 = try plan.retainedPoint(retained, 1);
+    try std.testing.expectEqual(words.ptr, p0.ptr);
+    try std.testing.expectEqual(p0.ptr + p0.words, p1.ptr);
+    try std.testing.expectEqual(p1.ptr + p1.words, x0.ptr);
+    try std.testing.expectEqual(x0.ptr + point_words, x1.ptr);
+    try std.testing.expectEqual(@as(usize, 6 * 8), x0.words);
+    try std.testing.expectEqual(@as(usize, 5 * 8), x1.words);
+}
+
+test "wide binding sizes the full CPU row point before enqueue" {
+    const a = std.testing.allocator;
+    var instances = [_]G.Instance{.{ .origin = .{ .core = .cpu }, .row_log = max_row_log, .terms = 15, .fixed_offset = 0, .main_offset = 0 }};
+    var plan = try Plan.init(a, &instances, 27);
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 16) << 23, plan.output_words);
+    try std.testing.expectEqual((@as(usize, 8) << 23) + point_words, plan.retainedWords());
+    try std.testing.expectError(error.InvalidNativeBindingGeometry, Plan.init(a, &instances, 26));
+    instances[0].row_log += 1;
+    try std.testing.expectError(error.InvalidNativeBindingGeometry, Plan.init(a, &instances, 28));
 }
 
 test "binding enqueue type-checks against api.Enqueue" {

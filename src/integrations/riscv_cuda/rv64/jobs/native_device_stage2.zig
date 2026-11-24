@@ -604,7 +604,7 @@ pub const ClassFraming = struct {
     fixed_words: usize,
     /// Complete Stage-1 persistent allocation, including its root/authority.
     fixed_region_words: usize = 0,
-    resident_handoff: ?struct { checkpoint: usize, binding: usize, semantic: usize, section: usize = 0, section_words: usize = 0 } = null,
+    resident_handoff: ?struct { checkpoint: usize, binding: usize, semantic: usize, section: usize = 0, section_words: usize = 0, main_nodes_at: usize = 0, main_nodes_words: usize = 0 } = null,
     resources_warmed: bool = false,
     /// Installed only when every worker reclaims stream-ordered non-LIFO
     /// frees. Otherwise footprint retains the conservative sum of phases.
@@ -767,6 +767,7 @@ pub const Symbols = struct {
     pcs: N.Symbols,
     composition: NComp.Symbols,
     global: Gl.Symbols,
+    binding_eq: ?B.BuildEq = null,
     /// Check.oods_constraint kernel (addon); null leaves the word unset.
     oods: ?NO.Symbols = null,
     leaf: ?LF.EncodeFn = null,

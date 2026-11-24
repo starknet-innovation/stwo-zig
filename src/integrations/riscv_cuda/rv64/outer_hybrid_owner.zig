@@ -210,7 +210,7 @@ pub const Lane = struct {
 
     fn wholeNode(raw: *anyopaque, a: std.mem.Allocator, key: *const Outer.prove.Authority, graph: *const Circuit.builder.Context(Q), expected: []const Q, ordinal: u32) !Outer.prove.Produced {
         const self = of(raw);
-        var input = Prestage.Input{ .key = key, .graph = graph, .expected = expected, .ordinal = ordinal, .library = &self.hybrid.base, .class = Dev.class_hint, .is_leaf = Dev.class_is_leaf, .seed_tape = Dev.seed_tape, .blake_sample_inputs = Dev.blake_sample_inputs };
+        var input = Prestage.Input{ .key = key, .graph = graph, .expected = expected, .ordinal = ordinal, .library = &self.hybrid.base, .class = Dev.class_hint, .is_leaf = Dev.class_is_leaf, .seed_tape = Dev.seed_tape, .child_proof_starts = Dev.child_proof_starts, .blake_sample_inputs = Dev.blake_sample_inputs };
         if (self.takeStaged(graph)) |box| {
             input.prepared = box.prepared;
             input.class = box.class;

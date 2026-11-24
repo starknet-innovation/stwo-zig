@@ -64,6 +64,16 @@ pub const Session = struct {
         if (self.active) return error.ResidentRequestAlreadyActive;
         if (self.setup) |*cache| try cache.persist();
     }
+    pub fn beginRequest(self: *Session) !void {
+        if (self.active) return error.ResidentRequestAlreadyActive;
+        if (self.setup) |*cache| if (try cache.fixed.retireIfPressured()) {
+            self.setup_validated.clear();
+            cache.clearComponents();
+            std.debug.print("GPU_RESIDENT_STORE retired_fixed_setup=true\n", .{});
+        };
+        if (self.fixed) |*cache| if (try cache.retireIfPressured()) self.validated_fixed.clear();
+        self.active = true;
+    }
     pub fn setupStats(self: *const Session) ?SetupCache.Stats {
         return if (self.setup) |cache| cache.stats else null;
     }

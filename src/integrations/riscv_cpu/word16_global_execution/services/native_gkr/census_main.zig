@@ -97,7 +97,7 @@ pub fn main() !void {
         for (plan.slots) |slot| {
             const l = Global.layout(slot.origin);
             const rows = @as(u64, 1) << @intCast(slot.log);
-            const descriptor = @import("cpu_component.zig").Authority.Source.Descriptor{ .origin = slot.origin, .cpu_u8_pairs = setup.materials.geometry.cpu_u8_pairs, .cpu_compact_decode = setup.materials.geometry.cpu_compact_decode };
+            const descriptor = @import("cpu_component.zig").Authority.Source.Descriptor.forGeometry(slot.origin, setup.materials.geometry);
             const source_shape = try @import("cpu_component.zig").Authority.shape(descriptor);
             const s = Slot{
                 .fixed_cols = source_shape.fixed,

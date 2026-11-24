@@ -121,7 +121,7 @@ fn falseFragment(quotient: u64) !void {
     }
     for (source.counts16, d.counts16) |*total, count| total.* += count;
     source.range16.deinit();
-    source.range16 = try A.word16_cpu.table_trace.Source.initRange16(a, setup.materials.range16_fixed, source.counts16);
+    source.range16 = try A.word16_cpu.table_trace.Source.initRange16(a, setup.materials.tables.range16, source.counts16);
     try proveRejected(&f, &setup, &source, null);
 }
 

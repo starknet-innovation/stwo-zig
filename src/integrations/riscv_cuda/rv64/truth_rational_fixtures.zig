@@ -9,7 +9,7 @@ const IO = @import("fixture_io.zig");
 const O = core.fields.om31.OM31;
 const M = core.fields.m31.M31;
 pub fn write(a: std.mem.Allocator, dir: std.fs.Dir) !void {
-    for (7..15) |id| {
+    for (7..Meta.role_count) |id| {
         var artifact = try T.record(a, @intCast(id));
         defer artifact.deinit();
         const sizes = try T.roleWidths(@intCast(id));

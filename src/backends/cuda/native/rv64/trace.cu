@@ -185,10 +185,10 @@ extern "C" int stwo_rv64_trace_prefix_workspace_words(
   if (!status) *words = banks.words();
   return status;
 }
-extern "C" int stwo_rv64_trace_tree_on(void *ctx, uint32_t lane,
-                                       const b::MixedSegment *segments,
-                                       uint32_t count, uint32_t log,
-                                       uint32_t *tree, uint64_t tree_words) {
+static int trace_tree(void *ctx, uint32_t lane, const b::MixedSegment *segments,
+                      uint32_t count, uint32_t log, uint32_t *tree,
+                      uint64_t tree_words, uint32_t *prefix,
+                      uint64_t prefix_words, bool separate_prefix) {
   using namespace stwo::cuda::rv64;
   TraceCustody c(ctx, lane);
   TraceInputs input{};
@@ -206,11 +206,15 @@ extern "C" int stwo_rv64_trace_tree_on(void *ctx, uint32_t lane,
   const int layout_status = prefix_bank_layout(segments, count, &banks);
   if (layout_status) return layout_status;
   const uint64_t scratch_words = banks.words();
-  const bool owned_scratch = tree_words >= need + scratch_words;
-  if (!c.range(tree, need + (owned_scratch ? scratch_words : 0), true))
+  const bool packed_scratch = !separate_prefix && tree_words >= need + scratch_words;
+  if (separate_prefix && (prefix_words < scratch_words ||
+      (scratch_words && reinterpret_cast<uintptr_t>(prefix) % alignof(b::ProgressiveState))))
+    return int(cudaErrorInvalidValue);
+  if (!c.range(tree, need + (packed_scratch ? scratch_words : 0), true) ||
+      (separate_prefix && scratch_words && !c.range(prefix, scratch_words, true)))
     return c.status;
-  auto *scratch = owned_scratch && scratch_words
-                      ? reinterpret_cast<b::ProgressiveState *>(tree + need)
+  auto *scratch = scratch_words
+                      ? reinterpret_cast<b::ProgressiveState *>(separate_prefix ? prefix : packed_scratch ? tree + need : nullptr)
                       : nullptr;
   auto *hashes = reinterpret_cast<b::Hash *>(tree);
   int status = native_height_leaves(input.segments, count, uint32_t(leaves),
@@ -218,6 +222,21 @@ extern "C" int stwo_rv64_trace_tree_on(void *ctx, uint32_t lane,
   if (!status) status = stwo_blake2s_merkle_layers_on(hashes, uint32_t(leaves), 2 * leaves - 1, c.stream);
   return status;
 }
+extern "C" int stwo_rv64_trace_tree_on(void *ctx, uint32_t lane,
+                                       const b::MixedSegment *segments,
+                                       uint32_t count, uint32_t log,
+                                       uint32_t *tree, uint64_t tree_words) {
+  return trace_tree(ctx, lane, segments, count, log, tree, tree_words, nullptr, 0, false);
+}
+
+// Strict job path. Retain only the nodes through PCS. The producer owns a
+// separate prefix bank, which can retire immediately after hashing.
+extern "C" int stwo_rv64_trace_tree_separate_prefix_on(void *ctx, uint32_t lane,
+    const b::MixedSegment *segments, uint32_t count, uint32_t log,
+    uint32_t *tree, uint64_t tree_words, uint32_t *prefix, uint64_t prefix_words) {
+  return trace_tree(ctx, lane, segments, count, log, tree, tree_words, prefix, prefix_words, true);
+}
+
 extern "C" int stwo_rv64_trace_open_on(void *ctx, uint32_t lane,
                                        const b::MixedSegment *segments,
                                        uint32_t count,

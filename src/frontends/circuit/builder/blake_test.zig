@@ -181,3 +181,26 @@ test "blake: reduced digests and constant hashes build valid circuits" {
     try ctx.finalize(false);
     try std.testing.expect(try ctx.isCircuitValid());
 }
+
+test "blake: recorded compression reproduces value-mode wires for prefixed and partial blocks" {
+    var values = try TraceContext.initWithWitnessOrigins(gpa, 0);
+    defer values.deinit();
+    var trace = try TraceContext.initTraceOnly(gpa, 0);
+    defer trace.deinit();
+    for ([_]usize{ 0, 3, 64, 131 }) |n_bytes| {
+        var wire_sets: [2][33]wrappers.U32Wrapper(Var) = undefined;
+        var digests: [2]blake.HashValue(Var) = undefined;
+        for ([_]*TraceContext{ &values, &trace }, &wire_sets, &digests) |ctx, *words, *digest| {
+            for (words, 0..) |*word, i| word.* = try wrappers.constU32(QM31, ctx, @intCast(13 * i + 1));
+            const count = (n_bytes + 3) / 4;
+            digest.* = try blake.blake2sU32sFrom(QM31, ctx, blake.blake2s_iv, 64, words[0..count], n_bytes);
+        }
+        try std.testing.expectEqualDeep(digests[0], digests[1]);
+        try std.testing.expectEqual(values.circuit.n_vars, trace.circuit.n_vars);
+        try std.testing.expectEqualDeep(values.constantVars(), trace.constantVars());
+        try std.testing.expectEqualDeep(values.circuit.blake_g_gate.items, trace.circuit.blake_g_gate.items);
+        try std.testing.expectEqualDeep(values.circuit.triple_xor.items, trace.circuit.triple_xor.items);
+        try std.testing.expectEqualDeep(values.gate_counts, trace.gate_counts);
+        try std.testing.expectEqualDeep(values.stats, trace.stats);
+    }
+}

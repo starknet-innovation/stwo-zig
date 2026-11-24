@@ -48,6 +48,7 @@ pub const Stage2 = struct {
     calls: u32,
     first_id: u32,
     compact: []const u32,
+    compact_device: ?@import("../guest_service_inputs.zig").TruthSpan = null,
     /// worker_protocol.begin(config, expected) [+ binding] (K.seed).
     seed: [9]u32,
     /// Device manifest digest (8 words: the seal slot's first words), or
@@ -74,6 +75,10 @@ pub const Stage2 = struct {
     /// null = a job-slab field (finish copies the bytes: harnesses).
     encoded: ?api.DeviceBuffer = null,
     request_slab_only: bool = false,
+    /// The admitted class bound includes both original tree allocations
+    /// through the rolling PCS. Only their authenticated node spans are lent.
+    retain_source_nodes: bool = false,
+    shared_commit_evaluations: bool = false,
     // per-job plan copies
     fixed_plan: C.CommitPlan = undefined,
     main_plan: C.CommitPlan = undefined,
@@ -81,6 +86,7 @@ pub const Stage2 = struct {
     composition: NC.Plan = undefined,
     pcs: NP.PcsJob = undefined,
     fixed_tree: S1.FixedTree = undefined,
+    fixed_inputs: []C.Input = &.{},
     live: bool = false,
     layout: Slab.ProofLayout = .{},
     table: Table = .{},
@@ -133,7 +139,8 @@ pub const Stage2 = struct {
             inline for (verdict_names) |name| if (@field(self.verdicts, name) == null) return error.TruthRequestVerdictsMissing;
         }
         const c = self.class;
-        if (self.compact.len != c.compactWords(self.calls) or self.calls == 0) return error.TruthCompactShape;
+        if (self.calls == 0) return error.TruthCompactShape;
+        try Schema.validateCompact(self.compact, self.compact_device, c.compactWords(self.calls));
         // `.check` compares the device bytes it copies out of the job slab;
         // a request-slab region would leave nothing to compare.
         if (self.encode == .check and self.encoded != null) return error.TruthCheckNeedsJobSlabRegion;
@@ -146,8 +153,14 @@ pub const Stage2 = struct {
             if (d.words < G.Exchange.seal_digest_words) return error.TruthDigestShape;
         } else if (self.digest_words == null) return error.TruthDigestRequired;
         if (self.stage1_root != null and self.stage1_root_words != null) return error.TruthStage1RootAmbiguous;
-        self.fixed_plan = try K.jobPlan(self.a, &c.fixed_plan);
-        errdefer K.freeJobPlan(self.a, &self.fixed_plan);
+        const resident = self.request_slab_only or c.source_fixed_root != null;
+        self.fixed_plan = if (resident) c.fixed_plan else try K.jobPlan(self.a, &c.fixed_plan);
+        errdefer if (!resident) K.freeJobPlan(self.a, &self.fixed_plan);
+        if (!resident) {
+            self.fixed_inputs = try self.a.alloc(C.Input, c.fixed_host.len);
+            for (self.fixed_inputs, c.fixed_host) |*i, h| i.* = .{ .host = h };
+        }
+        errdefer self.a.free(self.fixed_inputs);
         self.main_plan = try K.jobPlan(self.a, &c.main_plan);
         errdefer K.freeJobPlan(self.a, &self.main_plan);
         self.inter_plan = try K.jobPlan(self.a, &c.inter_plan);
@@ -159,11 +172,10 @@ pub const Stage2 = struct {
         self.composition.tw_device = null;
         self.pcs = try K.clonePcs(self.a, c);
         errdefer self.a.free(self.pcs.prepared.coefficients);
-        self.pcs_words = try self.a.alloc(u32, @intCast(self.pcs.outputWords()));
+        if (self.encode != .device) self.pcs_words = try self.a.alloc(u32, @intCast(self.pcs.outputWords()));
         errdefer self.a.free(self.pcs_words);
         self.fixed_tree = .{ .plan = &self.fixed_plan, .key = c.fixed_key };
         self.table = tableOf(c);
-        self.live = true;
         const n_status: u32 = Schema.StatusIndex.first_role + @as(u32, @intCast(c.roles.len));
         _ = try self.layout.add(.root, 0, 32);
         _ = try self.layout.add(.opaque_words, 0, 8); // alpha
@@ -183,13 +195,15 @@ pub const Stage2 = struct {
         _ = try self.layout.add(.opaque_words, 3, feltWords(c.localScript().felts));
         _ = try self.layout.add(.opaque_words, 4, feltWords(X.shared_felts));
         _ = try self.layout.add(.channel_state, 0, @import("channel.zig").snapshot_words);
+        self.live = true;
     }
     pub fn deinit(self: *Stage2) void {
         self.span.close(self.timing);
         self.device_span.close(self.timing);
         self.oods_span.close(self.timing);
         if (!self.live) return;
-        K.freeJobPlan(self.a, &self.fixed_plan);
+        if (!self.request_slab_only and self.class.source_fixed_root == null) K.freeJobPlan(self.a, &self.fixed_plan);
+        self.a.free(self.fixed_inputs);
         K.freeJobPlan(self.a, &self.main_plan);
         K.freeJobPlan(self.a, &self.inter_plan);
         self.a.free(self.pcs.prepared.coefficients);
@@ -238,24 +252,21 @@ pub const Stage2 = struct {
         const seed = try s.alloc(9);
         try s.upload(seed, &self.seed);
         self.staged_seed = seed;
-        const compact = try s.alloc(self.compact.len);
-        try s.upload(compact, self.compact);
+        const compact = try Schema.stageCompact(s, self.compact, self.compact_device);
         self.staged_compact = compact;
         // FIXED: class-persistent, filled by the first job of the class.
-        const fixed_inputs = try self.a.alloc(C.Input, c.fixed_host.len);
-        defer self.a.free(fixed_inputs);
-        for (fixed_inputs, c.fixed_host) |*i, h| i.* = .{ .host = h };
-        if (self.request_slab_only) {
-            const region = try s.persistent(c.fixed_key, self.fixed_tree.words());
+        if (self.request_slab_only or c.source_fixed_root != null) {
+            const region = try s.persistent(c.fixed_key, c.fixedRegionWords());
             if (region.fresh) return error.TruthClassNotWarmed;
             self.fixed_tree.persistent = region;
-        } else try self.fixed_tree.stage(s, fixed_inputs);
+        } else try self.fixed_tree.stage(s, self.fixed_inputs);
         const inputs = try placeholders(self.a, @max(c.main_logs.len, c.inter_logs.len));
         defer self.a.free(inputs);
         try self.main_plan.stage(s, inputs[0..c.main_logs.len]);
         try self.inter_plan.stage(s, inputs[0..c.inter_logs.len]);
         for (c.roles, 0..) |r, i| self.twiddles[i] = try I.stageTwiddles(self.a, s, r.interaction.log);
         try self.composition.stage(s);
+        try self.composition.bindPcsTables(&self.pcs);
         self.pinned = try s.pinned(@intCast(self.pcs.ingressWords()));
         if (self.encode != .host) {
             // Class-persistent per worker: uploaded by the first job of the class.
@@ -287,6 +298,7 @@ pub const Stage2 = struct {
         trace("s2.begin", self.ordinal);
         const staged = self.staged orelse return error.TruthJobNotStaged;
         const compact = self.staged_compact.?;
+        if (self.compact_device) |d| try check(sym.copy_d2d(ctx, compact.ptr, d.buffer.ptr, d.buffer.bytes()));
         const roots = try e.slab.field(.root, 0);
         const status = try e.slab.field(.status, 0);
         const own = try e.slab.field(.status, 1);
@@ -302,20 +314,20 @@ pub const Stage2 = struct {
         const stage1_root: ?api.DeviceBuffer = self.stage1_root orelse if (self.stage1_root_words != null) try staged.slice(t.host_root, 8) else null;
         try self.span.mark(self.timing, false, e.stream());
         try e.channel.initFromCheckpoint(self.staged_seed.?);
-        const fixed_inputs = try self.a.alloc(C.Input, c.fixed_host.len);
-        defer self.a.free(fixed_inputs);
-        for (fixed_inputs, c.fixed_host) |*i, h| i.* = .{ .host = h };
-        const fixed = try self.fixed_tree.enqueue(sym.commit, e, fixed_inputs, try roots.slice(0, 8));
+        const fixed = try self.fixed_tree.enqueue(sym.commit, e, self.fixed_inputs, try roots.slice(0, 8));
         trace("s2.fixed", self.ordinal);
         const main_eval = try e.alloc(c.mainEvalWords());
         const bytes = try enqueueWitness(c, sym, e, compact, main_eval, status.ptr + Schema.StatusIndex.witness, self.calls, self.first_id);
         const main_inputs = try self.a.alloc(C.Input, c.main_logs.len);
         defer self.a.free(main_inputs);
         try mainInputs(c, main_eval, main_inputs);
-        const main = try self.main_plan.enqueue(sym.commit, e, main_inputs, try roots.slice(8, 8), true);
+        const shared_lde = if (self.shared_commit_evaluations)
+            try e.alloc(@max(self.main_plan.eval_cells, self.inter_plan.eval_cells))
+        else
+            null;
+        const main = try self.main_plan.enqueueUsingEvaluations(sym.commit, e, main_inputs, try roots.slice(8, 8), self.retain_source_nodes, shared_lde);
         trace("s2.main", self.ordinal);
         if (bytes) |b| e.free(b);
-        e.free(main_eval);
         // Local challenges (proof channel), shared challenges (fresh channel over the digest).
         try X.run(c.localScript(), e.channel, try staged.slice(t.local, X.stagedWords(c.localScript())), null, local);
         trace("s2.local", self.ordinal);
@@ -330,26 +342,23 @@ pub const Stage2 = struct {
         const bounds = [4]u32{ b.staged, b.local, b.shared, b.claim };
         var outputs: [3]api.DeviceBuffer = undefined;
         var max_fixed: usize = 0;
-        var max_main: usize = 0;
         for (c.roles) |r| {
             max_fixed = @max(max_fixed, r.interaction.fixed_count);
-            max_main = @max(max_main, r.interaction.main_count);
         }
         const fixed_ptrs = try self.a.alloc([*]const u32, max_fixed);
         defer self.a.free(fixed_ptrs);
-        const main_ptrs = try self.a.alloc([*]const u32, max_main);
-        defer self.a.free(main_ptrs);
         for (c.roles, 0..) |*r, i| {
             const p = &r.interaction;
             const params = try e.alloc(p.program.len * 8);
             try check(sym.gather(ctx, 0, consts.ptr, local.ptr, shared.ptr, null, @ptrCast(staged.ptr + t.programs[2 * i]), @intCast(p.program.len), &bounds, params.ptr, status.ptr + Schema.StatusIndex.params));
             for (0..p.fixed_count) |k| fixed_ptrs[k] = fixed.coefficients.ptr + c.fixed_offsets[p.fixed_first + k];
-            for (0..p.main_count) |k| main_ptrs[k] = main.coefficients.ptr + self.main_plan.offsets[p.main_first + k];
+            const role_main = try I.mainEvaluations(main_eval, c.main_logs, p.main_first, p.main_count, p.log);
             outputs[i] = try e.alloc(p.outputWords());
-            try I.enqueue(p, &sym.interaction, e, .{ .fixed = fixed_ptrs[0..p.fixed_count], .main = main_ptrs[0..p.main_count], .parameters = params, .twiddles = self.twiddles[i].? }, .{ .output = outputs[i], .claims = claims, .zero = zero, .status = try status.slice(Schema.StatusIndex.first_role + i, 1) });
+            try I.enqueue(p, &sym.interaction, e, .{ .fixed = fixed_ptrs[0..p.fixed_count], .main = role_main, .parameters = params, .twiddles = self.twiddles[i].? }, .{ .output = outputs[i], .claims = claims, .zero = zero, .status = try status.slice(Schema.StatusIndex.first_role + i, 1) });
             e.free(params);
             trace("s2.role", self.ordinal);
         }
+        e.free(main_eval);
         // mixManifestAndClaims (worker_protocol): header, digest, claims.
         try e.channel.mixWords(try staged.slice(t.header, 3));
         try e.channel.mixWords(try digest.slice(0, 8));
@@ -365,7 +374,8 @@ pub const Stage2 = struct {
                 at += 1;
             };
         }
-        const inter = try self.inter_plan.enqueue(sym.commit, e, inter_inputs, try roots.slice(16, 8), true);
+        const inter = try self.inter_plan.enqueueUsingEvaluations(sym.commit, e, inter_inputs, try roots.slice(16, 8), self.retain_source_nodes, shared_lde);
+        if (shared_lde) |buffer| e.free(buffer);
         trace("s2.inter", self.ordinal);
         var k = c.roles.len;
         while (k > 0) {
@@ -387,18 +397,26 @@ pub const Stage2 = struct {
         try e.channel.mixRootFromTree(try roots.slice(24, 8));
         trace("s2.composition", self.ordinal);
         // OODS + enqueue-only PCS over the four trees.
-        const trees = [4]struct { base: [*]const u32, offsets: []const usize }{
-            .{ .base = fixed.coefficients.ptr, .offsets = c.fixed_offsets },
-            .{ .base = main.coefficients.ptr, .offsets = self.main_plan.offsets },
-            .{ .base = inter.coefficients.ptr, .offsets = self.inter_plan.offsets },
-            .{ .base = comp.coefficients.ptr, .offsets = self.composition.offsets },
-        };
-        for (trees, 0..) |tree, index| for (tree.offsets, 0..) |offset, original| try self.pcs.bindColumn(index, original, tree.base + offset);
-        const pcs_out = if (self.encode == .device) try e.alloc(self.pcs_words.len) else try e.slab.field(.opaque_words, 2);
+        const trees = [4]C.Committed{ fixed, main, inter, comp };
+        const offsets = [4][]const usize{ c.fixed_offsets, self.main_plan.offsets, self.inter_plan.offsets, self.composition.offsets };
+        for (trees, offsets, 0..) |tree, columns, index| try self.pcs.bindTree(index, tree.coefficients.ptr[0..tree.coefficients.words], columns);
+        var images: NP.SourceImages = .{};
+        if (self.retain_source_nodes) {
+            const main_nodes = main.node_storage orelse return error.TruthSourceTreeMissing;
+            const inter_nodes = inter.node_storage orelse return error.TruthSourceTreeMissing;
+            images.retain(1, main_nodes.ptr, self.main_plan.tree_words, true);
+            images.retain(2, inter_nodes.ptr, self.inter_plan.tree_words, true);
+        }
+        if (comp.opening_image) |image| images.retain(3, image.ptr, image.words, false);
+        self.pcs.source_images = if (self.retain_source_nodes or comp.opening_image != null) images else null;
+        const pcs_out = if (self.encode == .device) try e.alloc(@intCast(self.pcs.outputWords())) else try e.slab.field(.opaque_words, 2);
         try self.pcs.enqueueOpening(sym.pcs, e, self.pinned, try e.slab.field(.opaque_words, 1), pcs_out);
         trace("s2.pcs", self.ordinal);
+        if (comp.opening_image) |image| e.free(image);
         e.free(comp.coefficients);
+        if (inter.node_storage) |nodes| e.free(nodes);
         e.free(inter.coefficients);
+        if (main.node_storage) |nodes| e.free(nodes);
         e.free(main.coefficients);
         if (self.fault == .absent_claim) {
             // A nonzero word in the absent claim (classic) / the local closing

@@ -53,7 +53,8 @@ static void exercise(uint32_t count, uint32_t chunk_rows) {
        fixed = o.plane(rom.size(), 1), output = o.plane(expected.size(), 1),
        status = o.plane(1, 1);
   o.upload(input, records); o.upload(seed, seeds); o.upload(fixed, rom);
-  o.upload(status, {0}); CHECK(stwo_exec_context_sync(o.ctx));
+  const std::vector<uint32_t> poison(expected.size(), 0xfacefeedu);
+  o.upload(output, poison); o.upload(status, {0}); CHECK(stwo_exec_context_sync(o.ctx));
   StwoRv64CpuUnpack j{input.words, seed.words, fixed.words, output.words,
                       status.words, count, 5, chunk_rows, 0};
   CHECK(stwo_rv64_cpu_unpack_on(o.ctx, 1, &j));
@@ -65,9 +66,32 @@ static void exercise(uint32_t count, uint32_t chunk_rows) {
   if (!stwo_rv64_cpu_unpack_on(o.ctx, 1, &bad)) throw std::runtime_error("wrong version admitted");
   bad = j; bad.metadata = output.words + expected.size() - 1;
   if (!stwo_rv64_cpu_unpack_on(o.ctx, 1, &bad)) throw std::runtime_error("short output admitted");
-  records[2] = 32; o.upload(input, records); CHECK(stwo_exec_context_sync(o.ctx));
+  const auto rom_row = records[2];
+  records[2] = 32; o.upload(input, records); o.upload(output, poison);
+  CHECK(stwo_exec_context_sync(o.ctx));
   CHECK(stwo_rv64_cpu_unpack_on(o.ctx, 1, &j));
-  if (!o.read(status)[0]) throw std::runtime_error("bad ROM row admitted");
+  const auto rejected = o.read(output);
+  if (o.read(status)[0] != 2 || !std::all_of(rejected.begin(), rejected.begin() + 14,
+      [](uint32_t x) { return x == 0; })) throw std::runtime_error("undefined rejected ROM row");
+  if (count == 1) {
+    records[2] = rom_row; o.upload(input, records);
+    const auto circle = rom_row & 1 ? 31 - rom_row / 2 : rom_row / 2;
+    uint32_t rp = 0;
+    for (uint32_t i = 0; i != 5; ++i) rp |= ((circle >> i) & 1) << (4 - i);
+    for (uint32_t slot = 0; slot < 3; ++slot) {
+      auto bad_rom = rom;
+      bad_rom[(10 + slot) * 32 + rp] = 32 + slot;
+      o.upload(fixed, bad_rom); o.upload(output, poison); o.upload(status, {0});
+      CHECK(stwo_exec_context_sync(o.ctx));
+      CHECK(stwo_rv64_cpu_unpack_on(o.ctx, 1, &j));
+      const auto row = o.read(output);
+      const uint32_t dest = slot == 2 ? 6 : 2 * slot;
+      if (row[dest] || row[dest + 1] || row[10 + slot] ||
+          std::find(row.begin(), row.end(), poison[0]) != row.end())
+        throw std::runtime_error("undefined rejected register slot");
+      if (o.read(status)[0] != 2) throw std::runtime_error("bad register admitted");
+    }
+  }
   std::printf("CPU_UNPACK count=%u chunk=%u byte_identical=true metadata_bytes=%zu ingress_bytes=%zu\n",
               count, chunk_rows, expected.size() * 4, (records.size() + seeds.size()) * 4);
   o.close();

@@ -87,6 +87,8 @@ pub const Class = struct {
     fixed_words: usize,
     fixed_key: [32]u8,
     fixed_root: [32]u8,
+    /// Source-suite root in the second slot of a device-preseeded region.
+    source_fixed_root: ?[32]u8 = null,
     fixed_logs: []u32,
     main_plan: C.CommitPlan,
     main_logs: []u32,
@@ -145,6 +147,9 @@ pub const Class = struct {
     pub fn stagedFelts(self: *const Class) u32 {
         return P.stagedFelts(@intCast(self.roles.len));
     }
+    pub fn fixedRegionWords(self: *const Class) usize {
+        return self.fixed_plan.coefficient_cells + if (self.source_fixed_root != null) @as(usize, 16) else 8;
+    }
     pub fn bounds(self: *const Class) P.Bounds {
         return .{ .staged = self.stagedFelts(), .local = self.localScript().felts, .claim = self.claim_count };
     }
@@ -198,7 +203,7 @@ pub fn witnessOf(truth: Truth) !Witness {
     };
 }
 
-/// v3 kernel id (truth_source.zig / truth_codegen): sha 3, arith 4, secp_row 5/6, curve 10..14.
+/// v3 kernel id (truth_source.zig / truth_codegen): sha 3, arith 4, secp_row 5/6, curve 10..16.
 pub fn delegatedId(truth: Truth) !u32 {
     return switch (truth) {
         .sha256 => 3,
@@ -286,12 +291,14 @@ pub const Init = struct {
     fixed_root: [32]u8,
     psym: NP.Symbols,
     wide_framing: bool,
+    device_fixed: ?@import("native_fixed_seed.zig").Sealed = null,
 };
 
 /// Build the class plan. Host only (no device work); the device regions are
 /// filled by the first job of the class on each worker (Stager.persistent).
 pub fn build(a: std.mem.Allocator, in: Init) !*Class {
     const truth = in.truth;
+    if (truth.key().producer_only and in.device_fixed == null) return error.TruthClassFixedShape;
     const self = try a.create(Class);
     errdefer a.destroy(self);
     const kind: Kind = switch (truth) {
@@ -316,8 +323,10 @@ pub fn build(a: std.mem.Allocator, in: Init) !*Class {
     errdefer a.free(fixed_logs);
     const main_logs = try truth.logs(a, 1);
     errdefer a.free(main_logs);
-    if (in.fixed.len != fixed_logs.len) return error.TruthClassFixedShape;
-    for (in.fixed, fixed_logs) |c, l| if (c.log_size != l or c.words.len != @as(usize, 1) << @intCast(l)) return error.TruthClassFixedShape;
+    if (in.device_fixed == null) {
+        if (in.fixed.len != fixed_logs.len) return error.TruthClassFixedShape;
+        for (in.fixed, fixed_logs) |c, l| if (c.log_size != l or c.words.len != @as(usize, 1) << @intCast(l)) return error.TruthClassFixedShape;
+    } else if (in.fixed.len != 0) return error.TruthClassFixedShape;
     const main_width: usize = if (kind == .classic) A.crypto.keccak.layout.MAIN else (try V3.shape(truth)).main;
     const extra: usize = if (kind == .classic) 2 else 0;
     if (main_logs.len != main_width + extra) return error.TruthClassMainShape;
@@ -329,24 +338,26 @@ pub fn build(a: std.mem.Allocator, in: Init) !*Class {
     errdefer fixed_plan.deinit();
     const fixed_host = try a.alloc([]const u32, in.fixed.len);
     errdefer a.free(fixed_host);
-    const fixed_offsets = try a.alloc(usize, in.fixed.len);
+    const fixed_offsets = try a.alloc(usize, fixed_logs.len);
     errdefer a.free(fixed_offsets);
-    var fixed_words: usize = 0;
-    for (in.fixed, fixed_host) |c, *h| {
-        h.* = c.words;
-        fixed_words += c.words.len;
-    }
+    for (in.fixed, fixed_host) |c, *h| h.* = c.words;
+    const fixed_words = fixed_plan.coefficient_cells;
     // The persistent FIXED region IS the commit plan's coefficient image (ORIGINAL view by offsets).
     @memcpy(fixed_offsets, fixed_plan.offsets);
-    var fixed_key: [32]u8 = undefined;
-    {
+    const fixed_key = if (in.device_fixed) |sealed| key: {
+        const source_root = sealed.source_root orelse return error.TruthClassFixedShape;
+        if (sealed.words != fixed_words + 16 or !std.mem.eql(u8, &sealed.root, &in.fixed_root) or
+            (!truth.key().producer_only and !std.mem.eql(u8, &source_root, &truth.key().root)))
+            return error.TruthClassFixedShape;
+        break :key sealed.key;
+    } else key: {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         h.update("rv64-m8-gpu-truth-fixed/v1\x00");
         h.update(&in.fixed_root);
         h.update(std.mem.asBytes(&beta));
         h.update(std.mem.sliceAsBytes(fixed_logs));
-        fixed_key = h.finalResult();
-    }
+        break :key h.finalResult();
+    };
     // --- MAIN (evaluations) ---
     const main_shapes = try a.alloc(C.Shape, main_logs.len);
     defer a.free(main_shapes);
@@ -494,15 +505,33 @@ pub fn build(a: std.mem.Allocator, in: Init) !*Class {
         .{ .root = @splat(0), .columns = tree_columns[3] },
     };
     const request = D.Request{ .scope = null, .config = in.config, .lifting_log_size = composition.chunkLog() + beta, .trees = &trees, .points = .{ .items = &tree_points } };
-    var pcs = try NP.PcsJob.prepare(a, in.psym, request, placeholder, in.wide_framing);
+    var pcs = if (in.device_fixed != null)
+        try NP.PcsJob.prepareDevice(a, in.psym, request, placeholder, in.wide_framing)
+    else
+        try NP.PcsJob.prepare(a, in.psym, request, placeholder, in.wide_framing);
     errdefer pcs.deinit(a);
+    // Rolling PCS borrows each contiguous coefficient tree. Admit the tighter
+    // reservation only when this class's four real commit layouts match PCS
+    // order. The per-job guard rechecks the actual pointers and allocation
+    // ownership at enqueue, before any proof work can use the reservation.
+    if (pcs.prepared.geometry_only and pcs.plan.rolling != 0) {
+        const offsets = [4][]const usize{ fixed_plan.offsets, main_plan.offsets, inter_plan.offsets, composition.offsets };
+        const sizes = [_]usize{ fixed_plan.coefficient_cells, main_plan.coefficient_cells, inter_plan.coefficient_cells, composition.coefficientWords() };
+        var base: usize = 0;
+        for (pcs.prepared.metadata.shape.trees, offsets, sizes) |tree, layout, size| {
+            const end = base + tree.sorted_to_original.len;
+            if (!completeCoefficientTree(tree.sorted_to_original, layout, pcs.prepared.coefficients[base..end], size)) break;
+            base = end;
+        } else try pcs.requireBorrowedTrees(a);
+    }
+    composition.retain_opening = pcs.prepared.geometry_only and pcs.plan.source_node_images != 0;
     const pristine = try a.dupe(PcsColumn, pcs.prepared.coefficients);
     errdefer a.free(pristine);
     var oods = try TO.fromGeometry(a, .{ .kind = kind, .truth = truth, .log = log, .roles = roles, .mask_log = mask_log, .split = split, .shape = pcs.prepared.metadata.shape });
     errdefer oods.deinit();
     var encode = try NE.Program.build(a, pcs.prepared.metadata.shape);
     errdefer encode.deinit();
-    self.* = .{ .a = a, .key = try classKey(truth, in.config, in.fixed_root), .kind = kind, .truth = truth, .truth_tag = @intFromEnum(std.meta.activeTag(truth)), .witness = try witnessOf(truth), .log = log, .main_width = main_width, .compact_words_per_call = try compactWordsPerCall(truth), .config = in.config, .beta = beta, .fixed_plan = fixed_plan, .fixed_host = fixed_host, .fixed_offsets = fixed_offsets, .fixed_words = fixed_words, .fixed_key = fixed_key, .fixed_root = in.fixed_root, .fixed_logs = fixed_logs, .main_plan = main_plan, .main_logs = main_logs, .inter_plan = inter_plan, .inter_logs = inter_logs, .roles = roles, .claim_count = claim_count, .zero_count = zero_count, .composition = composition, .comp_log = comp_log, .split = split, .total = total, .mask_log = mask_log, .pcs = pcs, .pristine = pristine, .oods = oods, .encode = encode, .owned = owned, .owned_entries = owned_entries };
+    self.* = .{ .a = a, .key = try classKey(truth, in.config, in.fixed_root), .kind = kind, .truth = truth, .truth_tag = @intFromEnum(std.meta.activeTag(truth)), .witness = try witnessOf(truth), .log = log, .main_width = main_width, .compact_words_per_call = try compactWordsPerCall(truth), .config = in.config, .beta = beta, .fixed_plan = fixed_plan, .fixed_host = fixed_host, .fixed_offsets = fixed_offsets, .fixed_words = fixed_words, .fixed_key = fixed_key, .fixed_root = in.fixed_root, .source_fixed_root = if (in.device_fixed) |sealed| sealed.source_root else null, .fixed_logs = fixed_logs, .main_plan = main_plan, .main_logs = main_logs, .inter_plan = inter_plan, .inter_logs = inter_logs, .roles = roles, .claim_count = claim_count, .zero_count = zero_count, .composition = composition, .comp_log = comp_log, .split = split, .total = total, .mask_log = mask_log, .pcs = pcs, .pristine = pristine, .oods = oods, .encode = encode, .owned = owned, .owned_entries = owned_entries };
     return self;
 }
 
@@ -531,7 +560,7 @@ pub fn clonePcs(a: std.mem.Allocator, self: *const Class) !NP.PcsJob {
     job.prepared.section_owned = @splat(false);
     job.prepared.owns_metadata = false;
     job.prepared.geometry = null;
-    job.descriptor = job.prepared.descriptor();
+    job.descriptor = job.prepared.geometryDescriptor();
     return job;
 }
 
@@ -550,26 +579,26 @@ pub fn freeJobPlan(a: std.mem.Allocator, plan: *C.CommitPlan) void {
 /// device from the device trees (root_match checks the FIXED root against
 /// the class authority).
 pub const Binding = struct { identity: [32]u8, root: [32]u8, profile: ?WP.Candidate.Profile };
-pub const binding_profile_tag = "rv64-OM-localGKR-classicTruth-beta2-engineering/v1\x00";
 pub fn seed(config: WP.PcsConfig, expected: CPU.rv64_gkr_manifest.ExpectedWorker, binding: ?Binding) [9]u32 {
-    var ch = WP.begin(config, expected);
-    if (binding) |b| {
-        // fixed_authority.emitBindingBegin.
-        var tag: [32]u8 = undefined;
-        std.crypto.hash.blake2.Blake2s256.hash(binding_profile_tag, &tag, .{});
-        WP.digest(&ch, tag);
-        WP.digest(&ch, b.identity);
-        WP.digest(&ch, b.root);
-        if (b.profile) |p| if (p.conjectured()) WP.digest(&ch, WP.Candidate.profileIdentity(p));
-    }
+    const ch = if (binding) |b| (CPU.rv64_gkr_fixed_authority.ProducerHeader{
+        .fixed_identity = b.identity,
+        .fixed_root = b.root,
+        .profile = b.profile,
+    }).begin(config, expected) else WP.begin(config, expected);
     var out: [9]u32 = undefined;
     for (out[0..8], 0..) |*w, i| w.* = std.mem.readInt(u32, ch.inner.digest[i * 4 ..][0..4], .little);
     out[8] = ch.inner.n_draws;
     return out;
 }
 
-/// fixed_setup.coefficientIdentity (the binding's fixed identity).
-pub fn fixedIdentity(columns: []const FixedColumn, log_blowup: u32) ![32]u8 {
+pub fn fixedIdentityFor(config: WP.PcsConfig, root: [32]u8, columns: []const FixedColumn) ![32]u8 {
+    const Authority = CPU.rv64_gkr_fixed_authority;
+    if (Authority.usesRootIdentity(config)) return Authority.rootIdentity(root);
+    return fixedIdentity(columns, config.fri_config.log_blowup_factor);
+}
+
+/// Coefficient cache identity for the compatibility profile.
+fn fixedIdentity(columns: []const FixedColumn, log_blowup: u32) ![32]u8 {
     if (columns.len == 0) return error.EmptyFixedSetup;
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     h.update("rv64-immutable-M31-prefixed-Blake-fixed-setup/v1\x00");
@@ -593,74 +622,72 @@ pub fn fixedIdentity(columns: []const FixedColumn, log_blowup: u32) ![32]u8 {
 // ---------------------------------------------------------------------------
 pub const Advice = @typeInfo(@FieldType(S.Prepare, "advice")).pointer.child;
 
+const CompactWriter = struct {
+    output: []u32,
+    per_call: usize,
+    begin: usize,
+    end: usize,
+    offset: usize = 0,
+    written: usize = 0,
+
+    fn append(self: *CompactWriter, calls: anytype) void {
+        const start = @max(self.begin, self.offset);
+        const stop = @min(self.end, self.offset + calls.len);
+        if (start < stop) for (calls[start - self.offset .. stop - self.offset]) |*call| {
+            const values = if (@typeInfo(@TypeOf(call.*)) == .array) call else &call.before;
+            const dst = self.output[self.written * self.per_call ..][0..self.per_call];
+            for (values[0 .. self.per_call / 2], 0..) |value, i| {
+                dst[2 * i] = @truncate(value);
+                dst[2 * i + 1] = @truncate(value >> 32);
+            }
+            self.written += 1;
+        };
+        self.offset += calls.len;
+    }
+};
+
 pub fn packCompact(a: std.mem.Allocator, truth: Truth, advice: *const Advice) ![]u32 {
+    if (truth.first() == 0) return error.InvalidDeviceTruthSpan;
     const per = try compactWordsPerCall(truth);
     const output = try a.alloc(u32, try std.math.mul(usize, truth.count(), per));
     errdefer a.free(output);
-    if (truth.first() == 0) return error.InvalidDeviceTruthSpan;
     const begin: usize = truth.first() - 1;
-    const end = begin + truth.count();
-    var offset: usize = 0;
-    var written: usize = 0;
-    const Put = struct {
-        fn state(out: []u32, at: usize, per_call: usize, values: anytype) void {
-            for (values, 0..) |value, i| {
-                out[at * per_call + 2 * i] = @truncate(value);
-                out[at * per_call + 2 * i + 1] = @truncate(value >> 32);
-            }
-        }
-    };
+    var put = CompactWriter{ .output = output, .per_call = per, .begin = begin, .end = begin + truth.count() };
     switch (truth) {
         .keccak => {
-            for (advice.keccak) |chunk| for (chunk) |call| {
-                if (offset >= begin and offset < end) {
-                    Put.state(output, written, per, call.before);
-                    written += 1;
-                }
-                offset += 1;
-            };
-            for (advice.sponge) |chunk| for (chunk.inputs) |s| {
-                if (offset >= begin and offset < end) {
-                    Put.state(output, written, per, s);
-                    written += 1;
-                }
-                offset += 1;
-            };
+            for (advice.keccak) |chunk| put.append(chunk);
+            for (advice.sponge) |chunk| put.append(chunk.inputs);
         },
         .sha256, .arith256_mod => {
             const chunks = if (truth == .sha256) advice.sha256 else advice.arith256_mod;
-            for (chunks) |chunk| for (chunk) |call| {
-                if (offset >= begin and offset < end) {
-                    Put.state(output, written, per, call.before[0 .. per / 2]);
-                    written += 1;
-                }
-                offset += 1;
-            };
+            for (chunks) |chunk| put.append(chunk);
         },
         .curve => |t| {
             const index = @intFromEnum(t.setup.op) - 5;
-            for (advice.curves) |chunk| for (chunk[index]) |call| {
-                if (offset >= begin and offset < end) {
-                    Put.state(output, written, per, call.before[0 .. per / 2]);
-                    written += 1;
-                }
-                offset += 1;
-            };
+            for (advice.curves) |chunk| put.append(chunk[index]);
         },
         .secp_row => |t| {
             const k: usize = if (t.setup.kind == .add) 0 else 1;
-            for (advice.secp) |chunk| for (chunk[k]) |call| {
-                if (offset >= begin and offset < end) {
-                    Put.state(output, written, per, call.before[0 .. per / 2]);
-                    written += 1;
-                }
-                offset += 1;
-            };
+            for (advice.secp) |chunk| put.append(chunk[k]);
         },
         else => return error.UnsupportedDeviceTruthFamily,
     }
-    if (written != truth.count()) return error.InvalidDeviceTruthSpan;
+    if (put.written != truth.count()) return error.InvalidDeviceTruthSpan;
     return output;
+}
+
+test "truth compact ingress reads only its span across packet and sponge chunks" {
+    const Packet = struct { before: [2]u64 };
+    var output: [6]u32 = @splat(0);
+    var writer = CompactWriter{ .output = &output, .per_call = 2, .begin = 2, .end = 5 };
+    const packets = [_]Packet{ .{ .before = .{ 1, 2 } }, .{ .before = .{ 3, 4 } }, .{ .before = .{ 0x12_0000_0034, 5 } } };
+    const sponge = [_][2]u64{ .{ 6, 7 }, .{ 8, 9 }, .{ 10, 11 } };
+    writer.append(packets[0..1]);
+    writer.append(packets[1..]);
+    writer.append(sponge[0..0]);
+    writer.append(sponge[0..]);
+    try std.testing.expectEqual(@as(usize, 3), writer.written);
+    try std.testing.expectEqualSlices(u32, &.{ 0x34, 0x12, 6, 0, 8, 0 }, &output);
 }
 
 test "truth class is fully analyzed" {
@@ -743,4 +770,32 @@ test "withSpan replaces only the span" {
     try std.testing.expectEqual(@as(u32, 4), t.first());
     try std.testing.expectEqual(@intFromPtr(&setup), @intFromPtr(t.sha256.setup));
     try std.testing.expectEqual(@as(u32, 3), truth.count());
+}
+
+fn completeCoefficientTree(order: []const u32, offsets: []const usize, columns: []const PcsColumn, size: usize) bool {
+    if (order.len == 0 or order.len != offsets.len or order.len != columns.len) return false;
+    var cursor: usize = 0;
+    for (order, columns) |original, col| {
+        if (original >= offsets.len or cursor != offsets[original] or cursor > size or
+            col.count == 0 or col.count > size - cursor) return false;
+        cursor += @intCast(col.count);
+    }
+    return cursor == size;
+}
+
+test "truth PCS admits only exact complete coefficient trees in PCS order" {
+    var columns: [3]PcsColumn = undefined;
+    columns[0].count = 32;
+    columns[1].count = 64;
+    columns[2].count = 128;
+    const order = [_]u32{ 2, 0, 1 };
+    const offsets = [_]usize{ 32, 96, 0 };
+    try std.testing.expect(completeCoefficientTree(&order, &offsets, &columns, 224));
+    try std.testing.expect(!completeCoefficientTree(&order, &.{ 33, 96, 0 }, &columns, 224));
+    try std.testing.expect(!completeCoefficientTree(&order, &.{ 31, 96, 0 }, &columns, 224));
+    try std.testing.expect(!completeCoefficientTree(&.{ 2, 0, 3 }, &offsets, &columns, 224));
+    try std.testing.expect(!completeCoefficientTree(&order, &offsets, &columns, 223));
+    try std.testing.expect(!completeCoefficientTree(&order, &offsets, &columns, 225));
+    columns[2].count = std.math.maxInt(u64);
+    try std.testing.expect(!completeCoefficientTree(&order, &offsets, &columns, 224));
 }

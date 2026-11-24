@@ -11,6 +11,7 @@ pub const compact_chunk_rows: usize = 256;
 pub const pack_stack_bytes: usize = 1 << 20;
 pub const CompactRecord = extern struct { result: u64, rom_row: u32, next_pc: u32 };
 pub const CompactSeed = extern struct { values: [32]u64, clocks: [32]u32 };
+const CaptureMetadata = @typeInfo(@FieldType(Source, "metadata")).pointer.child;
 pub const Compact = struct {
     allocator: std.mem.Allocator,
     records: []CompactRecord,
@@ -38,7 +39,7 @@ pub const Compact = struct {
         var launched: usize = 0;
         errdefer for (threads[0..launched]) |thread| thread.join();
         for (0..workers) |i| {
-            jobs[i] = .{ .source = source, .records = records, .seeds = seeds, .first = seeds.len * i / workers, .end = seeds.len * (i + 1) / workers };
+            jobs[i] = .{ .source = source, .metadata = source.metadata, .records = records, .seeds = seeds, .first = seeds.len * i / workers, .end = seeds.len * (i + 1) / workers };
             if (i + 1 < workers) {
                 threads[launched] = try std.Thread.spawn(.{ .stack_size = pack_stack_bytes }, PackJob.run, .{&jobs[i]});
                 launched += 1;
@@ -122,9 +123,36 @@ pub const Compact = struct {
         if (pc != public.final_pc or !std.mem.eql(u64, &registers, &public.final_registers) or !std.mem.eql(u32, &clocks, &public.register_clocks) or !std.mem.eql(u32, &clocks, &trace.clocks)) return error.InvalidMinimalCpuBoundary;
         return .{ .allocator = allocator, .records = records, .seeds = seeds };
     }
+    /// Fill a whole-chunk window directly in the packet ring. The consumer
+    /// joins this wave before the ring buffer can be published or reused.
+    pub fn fillWindow(source: *const Source, first: usize, records: []align(4) CompactRecord, seeds: []CompactSeed, work_lease: ?*@import("stwo_prover_engine").work_pool.WorkLease) !void {
+        const metadata = source.metadata[first..][0..records.len];
+        const lease = work_lease orelse {
+            var job = PackJob{ .source = source, .metadata = metadata, .records = records, .seeds = seeds, .first = 0, .end = seeds.len };
+            return job.pack();
+        };
+        var jobs: [4]PackJob = undefined;
+        const workers = @min(jobs.len, lease.workerCount(), seeds.len);
+        if (workers == 0) return;
+        var group: std.Thread.WaitGroup = .{};
+        {
+            errdefer {
+                group.wait();
+                lease.completeWave();
+            }
+            for (0..workers) |i| {
+                jobs[i] = .{ .source = source, .metadata = metadata, .records = records, .seeds = seeds, .first = seeds.len * i / workers, .end = seeds.len * (i + 1) / workers };
+                if (i + 1 < workers) try lease.spawnWg(&group, PackJob.run, .{&jobs[i]}) else jobs[i].run();
+            }
+        }
+        group.wait();
+        lease.completeWave();
+        for (jobs[0..workers]) |job| if (job.failure) |err| return err;
+    }
     const PackJob = struct {
         source: *const Source,
-        records: []CompactRecord,
+        metadata: []const CaptureMetadata,
+        records: []align(4) CompactRecord,
         seeds: []CompactSeed,
         first: usize,
         end: usize,
@@ -140,7 +168,7 @@ pub const Compact = struct {
                 var touched: u32 = 1;
                 const start = chunk * compact_chunk_rows;
                 const end = @min(start + compact_chunk_rows, self.records.len);
-                for (self.source.metadata[start..end], self.records[start..end]) |meta, *record| {
+                for (self.metadata[start..end], self.records[start..end]) |meta, *record| {
                     if (meta.values[4] > std.math.maxInt(u32) or meta.rom_row >= self.source.program.row_to_entry.len) return error.InvalidCompactCpuMetadata;
                     record.* = .{ .result = meta.values[2], .rom_row = meta.rom_row, .next_pc = @intCast(meta.values[4]) };
                     const entry = self.source.program.entries[self.source.program.row_to_entry[meta.rom_row]];
@@ -231,6 +259,22 @@ test "first-pass CPU records remap to byte-identical compact capture without hos
     defer source.deinit();
     var expected = try Compact.fromCapture(allocator, &source);
     defer expected.deinit();
+    // Ring records may start at a four-byte offset. Use a full window and
+    // then a partial chunk, with the same lease reused for both waves.
+    var ring: [4 * n + 1]u32 align(8) = undefined;
+    const streamed = std.mem.bytesAsSlice(CompactRecord, std.mem.sliceAsBytes(ring[1..]));
+    var streamed_seeds: [3]CompactSeed = undefined;
+    const Work = @import("stwo_prover_engine").work_pool;
+    var pool: Work.WorkPool = .{};
+    try pool.initInPlaceWithOptions(.{ .worker_count = 4, .backing_allocator = allocator });
+    defer pool.deinit();
+    var lease = try pool.acquire(try Work.WorkerBudget.init(4));
+    defer lease.deinit();
+    try Compact.fillWindow(&source, 0, streamed[0..512], streamed_seeds[0..2], &lease);
+    try Compact.fillWindow(&source, 512, streamed[512..], streamed_seeds[2..3], &lease);
+    for (expected.records, streamed) |want, got| try std.testing.expectEqual(want, got);
+    try std.testing.expectEqualSlices(CompactSeed, expected.seeds, &streamed_seeds);
+
     var engine = try front.fast_execution.Engine.init(allocator, &memory, .{});
     defer engine.deinit();
     var fast_session = try front.Session.init(allocator, initial, &memory, .{ .max_retirements = n });
@@ -255,6 +299,10 @@ test "first-pass CPU records remap to byte-identical compact capture without hos
     defer allocator.free(tampered_metadata);
     var tampered_source = source;
     tampered_source.metadata = tampered_metadata;
+    tampered_metadata[300].rom_row = std.math.maxInt(u32);
+    try std.testing.expectError(error.InvalidCompactCpuMetadata, Compact.fillWindow(&tampered_source, 0, streamed[0..512], streamed_seeds[0..2], &lease));
+    try Compact.fillWindow(&source, 0, streamed[0..512], streamed_seeds[0..2], &lease);
+    tampered_metadata[300] = source.metadata[300];
     tampered_metadata[300].values[0] ^= @as(u64, 1) << 63;
     try std.testing.expectError(error.InvalidCompactCpuMetadata, actual.validateCapture(&tampered_source));
     seeds[1].values[1] ^= @as(u64, 1) << 63;

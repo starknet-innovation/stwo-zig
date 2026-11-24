@@ -18,7 +18,6 @@ const TruthEncoded = std.meta.Child(@FieldType(Bundle, "truths"));
 const Truth = std.meta.Child(@FieldType(ProductCPU.rv64_ethereum_keys.Owner, "truths"));
 const Root = CPU.rv64_om31_services_root;
 const Wrap = CPU.rv64_om31_execution_wrap;
-const Bounds = CPU.rv64_gkr_source_bounds;
 
 pub const Authority = struct {
     native: *const NCB.Inventory,
@@ -27,9 +26,9 @@ pub const Authority = struct {
     native_inputs: []const S2.RequestInputs,
     truth_inputs: []const TF.Request,
     recursion: RC.Classes,
-    bounds: *const Bounds.Report,
     profile: CPU.rv64_om31_security_candidate.Profile,
     keccak_uniform_throughput: bool,
+    grouped_recursion: bool = false,
 };
 
 fn find(p: G.Publication, kind: G.ProofKind, ordinal: usize) !G.Published {
@@ -141,23 +140,28 @@ pub fn write(a: std.mem.Allocator, authority: Authority, ctx: *const G.RequestCo
     // Borrowed views; never call Bundle.deinit on the shared request authority
     // or the readback mirrors. Only this publication arena owns the containers.
     const bundle = Bundle{ .requests = @constCast(inv.requests), .stage_one_bytes = @constCast((try find(p, .request, 0)).bytes), .cpus = cpus, .truths = truths };
-    try CPU.rv64_gkr_bundle_wire.write(ar, p.dir, setups, authority.truths, &bundle);
+    try CPU.rv64_gkr_bundle_wire.writeFor(authority.native.envelope, ar, p.dir, setups, authority.truths, &bundle);
 
-    const plan = try CPU.rv64_om31_ready_dag.Plan.initArity(n + truths.len, 4);
+    const workers = n + truths.len;
+    const span = if (authority.grouped_recursion) try Wrap.ClassSetup.ServiceGroupSpan.init(@intCast(workers -| 3), workers) else null;
+    if (span != null and truths.len < 3) return error.ServiceGroupMembership;
+    const plan = if (span) |group| try group.terminalPlan(workers, 4) else try CPU.rv64_om31_ready_dag.Plan.initArity(workers, 4);
     const nodes = try ar.alloc(Wrap.Node, plan.count);
     for (nodes, plan.nodes[0..plan.count], 0..) |*node, spec, i| {
         const kind: G.ProofKind = if (spec.isLeaf()) .leaf else if (i == plan.root) .root else .fold;
         const proof = try find(p, kind, i);
         node.* = .{ .first_leaf = spec.first_leaf, .leaf_count = spec.leaf_count, .left = spec.left(), .right = spec.right(), .authority = try authority.recursion.identity(p.block, i), .digest = try nodeDigest(proof.bytes) };
     }
-    try p.dir.makePath("recursion-om31");
-    var recursive = try p.dir.openDir("recursion-om31", .{});
+    const recursive_path = if (span != null) "recursion-service-group" else "recursion-om31";
+    try p.dir.makePath(recursive_path);
+    var recursive = try p.dir.openDir(recursive_path, .{});
     defer recursive.close();
     const tree = try Wrap.treeJson(ar, &plan, nodes, .{ .cpus = cpu_frames, .truths = truth_frames });
     try recursive.writeFile(.{ .sub_path = "tree.json", .data = tree });
-    const b = authority.bounds;
+    const b = if (authority.inventory.bounds) |*report| report else return error.GpuNativeInventoryMissing;
     try json(ar, p.dir, "candidate-source-bounds.json", .{ .profile = ProductCPU.rv64_ethereum_gkr_main.candidateLabel(authority.profile), .security_qualified = false, .accounting_profile = b.accounting_profile, .shape = b.shape, .cpu_scopes = b.cpu_scopes, .truth_scopes = b.truth_scopes, .global_signed = b.global_signed, .global_denominator_slots = b.global_denominator_slots, .lookup_only_conditional_degrees = b.conditional_degrees, .transcript_round_bound_qualified = b.transcript_round_bound_qualified, .secp_polynomial_error_budget_qualified = b.secp_polynomial_error_budget_qualified });
     try json(ar, p.dir, "report.json", .{ .profile = ProductCPU.rv64_ethereum_gkr_main.candidateLabel(authority.profile), .security_profile = authority.profile.name(), .security_qualified = false, .completed_ethereum_block = true, .capture_source = "in_process_execution", .keccak_uniform_throughput = authority.keccak_uniform_throughput, .retained_main = @as(?u64, null), .output = output, .cpu_proofs = n, .truth_proofs = truths.len, .capture_ns = @as(?u64, null), .setup_ns = @as(u64, 0), .prove_ns = @as(?u64, null), .same_process_verify_ns = @as(?u64, null), .total_before_report_ns = @as(?u64, null), .device_checks_accepted = true, .verification = "fresh CPU receiver runs off path", .timing_scope = "request wall and GPU spans are in m8-jobs.json; unavailable legacy stage partitions remain null" });
-    try json(ar, p.dir, "combined-report.json", .{ .schema = 1, .accepted = true, .completed_ethereum_block = true, .acceptance_basis = "all request-slab device verdicts; fresh CPU receiver required for qualification", .security_qualified = false, .profile = ProductCPU.rv64_ethereum_gkr_main.candidateLabel(authority.profile), .recursion_streamed = true, .native_bundle_reload = false, .restored_recursive_proofs = false, .recursion_ns = @as(?u64, null), .native_prove_ns = @as(?u64, null), .native_verify_ns = @as(?u64, null), .setup_breakdown = .{ .scope = "all class construction is charged to service initialization" }, .recursive = .{ .leaf_proofs = n + truths.len, .fold_proofs = plan.count - n - truths.len, .fold_arity = 4, .root_node = plan.root, .root_digest = nodes[plan.root].digest, .root_authority = nodes[plan.root].authority } });
+    const leaf_proofs = workers - @as(usize, if (span != null) 2 else 0);
+    try json(ar, p.dir, "combined-report.json", .{ .schema = 1, .accepted = true, .completed_ethereum_block = true, .acceptance_basis = "all request-slab device verdicts; fresh CPU receiver required for qualification", .security_qualified = false, .profile = ProductCPU.rv64_ethereum_gkr_main.candidateLabel(authority.profile), .recursion_streamed = true, .native_bundle_reload = false, .restored_recursive_proofs = false, .recursion_ns = @as(?u64, null), .native_prove_ns = @as(?u64, null), .native_verify_ns = @as(?u64, null), .setup_breakdown = .{ .scope = "all class construction is charged to service initialization" }, .recursive = .{ .leaf_proofs = leaf_proofs, .fold_proofs = plan.count - leaf_proofs, .fold_arity = 4, .root_node = plan.root, .root_digest = nodes[plan.root].digest, .root_authority = nodes[plan.root].authority } });
     try std.posix.fsync(p.dir.fd);
 }

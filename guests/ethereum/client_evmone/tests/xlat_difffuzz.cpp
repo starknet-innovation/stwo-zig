@@ -261,6 +261,149 @@ Out run(evmone::VM& vm, const evmone::baseline::CodeAnalysis& analysis, int64_t 
     return {r.status_code, r.gas_left, r.gas_refund, std::move(output), host_view(host)};
 }
 
+// Consumer regression programs for the stack fusion and bounded Solidity word-copy loop.
+Bytes fusion_program(std::mt19937_64& rng, unsigned sample)
+{
+    Bytes c;
+    const unsigned family = sample % 5, d = 1 + (rng() % 8);
+    const unsigned heights[] = {0, 1, 2, d, d + 1, d + 2, 16, 1021, 1022, 1023, 1024};
+    const auto h = heights[(sample / 5) % 11];
+    for (unsigned i = 0; i < h; ++i)
+    {
+        c.push_back(0x60);
+        c.push_back(uint8_t(rng()));
+    }
+    const unsigned where = c.size();
+    unsigned fix = ~0u;
+    switch (family)
+    {
+    case 0:
+    {
+        const unsigned width = rng() % 256;
+        c.insert(c.end(), {0x60, 1, 0x60, 1, 0x60, uint8_t(width), 0x1b, 0x03});
+        if (sample & 1)
+            c.push_back(0x16);
+        break;
+    }
+    case 1:
+    {
+        c.insert(
+            c.end(), {0x80, 0x63, 0, 0, 0, h ? c[where - 1] : uint8_t{23}, 0x14, 0x61, 0, 0, 0x57});
+        fix = where + 8;
+        break;
+    }
+    case 2:
+    {
+        const unsigned k = 2 + rng() % 15;
+        for (unsigned j = 0; j < k; ++j)
+            c.push_back(0x50);
+        break;
+    }
+    case 3:
+    {
+        const unsigned k = 2 + rng() % 7;
+        const bool two = rng() & 1;
+        c.push_back(0x8f + k);
+        if (two)
+            c.push_back(0x8e + k);
+        for (unsigned j = 0; j < (two ? k - 1 : k); ++j)
+            c.push_back(0x50);
+        c.push_back(0x56);
+        const auto index = two ? int(h) - int(k) - 1 : int(h) - 1;
+        if (index >= 0 && c.size() + 3 < 256 && sample % 3)
+            c[2 * index + 1] = uint8_t(c.size() + 3);
+        break;
+    }
+    default:
+    {
+        c.insert(c.end(), {uint8_t(0x10 + rng() % 4), 0x15, 0x61, 0, 0, 0x57});
+        fix = where + 3;
+        break;
+    }
+    }
+    c.insert(c.end(), {0x60, 0xa7, 0x50});
+    const unsigned label = c.size();
+    c.push_back(0x5b);
+    if (fix != ~0u)
+    {
+        unsigned dst = sample % 3 ? label : label + 100;
+        c[fix] = uint8_t(dst >> 8);
+        c[fix + 1] = uint8_t(dst);
+    }
+    if (sample % 11 == 0 && c.size() > 7)
+    {
+        c.resize(c.size() - (rng() % 7 + 1));
+        return c;
+    }
+    c.insert(c.end(), {0x60, 0, 0x52, 0x60, 32, 0x60, 0, 0xf3});
+    return c;
+}
+
+Bytes word_copy_program(std::mt19937_64& rng, unsigned sample)
+{
+    Bytes c;
+    const auto push1 = [&](unsigned x) {
+        c.push_back(0x60);
+        c.push_back(uint8_t(x));
+    };
+    const auto push2 = [&](unsigned x) {
+        c.push_back(0x61);
+        c.push_back(uint8_t(x >> 8));
+        c.push_back(uint8_t(x));
+    };
+    // Distinguish forward overlapping copies from memmove and cover memory growth from zero.
+    for (unsigned i = 0; i < 16; ++i)
+    {
+        push1(0x40 + i);
+        push1(i * 5);
+        c.push_back(0x53);
+    }
+    if (sample % 13 == 0)
+        for (unsigned i = 0; i < (sample % 5) + 1017; ++i)
+            push1(9);
+    const unsigned lengths[] = {0, 1, 31, 32, 33, 63, 64, 65, 128, 900};
+    unsigned len = lengths[sample % 10];
+    push2(len);
+    unsigned dest = (rng() % 4) * 32 + rng() % 4;
+    unsigned src = (rng() % 4) * 32 + rng() % 4;
+    if (sample % 6 == 0)
+        dest = src;
+    push2(dest);
+    push2(src);
+    if (sample % 19 == 0)
+        c.insert(c.end(), {0x68, 1, 0, 0, 0, 0, 0, 0, 0, 0});
+    else
+        push2(rng() % 5 ? rng() % 40 : len);
+    const unsigned back = c.size();
+    c.push_back(0x5b);
+    const unsigned head = c.size();
+    c.insert(c.end(), {0x83, 0x81, 0x10, 0x15, 0x61, 0, 0, 0x57, 0x81, 0x81, 0x01, 0x51, 0x83, 0x82,
+                          0x01, 0x52, 0x60, 32, 0x01, 0x61, 0, 0, 0x56});
+    const unsigned exit = c.size();
+    c.push_back(0x5b);
+    const unsigned cycle = sample % 29 == 0 ? back + 1 : back,
+                   dst = sample % 23 == 0 ? exit + 1 : exit;
+    c[head + 5] = uint8_t(dst >> 8);
+    c[head + 6] = uint8_t(dst);
+    c[head + 20] = uint8_t(cycle >> 8);
+    c[head + 21] = uint8_t(cycle);
+    if (sample % 17 == 0)
+        c[head + 8 + rng() % 10] = 0x50;
+    if (sample % 31 == 0)
+    {
+        c.resize(head + rng() % 23);
+        return c;
+    }
+    // Include the ending counter in the observable memory, followed by copied source/destination
+    // bytes.
+    push2(224);
+    c.push_back(0x52);
+    push2(256);
+    push1(0);
+    c.push_back(0xf3);
+    return c;
+}
+
 void dump(const char* name, const Out& o)
 {
     std::printf("  %s: status=%d gas_left=%ld refund=%ld outlen=%zu hostlen=%zu\n", name,
@@ -292,9 +435,12 @@ int main(int argc, char** argv)
 
     std::mt19937_64 rng(seed);
     long mismatches = 0, runs = 0;
-    for (long i = 0; i < iters && mismatches < 5; ++i)
+    for (long i = 0; i < iters + 4096 && mismatches < 5; ++i)
     {
-        const auto code = gen(rng);
+        const auto seq = static_cast<unsigned>(i - iters);
+        const auto code = i < iters ? gen(rng) :
+                                      ((seq & 1) ? word_copy_program(rng, seq / 2) :
+                                                   fusion_program(rng, seq / 2));
         const auto analysis = evmone::baseline::analyze({code.data(), code.size()});
         Bytes calldata(rng() % 80);
         for (auto& b : calldata) b = (uint8_t)rng();
@@ -302,9 +448,12 @@ int main(int argc, char** argv)
         for (int k = 0; k < 4; ++k)
         {
             const auto rev = static_cast<evmc_revision>(rng() % (EVMC_MAX_REVISION + 1));
-            const int64_t gas = (k == 0) ? (int64_t)(rng() % 400) + 1 :
-                                (k == 1) ? (int64_t)(rng() % 5000) + 1 :
-                                           (int64_t)(rng() % 200000) + 1;
+            const int64_t gas =
+                (i >= iters && k == 3) ?
+                    std::max<int64_t>(0, int64_t(code.size() / 2) * 3 + int64_t(rng() % 45) - 22) :
+                (k == 0) ? (int64_t)(rng() % 400) + 1 :
+                (k == 1) ? (int64_t)(rng() % 5000) + 1 :
+                           (int64_t)(rng() % 200000) + 1;
             const auto b = run(*plain_vm, analysis, gas, rev, calldata);
             const auto f = run(*fused_vm, analysis, gas, rev, calldata);
             const auto a = has_xlat ? run(*xlat_vm, analysis, gas, rev, calldata) : f;
@@ -328,6 +477,6 @@ int main(int argc, char** argv)
             }
         }
     }
-    std::printf("%ld programs, %ld runs, %ld mismatches\n", iters, runs, mismatches);
+    std::printf("%ld programs, %ld runs, %ld mismatches\n", iters + 4096, runs, mismatches);
     return mismatches == 0 ? 0 : 1;
 }

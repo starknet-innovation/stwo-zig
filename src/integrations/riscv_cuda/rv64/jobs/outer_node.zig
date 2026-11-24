@@ -56,6 +56,7 @@ fn enqueueInteraction(device: *K.Device, f: K.Fractions, g: Abi.GlobalPairs) !vo
 pub const Long = struct {
     main_coef: K.Buffer,
     inter_coef: K.Buffer,
+    opening_images: [2]?TC.OpeningImage = .{ null, null },
     main_tree: ?K.Buffer,
     inter_tree: ?K.Buffer,
     parameters: K.Buffer,
@@ -194,13 +195,15 @@ pub const Node = struct {
         device.phase(.fixed);
         if (self.fixed) |f| {
             const fp = &(staged.statics.fixed_plan orelse return error.OuterJobWholeStagingMissing);
-            const tw = try staged.statics.table(fp.eval_log);
+            const tw = img.twiddles[fp.eval_log];
+            const itw = img.itwiddles[fp.eval_log];
+            if (tw.words == 0 or itw.words != tw.words) return error.MissingOuterTwiddles;
             const fs: TC.Statics = .{
                 .sorted_logs = self.at(img.fixed_logs),
-                .twiddles = self.at(img.twiddles[fp.eval_log]),
-                .twiddle_words = @intCast(tw.twiddles.len),
-                .itwiddles = self.at(img.itwiddles[fp.eval_log]),
-                .itwiddle_words = @intCast(tw.itwiddles.len),
+                .twiddles = self.at(tw),
+                .twiddle_words = @intCast(tw.words),
+                .itwiddles = self.at(itw),
+                .itwiddle_words = @intCast(itw.words),
             };
             const fixed_stream: ?*const TC.Stream = if (streams) |st| (if (st.fixed) |*fs_plan| fs_plan else null) else null;
             if (fixed_stream) |stream| {
@@ -221,7 +224,8 @@ pub const Node = struct {
         const values = try device.alloc(asg.count * 4);
         var values_live = true;
         defer if (values_live) device.free(values);
-        var job = K.AssignmentJob{ .values = values.ptr, .records = self.at(img.seeds), .indices = null, .status = @ptrCast(status), .value_count = @intCast(asg.count), .record_count = asg.seedCount(), .index_count = 0, .first = 0, .count = asg.seedCount() };
+        const scheduled_count = try initializeAssignmentSuffix(device, values, asg.count, asg.two_variables, asg.zero_variables);
+        var job = K.AssignmentJob{ .values = values.ptr, .records = self.at(img.seeds), .indices = null, .status = @ptrCast(status), .value_count = @intCast(scheduled_count), .record_count = asg.seedCount(), .index_count = 0, .first = 0, .count = asg.seedCount() };
         try device.check(asg.seed(device.ctx, K.lane, &job));
         if (asg.sample_map != null) {
             const prefill = k.prefill orelse return error.MissingBlakeSamplePrefillKernel;
@@ -280,11 +284,13 @@ pub const Node = struct {
             }
         }
 
+        try repeatAssignmentValue(device, values, scheduled_count, asg.two_variables);
+
         // 2. MAIN gate kernels into the sorted evaluation image.
         var runs: [Plan.count_columns][2]u64 = undefined;
         for (p.countRuns(&runs)) |r| try device.clear(main_eval.at(r[0]), r[1]);
         var counts: [Plan.count_columns][*]u32 = undefined;
-        for (&counts, Plan.main_columns - Plan.count_columns..) |*out, column| out.* = main_eval.at(p.main.offsets[column]);
+        for (&counts, p.main.logs.len - Plan.count_columns..) |*out, column| out.* = main_eval.at(p.main.offsets[column]);
         const gate_status = status + 3;
         for (0..Plan.gate_components) |c| {
             const comp = p.geometry.components[c];
@@ -309,7 +315,7 @@ pub const Node = struct {
         // 3. TC MAIN; the evaluation image stays live for INTER. Streamed:
         // the root goes straight to the section, no tree outlives the commit.
         const main_root: [*]const u32 = if (streams) |st| blk: {
-            try TC.enqueueStreamed(device, &p.main, &st.main, .{ .evaluations = main_eval.ptr, .coefficients = main_coef.ptr, .root_out = self.section + S.main_root, .statics = try self.statics(.main) });
+            try TC.enqueueStreamed(device, &p.main, &st.main, .{ .opening = long.opening_images[0], .evaluations = main_eval.ptr, .coefficients = main_coef.ptr, .root_out = self.section + S.main_root, .statics = try self.statics(.main) });
             break :blk self.section + S.main_root;
         } else blk: {
             try TC.enqueue(device, &p.main, .{ .evaluations = main_eval.ptr, .coefficients = main_coef.ptr, .tree = long.main_tree.?, .statics = try self.statics(.main) });
@@ -356,7 +362,7 @@ pub const Node = struct {
         try self.stepped(step);
         step += 1;
         const inter_root: [*]const u32 = if (streams) |st| blk: {
-            try TC.enqueueStreamed(device, &p.inter, &st.inter, .{ .evaluations = inter_coef.ptr, .coefficients = inter_coef.ptr, .root_out = self.section + S.inter_root, .statics = try self.statics(.inter) });
+            try TC.enqueueStreamed(device, &p.inter, &st.inter, .{ .opening = long.opening_images[1], .evaluations = inter_coef.ptr, .coefficients = inter_coef.ptr, .root_out = self.section + S.inter_root, .statics = try self.statics(.inter) });
             break :blk self.section + S.inter_root;
         } else blk: {
             try TC.enqueue(device, &p.inter, .{ .evaluations = inter_coef.ptr, .coefficients = inter_coef.ptr, .tree = long.inter_tree.?, .statics = try self.statics(.inter) });
@@ -397,16 +403,78 @@ pub const Node = struct {
         const i = self.staged.image;
         const p = self.staged.plan();
         const log = if (which == .main) p.main.eval_log else p.inter.eval_log;
-        const tw = try self.staged.statics.table(log);
+        const tw = i.twiddles[log];
+        const itw = i.itwiddles[log];
+        if (tw.words == 0 or itw.words != tw.words) return error.MissingOuterTwiddles;
         return .{
             .sorted_logs = self.at(if (which == .main) i.main_logs else i.inter_logs),
-            .twiddles = self.at(i.twiddles[log]),
-            .twiddle_words = @intCast(tw.twiddles.len),
-            .itwiddles = self.at(i.itwiddles[log]),
-            .itwiddle_words = @intCast(tw.itwiddles.len),
+            .twiddles = self.at(tw),
+            .twiddle_words = @intCast(tw.words),
+            .itwiddles = self.at(itw),
+            .itwiddle_words = @intCast(itw.words),
         };
     }
 };
+
+/// All gate kernels still read the original allocation. Only the assignment
+/// interpreter is restricted to the prefix whose values it must compute.
+fn initializeAssignmentSuffix(device: *K.Device, values: K.Buffer, count: usize, twos: u32, zeros: u32) !usize {
+    if (@as(u64, twos) + zeros > count or (twos != 0 and @as(u64, twos) + zeros == count) or values.words / 4 < count) return error.InvalidAssignmentZeroSuffix;
+    const live = count - zeros;
+    if (zeros != 0) try device.clear(values.at(4 * live), 4 * @as(u64, zeros));
+    return live - twos;
+}
+
+/// Double an initialized run using nonoverlapping, stream-ordered D2D copies.
+/// The source wire is produced by the ordinary seed/assignment schedule.
+fn repeatAssignmentValue(device: *K.Device, values: K.Buffer, live: usize, twos: usize) !void {
+    if (twos == 0) return;
+    const start = live - 1;
+    var done: usize = 1;
+    while (done <= twos) {
+        const batch = @min(done, twos + 1 - done);
+        try device.copy(values.at(4 * (start + done)), values.at(4 * start), 4 * batch);
+        done += batch;
+    }
+}
+
+test "staged assignment clears exactly the terminal QM31 values on the device" {
+    const F = struct {
+        fn copy(_: *anyopaque, dst: *anyopaque, src: *const anyopaque, n: usize) callconv(.c) c_int {
+            const d = @as([*]u8, @ptrCast(dst))[0..n];
+            const s = @as([*]const u8, @ptrCast(src))[0..n];
+            if (@intFromPtr(s.ptr) + n > @intFromPtr(d.ptr)) return 1;
+            @memcpy(d, s);
+            return 0;
+        }
+        fn clear(_: *anyopaque, addr: *anyopaque, byte: c_int, n: usize) callconv(.c) c_int {
+            if (byte != 0) return 1;
+            @memset(@as([*]u8, @ptrCast(addr))[0..n], 0);
+            return 0;
+        }
+    };
+    var words: [32]u32 = @splat(19);
+    const values = K.Buffer{ .ptr = &words, .words = 28 };
+    var kernels: K.Kernels = undefined;
+    kernels.memset = F.clear;
+    kernels.d2d = F.copy;
+    var device: K.Device = undefined;
+    device.ctx = &words;
+    device.kernels = &kernels;
+    device.counters = .{};
+    try std.testing.expectEqual(7, try initializeAssignmentSuffix(&device, values, 7, 0, 0));
+    try std.testing.expectEqual(3, try initializeAssignmentSuffix(&device, values, 7, 0, 4));
+    try std.testing.expectError(error.InvalidAssignmentZeroSuffix, initializeAssignmentSuffix(&device, values, 7, 0, 8));
+    try std.testing.expectError(error.InvalidAssignmentZeroSuffix, initializeAssignmentSuffix(&device, values, 8, 0, 1));
+    try std.testing.expectEqual(@as(u32, 1), device.counters.api);
+    for (words, 0..) |word, i| try std.testing.expectEqual(@as(u32, if (i >= 12 and i < 28) 0 else 19), word);
+    words[0..4].* = .{ 2, 0, 0, 0 };
+    const live = try initializeAssignmentSuffix(&device, values, 7, 5, 1);
+    try repeatAssignmentValue(&device, values, live, 5);
+    for (0..6) |i| try std.testing.expectEqualSlices(u32, &.{ 2, 0, 0, 0 }, words[4 * i ..][0..4]);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 0, 19, 19, 19, 19 }, words[24..]);
+    try std.testing.expectError(error.InvalidAssignmentZeroSuffix, initializeAssignmentSuffix(&device, values, 7, 7, 0));
+}
 
 /// Device channel steps the prefix enqueues (plan device_ops minus the
 /// composition root and OODS seed, which the tail owns).

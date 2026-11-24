@@ -17,8 +17,71 @@ __device__ __forceinline__ void n2b_shuffle(
     const uint32_t mask = 1u << log_stride;
 #pragma unroll
     for (uint32_t i = 0; i < 1u << (LogValues - 1u); ++i) {
-        M31 *value = lane & mask ? values + 2u * i : values + 2u * i + 1u;
-        *value = __shfl_xor_sync(0xffffffffu, *value, mask);
+        const bool odd = (lane & mask) != 0;
+        const M31 exchanged = __shfl_xor_sync(
+            0xffffffffu, odd ? values[2u * i] : values[2u * i + 1u], mask);
+        if (odd) values[2u * i] = exchanged;
+        else values[2u * i + 1u] = exchanged;
+    }
+}
+
+// Circle pairs have table entry (+odd, -odd, -even, +even). Select the
+// coordinate once so a warp issues one load even when lanes need both signs.
+__device__ __forceinline__ M31 dense_circle_twiddle(const M31 *twiddles, uint32_t pair) {
+    const uint32_t entry = ((pair >> 2u) << 1u) | (1u ^ ((pair >> 1u) & 1u));
+    const M31 value = twiddles[entry];
+    return ((pair ^ (pair >> 1u)) & 1u) ? m31_neg(value) : value;
+}
+
+// Each lane initially owns group[lane + i * Lanes]. At each stage one
+// XOR shuffle per pair brings its left and right operands into registers.
+// After the last shuffle each lane owns adjacent pairs, even when the caller
+// omits the final circle butterfly. group_start is a full-domain index.
+template <uint32_t LaneBits, uint32_t LogValues, bool DenseCircle = false>
+__device__ __forceinline__ void n2b_warp_butterflies(
+    M31 (&values)[1u << LogValues], uint32_t lane, uint32_t group_start,
+    uint32_t log_n, bool include_circle, const M31 *twiddles) {
+    static_assert(LaneBits > 0 && LaneBits <= 5 && LogValues > 0);
+#pragma unroll
+    for (uint32_t step = 0; step < LaneBits; ++step) {
+        const uint32_t bit = LaneBits - 1u - step;
+        n2b_shuffle<LogValues>(values, bit, lane);
+        if (bit == 0 && !include_circle) continue;
+#pragma unroll
+        for (uint32_t i = 0; i < (1u << (LogValues - 1u)); ++i) {
+            const uint32_t pair = (group_start >> (bit + 1u)) +
+                (lane >> bit) + (i << (LaneBits - bit));
+            const M31 twiddle = bit == 0
+                ? (DenseCircle ? dense_circle_twiddle(twiddles, pair) : circle_twiddle(twiddles, pair))
+                : twiddles[(1u << (log_n - 1u)) - (1u << (log_n - bit)) + pair];
+            const M31 product = m31_mul(twiddle, values[2u * i + 1u]);
+            const M31 left = values[2u * i];
+            values[2u * i] = m31_add(left, product);
+            values[2u * i + 1u] = m31_sub(left, product);
+        }
+    }
+}
+
+template <uint32_t LaneBits, uint32_t LogValues, bool DenseCircle = false>
+__device__ __forceinline__ void n2b_warp_tail(
+    M31 (&values)[1u << LogValues], uint32_t lane, uint32_t group_start,
+    uint32_t log_n, bool include_circle, const M31 *twiddles, M31 *column) {
+    n2b_warp_butterflies<LaneBits, LogValues, DenseCircle>(values, lane, group_start,
+                                             log_n, include_circle, twiddles);
+#pragma unroll
+    for (uint32_t i = 0; i < (1u << (LogValues - 1u)); ++i) {
+        const uint32_t out = group_start + (i << (LaneBits + 1u)) + 2u * lane;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        if constexpr (DenseCircle) {
+            if ((reinterpret_cast<uintptr_t>(column) & 7u) == 0) {
+                reinterpret_cast<uint2 *>(column + out)[0] =
+                    make_uint2(values[2u * i], values[2u * i + 1u]);
+                continue;
+            }
+        }
+#endif
+        column[out] = values[2u * i];
+        column[out + 1u] = values[2u * i + 1u];
     }
 }
 
@@ -206,43 +269,8 @@ __global__ void n2b_final_warp(
         layer_offset -= layer_size;
     }
 
-#pragma unroll
-    for (; stage <= log_n; ++stage) {
-        const uint32_t log_stride = log_n - stage;
-        n2b_shuffle<LogValues>(values, log_stride, lane);
-        if constexpr (!IncludeCircle) {
-            if (stage == log_n) continue;
-        }
-#pragma unroll
-        for (uint32_t i = 0; i < 1u << (LogValues - 1u); ++i) {
-            const uint32_t inner_pair =
-                (lane >> log_stride) +
-                (i << (kN2bLogWarp - log_stride));
-            const uint32_t outer_pair =
-                warp_index << (log_values_per_warp - 1u - log_stride);
-            const M31 right = values[2u * i + 1u];
-            const M31 product = stage == log_n
-                ? m31_mul(
-                      circle_twiddle(twiddles, inner_pair + outer_pair),
-                      right)
-                : m31_mul(
-                      twiddles[layer_offset + inner_pair + outer_pair],
-                      right);
-            const M31 left = values[2u * i];
-            values[2u * i] = m31_add(left, product);
-            values[2u * i + 1u] = m31_sub(left, product);
-        }
-        layer_size <<= 1;
-        layer_offset -= layer_size;
-    }
-
-    warp_start = (warp_index << log_values_per_warp) + 2u * lane;
-#pragma unroll
-    for (uint32_t i = 0; i < 1u << (LogValues - 1u); ++i) {
-        const uint32_t output = warp_start + (i << 6u);
-        column[output] = values[2u * i];
-        column[output + 1u] = values[2u * i + 1u];
-    }
+    n2b_warp_tail<kN2bLogWarp, LogValues>(values, lane,
+        warp_index << log_values_per_warp, log_n, IncludeCircle, twiddles, column);
 }
 
 template <uint32_t LogWarps, bool IncludeCircle>
@@ -341,43 +369,8 @@ __global__ void n2b_final_block(
         layer_offset -= layer_size;
     }
 
-#pragma unroll
-    for (; stage <= log_n; ++stage) {
-        const uint32_t log_stride = log_n - stage;
-        n2b_shuffle<log_values>(values, log_stride, lane);
-        if constexpr (!IncludeCircle) {
-            if (stage == log_n) continue;
-        }
-#pragma unroll
-        for (uint32_t i = 0; i < 1u << (log_values - 1u); ++i) {
-            const uint32_t inner_pair =
-                (lane >> log_stride) +
-                (i << (kN2bLogWarp - log_stride));
-            const uint32_t outer_pair =
-                warp_index << (log_values_per_warp - 1u - log_stride);
-            const M31 right = values[2u * i + 1u];
-            const M31 product = stage == log_n
-                ? m31_mul(
-                      circle_twiddle(twiddles, inner_pair + outer_pair),
-                      right)
-                : m31_mul(
-                      twiddles[layer_offset + inner_pair + outer_pair],
-                      right);
-            const M31 left = values[2u * i];
-            values[2u * i] = m31_add(left, product);
-            values[2u * i + 1u] = m31_sub(left, product);
-        }
-        layer_size <<= 1;
-        layer_offset -= layer_size;
-    }
-
-    warp_start = (warp_index << log_values_per_warp) + 2u * lane;
-#pragma unroll
-    for (uint32_t i = 0; i < 1u << (log_values - 1u); ++i) {
-        const uint32_t output = warp_start + (i << 6u);
-        column[output] = values[2u * i];
-        column[output + 1u] = values[2u * i + 1u];
-    }
+    n2b_warp_tail<kN2bLogWarp, log_values>(values, lane,
+        warp_index << log_values_per_warp, log_n, IncludeCircle, twiddles, column);
 }
 
 inline cudaError_t launch_n2b_continue(

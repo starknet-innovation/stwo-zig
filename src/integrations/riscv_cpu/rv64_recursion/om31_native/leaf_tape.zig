@@ -9,6 +9,16 @@ const Outer = @import("outer_wrap.zig");
 const Components = @import("../../word16_global_execution/services/gkr_local/cpu_components.zig");
 const Types = @import("../../word16_global_execution/services/types.zig");
 const Frame = @import("../../word16_global_execution/services/gkr_local/frame.zig");
+const Fixed = @import("../../word16_global_execution/services/gkr_local/fixed_authority.zig");
+
+pub const ClassBinding = struct {
+    header: Fixed.ProducerHeader,
+    source_root: [32]u8,
+
+    pub fn fromReceiver(fixed: ?*const Fixed.Binding) ?ClassBinding {
+        return if (fixed) |value| .{ .header = value.header(), .source_root = value.source_root } else null;
+    }
+};
 pub const Mode = enum { off, on, check };
 pub fn mode() Mode {
     const value = std.posix.getenv("STWO_RV64_LEAF_SEED_TAPE") orelse return .off;
@@ -23,16 +33,16 @@ const Key = struct {
         std.mem.writeInt(u64, &bytes, @intCast(value), .little);
         self.h.update(&bytes);
     }
-    fn init(input: anytype, shape: *const V.Shape) Key {
+    fn init(fixed_root: [32]u8, binding: ?ClassBinding, shape: *const V.Shape) Key {
         var self = Key{ .h = std.crypto.hash.sha2.Sha256.init(.{}) };
         self.h.update("rv64-om31-leaf-seed-class/v3\x00");
         self.h.update(@import("stwo_circuit_cpu_integration").om31.protocol.domainName());
         self.h.update(@tagName(Outer.shape()));
-        self.h.update(&input.expected.fixed);
-        if (input.fixed) |fixed| {
-            self.h.update(&fixed.fixed_identity);
+        self.h.update(&fixed_root);
+        if (binding) |fixed| {
+            self.h.update(&fixed.header.fixed_identity);
             self.h.update(&fixed.source_root);
-            if (fixed.profile) |p| self.h.update(@tagName(p));
+            if (fixed.header.profile) |p| self.h.update(@tagName(p));
         }
         self.word(shape.global_log);
         self.word(shape.composition_log_split);
@@ -58,7 +68,12 @@ const Key = struct {
 /// All class constants: source FIXED root, layout, exact GKR roster and proof
 /// structure, config and outer profile. No producer-supplied class is admitted.
 pub fn cpuClass(input: anytype, shape: *const V.Shape) ![32]u8 {
-    var key = Key.init(input, shape);
+    const proof = (input.stage.local orelse return error.WideCpuLocalRequired).proof;
+    return cpuClassWithProof(input, shape, proof, ClassBinding.fromReceiver(input.fixed));
+}
+
+pub fn cpuClassWithProof(input: anytype, shape: *const V.Shape, proof: anytype, binding: ?ClassBinding) ![32]u8 {
+    var key = Key.init(input.expected.fixed, binding, shape);
     key.h.update("cpu\x00");
     key.h.update(&input.setup.key.root);
     const instances = input.expected.local_instances orelse return error.WideCpuLocalRequired;
@@ -70,7 +85,6 @@ pub fn cpuClass(input: anytype, shape: *const V.Shape) ![32]u8 {
         key.word(instance.fixed_offset);
         key.word(instance.main_offset);
     }
-    const proof = (input.stage.local orelse return error.WideCpuLocalRequired).proof;
     key.word(proof.sumcheck_proofs.len);
     for (proof.sumcheck_proofs) |sc| {
         key.word(sc.round_polys.len);
@@ -86,12 +100,20 @@ pub fn cpuClass(input: anytype, shape: *const V.Shape) ![32]u8 {
     return key.h.finalResult();
 }
 pub fn truthClass(input: anytype, shape: *const V.Shape) [32]u8 {
-    var key = Key.init(input, shape);
-    key.h.update("truth\x00");
+    return truthClassWithBinding(input, shape, ClassBinding.fromReceiver(input.fixed));
+}
+
+pub fn truthClassWithBinding(input: anytype, shape: *const V.Shape, binding: ?ClassBinding) [32]u8 {
+    var key = Key.init(input.expected.fixed, binding, shape);
+    // The call span is guessed into the current tape and authenticated in
+    // its public frame. Circuit constants come from the implementation,
+    // operation, declaration geometry and receiver-derived fixed authority.
+    const declaration = @import("../../word16_global_execution/services/wire.zig").TruthDeclaration.from(input.truth);
+    key.h.update("truth/public-span\x00");
     key.h.update(@tagName(std.meta.activeTag(input.truth)));
-    key.h.update(&input.truth.key().root);
-    key.word(input.truth.first());
-    key.word(input.truth.count());
+    key.word(@intFromEnum(declaration.family));
+    for (declaration.logs) |log| key.word(log);
+    key.h.update(if (binding) |fixed| &fixed.source_root else &input.truth.key().root);
     return key.h.finalResult();
 }
 
@@ -126,7 +148,7 @@ pub fn cpu(a: std.mem.Allocator, input: anytype, values: *const V.Captured) ![][
         }
         try emit.word(c.register_clocks[r]);
     }
-    var plan = try Components.Plan.init(a, input.setup);
+    var plan = try Components.Plan.initFor(input.expected.envelope, a, input.setup);
     defer plan.deinit();
     const ls = try input.setup.materials.geometry.lsCounts(input.request.base.memory.ls_count);
     const dword = try Types.dwordCounts(input.setup.bridges, input.request.ls_dword);

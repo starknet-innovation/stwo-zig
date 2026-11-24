@@ -297,7 +297,7 @@ fn feltOf(w: []const u32) !O {
 fn resolveSeed(rec: *const Record, class: *const K.Class) !?struct { seed: [9]u32, binding: bool } {
     const local = rec.local orelse return null;
     const fixed = rec.fixed orelse return null;
-    const binding = K.Binding{ .identity = try K.fixedIdentity(fixed.columns, rec.config.fri_config.log_blowup_factor), .root = fixed.root, .profile = WP.candidateProfile(rec.config) };
+    const binding = K.Binding{ .identity = try K.fixedIdentityFor(rec.config, fixed.root, fixed.columns), .root = fixed.root, .profile = WP.candidateProfile(rec.config) };
     for ([_]?K.Binding{ null, binding }) |candidate| {
         const seed = K.seed(rec.config, rec.expected, candidate);
         var ch = WP.Channel.init();

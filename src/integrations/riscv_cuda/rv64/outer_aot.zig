@@ -19,6 +19,10 @@ pub fn groups(a: std.mem.Allocator, bundle: *const CPU.air.Bundle) ![]Group {
     };
     return out.toOwnedSlice(a);
 }
+pub const mixed_component = 1;
+pub const mixed_role_id = 12;
+const mixed_group: Group = .{ .component = mixed_component, .part = 0, .first = 0, .count = 6 };
+
 pub fn write(a: std.mem.Allocator, directory: std.fs.Dir) !void {
     const bytes = try std.fs.cwd().readFileAlloc(a, CPU.air.bundle_path, 64 << 20);
     defer a.free(bytes);
@@ -26,6 +30,11 @@ pub fn write(a: std.mem.Allocator, directory: std.fs.Dir) !void {
     defer bundle.deinit();
     const catalogue = try groups(a, &bundle);
     defer a.free(catalogue);
+    if (catalogue.len != mixed_role_id or catalogue[mixed_component].component != mixed_component)
+        return error.InvalidOm31OuterCatalogue;
+    var entries: [mixed_role_id + 1]Group = undefined;
+    @memcpy(entries[0..mixed_role_id], catalogue);
+    entries[mixed_role_id] = mixed_group;
     var declarations: std.ArrayList(u8) = .empty;
     defer declarations.deinit(a);
     var identities: std.ArrayList([64]u8) = .empty;
@@ -34,14 +43,15 @@ pub fn write(a: std.mem.Allocator, directory: std.fs.Dir) !void {
     defer masks.deinit(a);
     var params: std.ArrayList(usize) = .empty;
     defer params.deinit(a);
-    const names = try a.alloc([]u8, catalogue.len);
+    const names = try a.alloc([]u8, entries.len);
     defer a.free(names);
     var made: usize = 0;
     defer for (names[0..made]) |name| a.free(name);
     var manifest: std.ArrayList(u8) = .empty;
     defer manifest.deinit(a);
     try manifest.appendSlice(a, "{\"profile\":\"native-om31-circuit\",\"geometry_independent\":true,\"groups\":[\n");
-    for (catalogue, 0..) |group, id| {
+    for (entries, 0..) |group, id| {
+        if (id == mixed_role_id) try Outer.prove.bindMixedAot(a, &bundle);
         var artifact = try Outer.record.record(a, &bundle.components[group.component], group.part, group.first, group.count);
         defer artifact.deinit();
         names[id] = try C.kernelName(a, &artifact.program);
@@ -71,13 +81,13 @@ pub fn write(a: std.mem.Allocator, directory: std.fs.Dir) !void {
     try w.writeAll("static const void *kernels[]={");
     for (names, 0..) |name, i| try w.print("{s}(void*){s}", .{ if (i == 0) "" else ",", name });
     try w.writeAll("};\nstatic const uint32_t groups[]={");
-    for (catalogue, 0..) |_, i| try w.print("{s}0u", .{if (i == 0) "" else ","});
+    for (entries, 0..) |_, i| try w.print("{s}0u", .{if (i == 0) "" else ","});
     try w.writeAll("};\nstatic const uint32_t masks[]={");
     for (masks.items, 0..) |count, i| try w.print("{s}{}u", .{ if (i == 0) "" else ",", count });
     try w.writeAll("};\nstatic const uint32_t params[]={");
     for (params.items, 0..) |count, i| try w.print("{s}{}u", .{ if (i == 0) "" else ",", count });
     try w.writeAll("};\nstatic const uint32_t roots[]={");
-    for (catalogue, 0..) |group, i| try w.print("{s}{}u", .{ if (i == 0) "" else ",", group.count });
+    for (entries, 0..) |group, i| try w.print("{s}{}u", .{ if (i == 0) "" else ",", group.count });
     try w.writeAll("};\nstatic const uint8_t identities[][64]={\n");
     for (identities.items) |identity| {
         try w.writeAll("{");
@@ -86,5 +96,5 @@ pub fn write(a: std.mem.Allocator, directory: std.fs.Dir) !void {
     }
     try w.writeAll("};\nextern \"C\" int stwo_circuit_om31_composition_identity(uint32_t id,uint8_t*out){if(!out||id>=sizeof(kernels)/sizeof(kernels[0]))return 1;std::memcpy(out,identities[id],64);return 0;}\nextern \"C\" int stwo_circuit_om31_composition_role_on(void*c,uint32_t l,const StwoRv64CompositionRole*j,uint32_t*n){if(!j||j->role>=sizeof(kernels)/sizeof(kernels[0])||j->mask_count!=masks[j->role]||j->parameter_count!=params[j->role]||j->constraint_count!=roots[j->role])return int(cudaErrorInvalidValue);return stwo::cuda::rv64::composition_dispatch(c,l,j,n,kernels,groups,sizeof(kernels)/sizeof(kernels[0]));}\n");
     try directory.writeFile(.{ .sub_path = "outer-dispatch.cu", .data = dispatch.items });
-    std.debug.print("OM31_OUTER_AOT groups={} pinned_authority=true geometry_independent=true\n", .{catalogue.len});
+    std.debug.print("OM31_OUTER_AOT groups={} pinned_authority=true geometry_independent=true\n", .{entries.len});
 }

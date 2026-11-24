@@ -3,6 +3,8 @@
 #include "gkr.h"
 // GkrState layout for 128 oracles (batch.h): channel 16, 4 words, variables + active ids 2 * 128,
 // 4 words, alpha + lambda 16, seed + pad 12, claims 8 * 2 * 128, point 8 * 28 (was 1428/152/160/168/180/1204 at 64).
+// Numerical binding buffer limit. The host checks the exact source descriptor.
+constexpr uint32_t STWO_RV64_BINDING_MAX_ROW_LOG = 23;
 constexpr uint32_t STWO_RV64_GKR_STATE_WORDS = 2580;
 constexpr uint32_t STWO_RV64_GKR_ALPHA_WORD = 280;
 constexpr uint32_t STWO_RV64_GKR_LAMBDA_WORD = 288;

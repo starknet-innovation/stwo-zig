@@ -1,0 +1,29 @@
+--- a/lib/evmone_precompiles/kzg.cpp
++++ b/lib/evmone_precompiles/kzg.cpp
+@@ -9,6 +9,8 @@
+ #include <optional>
+ #include <span>
+
++extern "C" void stwo_miller_two_prepared(blst_fp12*, const blst_fp6*, const blst_p1_affine*,
++    const blst_fp6*, const blst_p1_affine*) noexcept;
+ namespace evmone::crypto
+ {
+ namespace
+@@ -55,13 +57,10 @@
+
+ bool pairings_verify(const blst_p1_affine& a1, const blst_p1_affine& b1) noexcept
+ {
+-    // Uses precomputed Miller loop lines for the G2 generator [1]₂.
+-    blst_fp12 left;
+-    blst_miller_loop_lines(&left, g2_gen_lines(), &a1);
+-    // Uses precomputed Miller loop lines for KZG_SETUP_G2_1 ([s]₂).
+-    blst_fp12 right;
+-    blst_miller_loop_lines(&right, kzg_setup_g2_1_lines(), &b1);
+-    return blst_fp12_finalverify(&left, &right);
++    blst_fp12 product;
++    stwo_miller_two_prepared(&product, g2_gen_lines(), &a1, kzg_setup_g2_1_lines(), &b1);
++    blst_final_exp(&product, &product);
++    return blst_fp12_is_one(&product);
+ }
+ }  // namespace
+

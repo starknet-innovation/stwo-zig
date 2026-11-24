@@ -110,6 +110,7 @@ pub const Binding = struct {
     inputs_hooks: ?InputsHooks = null,
     native_resources_ready: bool = false,
     recursion_resources_ready: bool = false,
+    proofless_setup: bool = false,
     resolution: Resolution = .{},
     /// The composed vtables (copies of the streams' entries + fallbacks).
     native_vt: G.NativeFactory.VTable = undefined,
@@ -151,6 +152,7 @@ pub const Binding = struct {
             .fallback = fallback,
         };
         self.s1_sym = try S1.Symbols.load(&libs.base, &libs.addon, &self.gkr_sym);
+        self.s2_sym.binding_eq = self.gkr_sym.numerical.stwo_rv64_binding_eq_on;
         self.timing = .{ .ctx = self, .create = tCreate, .record = tRecord, .elapsed = tElapsed, .destroy = tDestroy };
         self.registry.sym = &self.s1_sym;
         self.registry.workers = workers;
@@ -296,7 +298,7 @@ pub const Binding = struct {
         var it = self.registry.classes.iterator();
         while (it.next()) |kv| {
             const c = kv.value_ptr.*;
-            std.debug.print("GPU_M8_GN_BIND s1_class={x} job_words={d} image_words={d} gkr_staged={d} main_staged={d} compact_words={d} main_device={d} main_coeff_eval={d} gkr_enqueue={d} bind_enqueue={d} resident_words={d}\n", .{ kv.key_ptr.*[0..6].*, c.jobWords(), c.image_words, c.spec.gkr.stagedWords(true), c.main.stagedWords(0), c.spec.compact_words, c.main.deviceWords(), c.main.coefficient_cells + c.main.eval_cells, c.spec.gkr.enqueueWords(), c.bind.enqueueWords(), c.resident.words });
+            std.debug.print("GPU_M8_GN_BIND s1_class={x} job_words={d} image_words={d} gkr_staged={d} main_staged={d} compact_words={d} main_device={d} main_coeff_eval={d} gkr_enqueue={d} bind_enqueue={d} resident_words={d} retained_binding_words={d}\n", .{ kv.key_ptr.*[0..6].*, c.jobWords(), c.image_words, c.spec.gkr.stagedWords(true), c.main.stagedWords(0), c.spec.compact_words, c.main.deviceWords(), c.main.coefficient_cells + c.main.eval_cells, c.gkrEnqueueWords(), c.bind.retainedEnqueueWords(), c.resident.words, c.resident.binding_words });
         }
     }
 
@@ -332,16 +334,18 @@ pub const Binding = struct {
         for (self.registry.workers) |worker| reuse_frees = reuse_frees and worker.config.reuse_frees;
         for (self.registry.classes.values()) |cl| {
             const pool = self.stage2.classes.get(S2.framingKey(cl.spec.key)) orelse return error.GpuNativeClassNotWarmed;
+            const entry = cache.map.get(cl.spec.key) orelse return error.GpuNativeClassNotWarmed;
+            const f0 = pool.instances.items[0];
+            if (f0.pcs.prepared.geometry_only and f0.pcs.plan.source_node_images != 0 and cl.main.canRetainSeparateNodes(self.s1_sym.commit))
+                entry.main_node_words = cl.main.tree_words;
             for (pool.instances.items) |f| {
                 f.reuse_frees = reuse_frees;
                 if (f.semantic_words != cl.resident.semantic_words or f.fixed_words != cl.fixed.coefficient_cells) return error.NativeStage2ClassConflict;
                 try f.adoptResidentColumns(&cl.fixed, &cl.main);
                 f.fixed_region_words = cl.fixedRegionWords();
-                f.resident_handoff = .{ .checkpoint = cl.resident.checkpoint, .binding = cl.resident.binding, .semantic = cl.resident.semantic, .section = cl.resident.section, .section_words = cl.resident.section_words };
+                f.resident_handoff = .{ .checkpoint = cl.resident.checkpoint, .binding = cl.resident.binding, .semantic = cl.resident.semantic, .section = cl.resident.section, .section_words = cl.resident.section_words, .main_nodes_at = cl.resident.words, .main_nodes_words = entry.main_node_words };
             }
-            const entry = cache.map.get(cl.spec.key) orelse return error.GpuNativeClassNotWarmed;
-            const f = pool.instances.items[0];
-            entry.max_encoded_bytes = @max(entry.max_encoded_bytes, f.program.max_encoded_bytes + 4 * f.leaf_suffix_words);
+            entry.max_encoded_bytes = @max(entry.max_encoded_bytes, f0.program.max_encoded_bytes + 4 * f0.leaf_suffix_words);
         }
     }
     fn nInstalled(raw: *anyopaque, cache: *G.ClassCache, info: *const G.Installed) anyerror!void {
@@ -423,7 +427,10 @@ pub const Binding = struct {
         const self = of(raw);
         const r = self.inner_recursion;
         try r.vtable.warm(r.ctx, cache);
-        if (self.truth) |*t| try t.warm(cache);
+        if (self.truth) |*t| {
+            t.geometry_budget = self.proofless_setup;
+            try t.warm(cache);
+        }
         if (self.inputs_hooks) |h| if (h.warm) |f| try f(h.ctx, cache);
     }
     fn rInstalled(raw: *anyopaque, cache: *G.ClassCache, info: *const G.Installed) anyerror!void {
@@ -505,7 +512,11 @@ pub fn writeNative(p: G.Publication) !void {
     };
 }
 
-/// Leaf name: the first leaf input in legacy leaf order (segments, then truths).
+fn recursionDir(topology: ?*const D.Topology) []const u8 {
+    return if (topology != null and topology.?.grouped_recursion) "recursion-service-group" else "recursion-om31";
+}
+
+/// Leaf name from native ordinal order, including the terminal service span.
 pub fn leafName(buf: []u8, topology: *const D.Topology, id: u32) ![]const u8 {
     if (id >= topology.nodes.len) return error.GpuNativeRecursionUnknownNode;
     const n = topology.nodes[id];
@@ -517,7 +528,9 @@ pub fn leafName(buf: []u8, topology: *const D.Topology, id: u32) ![]const u8 {
         break :blk s;
     };
     const first: u32 = if (n.segments.len != 0) n.segments[0] else if (n.truths.len != 0) segments + n.truths[0] else return error.GpuNativeRecursionLeafWithoutInputs;
-    return std.fmt.bufPrint(buf, "recursion-om31/leaf-{d:0>6}.proof", .{first});
+    const count = n.segments.len + n.truths.len;
+    const name = if (count == 1) "leaf" else if (topology.grouped_recursion and n.truths.len == 3 and n.segments.len == 0) "service-group" else return error.InvalidRecursiveServiceGroup;
+    return std.fmt.bufPrint(buf, "{s}/{s}-{d:0>6}.proof", .{ recursionDir(topology), name, first });
 }
 
 pub fn writeRecursion(p: G.Publication, topology: ?*const D.Topology) !void {
@@ -526,19 +539,20 @@ pub fn writeRecursion(p: G.Publication, topology: ?*const D.Topology) !void {
 fn writeRecursionParts(p: G.Publication, topology: ?*const D.Topology, write_truths: bool) !void {
     var buf: [96]u8 = undefined;
     var made = false;
+    const subdir = recursionDir(topology);
     for (p.proofs) |pp| switch (pp.id.kind) {
         .truth => if (write_truths) try writeFile(p.dir, try std.fmt.bufPrint(&buf, "truth-{d}.bin", .{pp.id.ordinal}), pp.bytes),
         .leaf, .fold, .root => {
             if (!made) {
-                try p.dir.makePath("recursion-om31");
+                try p.dir.makePath(subdir);
                 made = true;
             }
             switch (pp.id.kind) {
                 .leaf => try writeFile(p.dir, try leafName(&buf, topology orelse return error.GpuNativeRecursionTopologyMissing, pp.id.ordinal), pp.bytes),
-                .fold => try writeFile(p.dir, try std.fmt.bufPrint(&buf, "recursion-om31/fold-{d:0>6}.proof", .{pp.id.ordinal}), pp.bytes),
+                .fold => try writeFile(p.dir, try std.fmt.bufPrint(&buf, "{s}/fold-{d:0>6}.proof", .{ subdir, pp.id.ordinal }), pp.bytes),
                 else => {
-                    try writeFile(p.dir, try std.fmt.bufPrint(&buf, "recursion-om31/fold-{d:0>6}.proof", .{pp.id.ordinal}), pp.bytes);
-                    try writeFile(p.dir, "recursion-om31/root.proof", pp.bytes);
+                    try writeFile(p.dir, try std.fmt.bufPrint(&buf, "{s}/fold-{d:0>6}.proof", .{ subdir, pp.id.ordinal }), pp.bytes);
+                    try writeFile(p.dir, try std.fmt.bufPrint(&buf, "{s}/root.proof", .{subdir}), pp.bytes);
                 },
             }
         },
@@ -576,4 +590,38 @@ test "fallback writers name artifacts like the D2 golden" {
     }
     _ = try tmp.dir.statFile("recursion-om31/root.proof");
     try t.expectError(error.GpuNativeRecursionTopologyMissing, writeRecursion(p, null));
+}
+
+test "terminal service group waits for three native proofs and publishes one leaf" {
+    const t = std.testing;
+    const a = t.allocator;
+    var topology = try D.Topology.carryExecution(a, 7, 4, 4, true);
+    defer topology.deinit();
+    try t.expectEqual(@as(usize, 12), topology.nodes.len);
+    try t.expectEqualSlices(u32, &.{ 4, 9, 10 }, topology.nodes[topology.root].children);
+    var dag = try D.build(a, .{ .devices = 1, .segments = &(.{D.Segment{}} ** 7), .truths = &(.{D.Truth{}} ** 4), .truth_two_stage = true, .recursion = topology.nodes, .root = topology.root });
+    defer dag.deinit();
+    const grouped = dag.nodes[dag.recursion[10]];
+    const expected = [_]G.ProofId{ .{ .kind = .truth, .ordinal = 1 }, .{ .kind = .truth, .ordinal = 2 }, .{ .kind = .truth, .ordinal = 3 } };
+    try t.expectEqualSlices(G.ProofId, &expected, grouped.children);
+    try t.expectEqualSlices(u32, dag.truth2[1..4], grouped.deps);
+    try t.expect(grouped.phase_b);
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var proofs: [12]G.Published = undefined;
+    for (topology.nodes, &proofs, 0..) |node, *proof, i| {
+        proof.* = .{ .id = .{ .kind = if (node.children.len == 0) .leaf else if (i == topology.root) .root else .fold, .ordinal = @intCast(i) }, .bytes = "group" };
+    }
+    try writeRecursion(.{ .block = 1, .proofs = &proofs, .exchange = &.{}, .dir = tmp.dir }, &topology);
+    for ([_][]const u8{ "leaf-000007.proof", "service-group-000008.proof", "fold-000011.proof", "root.proof" }) |name| {
+        var path: [96]u8 = undefined;
+        try tmp.dir.access(try std.fmt.bufPrint(&path, "recursion-service-group/{s}", .{name}), .{});
+    }
+    try t.expectError(error.FileNotFound, tmp.dir.access("recursion-service-group/leaf-000008.proof", .{}));
+    try t.expectError(error.FileNotFound, tmp.dir.access("recursion-service-group/leaf-000009.proof", .{}));
+    try t.expectError(error.FileNotFound, tmp.dir.access("recursion-service-group/leaf-000010.proof", .{}));
+    try t.expectError(error.FileNotFound, tmp.dir.access("recursion-om31", .{}));
+    try t.expectError(error.InvalidRecursiveServiceGroup, D.Topology.carryExecution(a, 7, 2, 4, true));
+    try t.expectError(error.InvalidRecursiveServiceGroup, D.Topology.carryExecution(a, 7, 4, 2, true));
 }

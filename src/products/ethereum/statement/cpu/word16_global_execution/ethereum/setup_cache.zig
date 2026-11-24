@@ -134,9 +134,14 @@ pub const Cache = struct {
         errdefer fixed.deinit();
         return .{ .allocator = a, .mode = options.mode, .directory = directory, .identity_only_cpu = options.identity_only_cpu, .max_build_threads = @max(1, options.max_build_threads), .store_bulk = options.store_bulk, .code_identity = try codeIdentity(a), .candidate = candidate, .fixed = fixed };
     }
-    pub fn deinit(self: *Cache) void {
+    /// Called only after the previous request has released its source borrows.
+    pub fn clearComponents(self: *Cache) void {
         for (self.resident.values()) |r| if (r.ptr) |ptr| r.destroy(self.allocator, ptr);
         self.resident.deinit(self.allocator);
+        self.resident = .empty;
+    }
+    pub fn deinit(self: *Cache) void {
+        self.clearComponents();
         self.fixed.deinit();
         if (self.directory) |d| self.allocator.free(d);
         self.* = undefined;

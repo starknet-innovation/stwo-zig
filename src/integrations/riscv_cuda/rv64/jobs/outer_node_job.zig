@@ -27,6 +27,15 @@ pub const NodeClass = struct {
     /// (image tail on, outputs from device memory). Type-erased: the
     /// builder lives outside rv64/jobs/ (legacy host types).
     make: *const fn (ctx: *anyopaque, a: std.mem.Allocator, target: Target) anyerror!Made,
+
+    pub fn stageProgram(self: *const NodeClass, s: *api.Stager, require_warm: bool) !api.DeviceBuffer {
+        const program = try s.persistent(self.prog_key, self.program.len);
+        if (program.fresh) {
+            if (require_warm) return error.GpuNativeRecursionSeedProgramCold;
+            try s.upload(program.buffer, self.program);
+        }
+        return program.buffer;
+    }
 };
 pub const Target = struct {
     /// GPU the node runs on (its whole-node graph cache is per device).
@@ -49,7 +58,6 @@ pub const Inputs = struct {
     seeds: api.DeviceBuffer,
     channel_seed: api.DeviceBuffer,
     outputs: api.DeviceBuffer,
-    packed_input: ?@import("outer_packed_class.zig").Staged = null,
 };
 /// Device entry points the node job needs (bound by the service).
 pub const DeviceOps = struct {
@@ -188,14 +196,7 @@ pub const NodeJob = struct {
         try self.made.job.vtable.stage(self.made.job.ctx, s);
         var t = try std.time.Timer.start();
         defer self.host_ns += t.read();
-        const p = try s.persistent(self.class.prog_key, self.class.program.len);
-        self.d_prog = p.buffer;
-        if (self.class.require_warm and p.fresh) return error.GpuNativeRecursionSeedProgramCold;
-        if (p.fresh) {
-            const pinned = try s.pinned(self.class.program.len);
-            @memcpy(pinned, self.class.program);
-            try s.upload(p.buffer, pinned);
-        }
+        self.d_prog = try self.class.stageProgram(s, self.class.require_warm);
         for (self.children[0..self.n_children], 0..) |c, k| if (c.device != self.device) {
             self.local[k] = try s.alloc(c.region.words);
         };

@@ -28,10 +28,15 @@ pub fn validate(g: G.Geometry, prepared: *const Prepared) !Splits {
         error.ProviderMultiplicityMassExceeded => error.ShiftMultiplicityMassExceeded,
         else => err,
     };
+    return splitCounts(g, prepared.alu.facts.len, prepared.binary.facts.len, prepared.shift.len);
+}
+/// Geometry is shared by captured facts and the CUDA census. Callers attest
+/// weighted mass from their own fact source before packing witness inputs.
+pub fn splitCounts(g: G.Geometry, alu: usize, binary: usize, shift: usize) !Splits {
     return .{
-        .alu = try G.factCounts(prepared.alu.facts.len, g.alu_log, g.alu_tail_log),
-        .binary = try G.factCounts(prepared.binary.facts.len, g.binary_log, g.binary_tail_log),
-        .shift = try G.factCounts(prepared.shift.len, g.shift_log, g.shift_tail_log),
+        .alu = try G.factCounts(alu, g.alu_log, g.alu_tail_log),
+        .binary = try G.factCounts(binary, g.binary_log, g.binary_tail_log),
+        .shift = try G.factCounts(shift, g.shift_log, g.shift_tail_log),
     };
 }
 pub fn weights(count: usize, values: []const u32) !void {

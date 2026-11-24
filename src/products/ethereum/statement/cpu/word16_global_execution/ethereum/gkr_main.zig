@@ -123,8 +123,7 @@ pub fn runCombinedResidentArgsWithExecution(recycler: *Recycler, all_args: []con
     const selection = try selectProfile(all_args);
     if (selection.args.len < 2 or !isCombinedProducer(selection.args[1])) return error.CombinedProductRequiresCombinedMode;
     try execution.validate();
-    if (session.active) return error.ResidentRequestAlreadyActive;
-    session.active = true;
+    try session.beginRequest();
     defer session.active = false;
     return runArguments(recycler, all_args, stages, session, true, execution);
 }
@@ -133,8 +132,7 @@ const isCombinedProducer = @import("gkr_request_execution.zig").isCombinedProduc
 /// Same producer authority and CLI contract, with caller-owned persistent caches.
 /// The caller keeps one GPU pool/session alive and serializes complete requests.
 pub fn runWithResidentArgs(recycler: *Recycler, all_args: []const [:0]u8, stages: ResidentStages, session: *ResidentSession) !void {
-    if (session.active) return error.ResidentRequestAlreadyActive;
-    session.active = true;
+    try session.beginRequest();
     defer session.active = false;
     return runArguments(recycler, all_args, stages, session, false, {});
 }

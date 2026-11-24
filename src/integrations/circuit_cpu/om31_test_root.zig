@@ -1,4 +1,5 @@
 test {
+    _ = @import("om31/cache_pack.zig");
     _ = @import("om31/device_prove.zig");
     _ = @import("om31/record_test.zig");
     _ = @import("om31/protocol.zig");

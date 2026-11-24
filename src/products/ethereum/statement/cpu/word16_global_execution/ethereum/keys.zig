@@ -16,6 +16,20 @@ const NativeCache = @import("stwo_riscv_cpu_integration").rv64_execution.word16.
 const Image = @import("../../word16_execution/expected_image.zig");
 const owner_fields = .{ "cpu_owners", "keccak_owners", "secp_owners", "sha256_owners", "arith256_owners", "curve_owners", "secp_row_owners" };
 pub const SetupCache = @import("setup_cache.zig");
+
+const FixedPolicy = enum {
+    committed,
+    device,
+
+    fn forTruth(self: FixedPolicy, decl: W.TruthDeclaration) @FieldType(R.CpuSetup, "key").FixedMode {
+        return switch (self) {
+            .committed => .committed,
+            // Each family and pair of physical logs fixes its immutable table.
+            .device => .{ .producer_evaluations = std.mem.toBytes([4]u64{ 0x54525554485f4649, @intFromEnum(decl.family), decl.logs[0], decl.logs[1] }) },
+        };
+    }
+};
+
 pub const Owner = struct {
     /// Shared immutable prefixes remain owned by the sequential resident session.
     borrowed_prefix: [7]usize = @splat(0),
@@ -52,6 +66,12 @@ pub const Owner = struct {
     pub fn initWithSuiteAndCaches(a: std.mem.Allocator, image: *const Image.Owner, cpu: []const W.CpuDeclaration, truth: []const W.TruthDeclaration, retire: bool, suite: Suite, caches: ImmutableCaches) !Owner {
         return initPolicy(a, image, cpu, truth, retire, suite, caches, null);
     }
+    /// Build immutable truth tables for a device producer that seals both
+    /// physical commitments before deriving its transcript. A shared owner
+    /// must be scoped to this suite and initialized empty for device setup.
+    pub fn initProducerTruths(a: std.mem.Allocator, image: *const Image.Owner, truth: []const W.TruthDeclaration, suite: Suite, shared: ?*Owner) !Owner {
+        return initFixedPolicy(a, image, &.{}, truth, false, suite, .{}, shared, .device);
+    }
     /// The caller independently binds shared to the authenticated program and
     /// suite, serializes requests, and keeps its allocator alive through teardown.
     pub fn initWithSharedCache(a: std.mem.Allocator, image: *const Image.Owner, cpu: []const W.CpuDeclaration, truth: []const W.TruthDeclaration, suite: Suite, caches: ImmutableCaches, shared: *Owner) !Owner {
@@ -61,6 +81,12 @@ pub const Owner = struct {
     /// cache (`setup_cache.zig`). Components are owned by `cache`, which must
     /// outlive this owner, `caches` and every lease derived from them.
     pub fn initResident(a: std.mem.Allocator, image: *const Image.Owner, cpu: []const W.CpuDeclaration, truth: []const W.TruthDeclaration, retire: bool, suite: Suite, caches: ImmutableCaches, cache: *SetupCache.Cache) !Owner {
+        return initResidentFor(.admitted, a, image, cpu, truth, retire, suite, caches, cache);
+    }
+    pub fn initResidentFor(envelope: @import("stwo_riscv_cpu_integration").rv64_gkr_fixed_authority_set.Envelope, a: std.mem.Allocator, image: *const Image.Owner, cpu: []const W.CpuDeclaration, truth: []const W.TruthDeclaration, retire: bool, suite: Suite, caches: ImmutableCaches, cache: *SetupCache.Cache) !Owner {
+        // Check the authority on cache hits as well as misses. FIXED columns for
+        // identical physical geometry have identical contents under either envelope.
+        if (envelope == .compact_wide) for (cpu) |d| try envelope.validateGeometry(d.geometry);
         try suite.validate();
         const cpus = try a.alloc(*const R.CpuSetup, cpu.len);
         const truths = a.alloc(R.Truth, truth.len) catch |err| {
@@ -73,12 +99,13 @@ pub const Owner = struct {
             const Cpu = struct {
                 a: std.mem.Allocator,
                 image: *const Image.Owner,
+                envelope: @import("stwo_riscv_cpu_integration").rv64_gkr_fixed_authority_set.Envelope,
                 d: W.CpuDeclaration,
                 suite: Suite,
                 caches: ImmutableCaches,
                 retire: bool,
                 pub fn build(b: @This()) !R.CpuSetup {
-                    var s = try R.CpuSetup.initWithAuthorityAndSuiteAndCaches(b.a, &b.image.authority, b.d.geometry, b.d.bridges, b.suite, b.caches);
+                    var s = try R.CpuSetup.initWithProjection(b.envelope.projection(), b.a, &b.image.authority, b.d.geometry, b.d.bridges, b.suite, b.caches);
                     errdefer s.deinit();
                     if (b.retire) try s.releaseFixedWitness();
                     // Resident components outlive this request's Image (a
@@ -154,6 +181,7 @@ pub const Owner = struct {
             caches: ImmutableCaches,
             retire: bool,
             cache: *SetupCache.Cache,
+            envelope: @import("stwo_riscv_cpu_integration").rv64_gkr_fixed_authority_set.Envelope,
             fn run(j: *const @This(), index: usize) anyerror!void {
                 const al = j.a;
                 const st = j.suite;
@@ -161,7 +189,7 @@ pub const Owner = struct {
                 const c = j.cache;
                 if (index < j.cpu.len) {
                     const d = j.cpu[index];
-                    j.cpus[index] = try c.obtain(R.CpuSetup, "cpu", .{ .suite = sid, .retire = j.retire, .geometry = d.geometry, .bridges = d.bridges }, true, Builders.Cpu{ .a = al, .image = j.image, .d = d, .suite = st, .caches = j.caches, .retire = j.retire });
+                    j.cpus[index] = try c.obtain(R.CpuSetup, "cpu", .{ .suite = sid, .retire = j.retire, .geometry = d.geometry, .bridges = d.bridges }, true, Builders.Cpu{ .envelope = j.envelope, .a = al, .image = j.image, .d = d, .suite = st, .caches = j.caches, .retire = j.retire });
                     return;
                 }
                 const d = j.truth[index - j.cpu.len];
@@ -200,12 +228,15 @@ pub const Owner = struct {
                 }
             }
         };
-        const jobs = Jobs{ .a = a, .image = image, .cpu = cpu, .truth = truth, .cpus = cpus, .truths = truths, .suite = suite, .suite_id = try suite.identity(), .caches = caches, .retire = retire, .cache = cache };
+        const jobs = Jobs{ .a = a, .image = image, .cpu = cpu, .truth = truth, .cpus = cpus, .truths = truths, .suite = suite, .suite_id = try suite.identity(), .caches = caches, .retire = retire, .cache = cache, .envelope = envelope };
         // Independent pure components; the cache serializes equal keys.
         try SetupCache.Cache.parallel(cpu.len + truth.len, cache.max_build_threads, &jobs, Jobs.run);
         return self;
     }
     fn initPolicy(a: std.mem.Allocator, image: *const Image.Owner, cpu: []const W.CpuDeclaration, truth: []const W.TruthDeclaration, retire: bool, suite: Suite, caches: ImmutableCaches, shared: ?*Owner) !Owner {
+        return initFixedPolicy(a, image, cpu, truth, retire, suite, caches, shared, .committed);
+    }
+    fn initFixedPolicy(a: std.mem.Allocator, image: *const Image.Owner, cpu: []const W.CpuDeclaration, truth: []const W.TruthDeclaration, retire: bool, suite: Suite, caches: ImmutableCaches, shared: ?*Owner, fixed_mode: FixedPolicy) !Owner {
         try suite.validate();
         const cpus = try a.alloc(*const R.CpuSetup, cpu.len);
         const truths = a.alloc(R.Truth, truth.len) catch |err| {
@@ -250,7 +281,7 @@ pub const Owner = struct {
                     try self.keccak_owners.ensureUnusedCapacity(a, 1);
                     const s = try a.create(K.TruthSetup);
                     errdefer a.destroy(s);
-                    s.* = try K.TruthSetup.initPolicy(a, d.logs[0], suite, policy);
+                    s.* = try K.TruthSetup.initWithFixedMode(a, d.logs[0], suite, policy, fixed_mode.forTruth(d));
                     self.keccak_owners.appendAssumeCapacity(s);
                     found = s;
                 }
@@ -267,7 +298,7 @@ pub const Owner = struct {
                     try self.secp_row_owners.ensureUnusedCapacity(a, 1);
                     const s = try a.create(SR.TruthSetup);
                     errdefer a.destroy(s);
-                    s.* = try SR.TruthSetup.initWithSuite(a, kind, d.logs[0], suite);
+                    s.* = try SR.TruthSetup.initWithFixedMode(a, kind, d.logs[0], suite, fixed_mode.forTruth(d));
                     self.secp_row_owners.appendAssumeCapacity(s);
                     found = s;
                 }
@@ -283,7 +314,7 @@ pub const Owner = struct {
                     try self.secp_owners.ensureUnusedCapacity(a, 1);
                     const s = try a.create(S.TruthSetup);
                     errdefer a.destroy(s);
-                    s.* = try S.TruthSetup.initWithSuite(a, kind, d.logs, suite);
+                    s.* = try S.TruthSetup.initWithFixedMode(a, kind, d.logs, suite, fixed_mode.forTruth(d));
                     self.secp_owners.appendAssumeCapacity(s);
                     found = s;
                 }
@@ -300,7 +331,7 @@ pub const Owner = struct {
                     try self.sha256_owners.ensureUnusedCapacity(a, 1);
                     const s = try a.create(H.TruthSetup);
                     errdefer a.destroy(s);
-                    s.* = try H.TruthSetup.initWithSuite(a, d.logs[0], suite);
+                    s.* = try H.TruthSetup.initWithFixedMode(a, d.logs[0], suite, fixed_mode.forTruth(d));
                     self.sha256_owners.appendAssumeCapacity(s);
                     found = s;
                 }
@@ -317,7 +348,7 @@ pub const Owner = struct {
                     try self.arith256_owners.ensureUnusedCapacity(a, 1);
                     const s = try a.create(Ar.TruthSetup);
                     errdefer a.destroy(s);
-                    s.* = try Ar.TruthSetup.initWithSuite(a, d.logs[0], suite);
+                    s.* = try Ar.TruthSetup.initWithFixedMode(a, d.logs[0], suite, fixed_mode.forTruth(d));
                     self.arith256_owners.appendAssumeCapacity(s);
                     found = s;
                 }
@@ -335,7 +366,7 @@ pub const Owner = struct {
                     try self.curve_owners.ensureUnusedCapacity(a, 1);
                     const s = try a.create(Cv.TruthSetup);
                     errdefer a.destroy(s);
-                    s.* = try Cv.TruthSetup.initWithSuite(a, op, d.logs[0], suite);
+                    s.* = try Cv.TruthSetup.initWithFixedMode(a, op, d.logs[0], suite, fixed_mode.forTruth(d));
                     self.curve_owners.appendAssumeCapacity(s);
                     found = s;
                 }

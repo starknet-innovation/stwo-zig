@@ -137,7 +137,7 @@ pub const Stage2 = struct {
         try e.channel.mixRootFromTree(try fields.roots.slice(24, 8));
         // Bind all four trees into the stage-time PCS framing, then the tail.
         const trees = [4]Composition.Committed{ prior[0], prior[1], inter_views, comp };
-        for (trees, 0..) |t, index| for (t.offsets, 0..) |offset, original| try self.pcs.bindColumn(index, original, t.tree.coefficients.ptr + offset);
+        for (trees, 0..) |t, index| try self.pcs.bindTree(index, t.tree.coefficients.ptr[0..t.tree.coefficients.words], t.offsets);
         try self.pcs.enqueueOpening(self.nsym, e, self.pinned, fields.oods, fields.pcs);
         e.free(comp.tree.coefficients);
         e.free(inter.coefficients);

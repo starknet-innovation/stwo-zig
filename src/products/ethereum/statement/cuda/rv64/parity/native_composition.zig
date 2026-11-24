@@ -209,6 +209,10 @@ pub const CompositionParityJob = struct {
         const committed = try seam.enqueue(seam.ctx, e, .{ .alpha = self.staged_alpha.?, .claims = claims, .status = status, .root_out = try e.slab.field(.root, 0), .trees = views });
         const out = committed.tree;
         if (self.events.record(self.end.?, e.stream()) != 0) return error.CudaTimingFailed;
+        const image = out.opening_image orelse return error.CompositionParityOpeningImageMissing;
+        const retained_root = try image.slice(image.words - 8, 8);
+        try check(self.sym.copy_d2d(e.ctx(), (try e.slab.field(.root, 0)).ptr, retained_root.ptr, 32));
+        e.free(image);
         const reference = try e.alloc(self.plan.coefficientWords());
         try self.peer.mirror(e, reference.ptr, self.legacy_output, self.plan.coefficientWords());
         try check(self.compare(e.ctx(), 0, reference.ptr, out.coefficients.ptr, self.plan.coefficientWords(), (try e.slab.field(.opaque_words, 0)).ptr));
@@ -361,6 +365,7 @@ pub const CompositionDecorator = struct {
         }
         var plan = try NComp.Plan.init(a, .{ .roles = specs, .log = log, .split = split, .total = @intCast(total), .beta = beta, .tree_logs = .{ logs[0], logs[1], logs[2] } });
         defer plan.deinit();
+        plan.retain_opening = true;
         if (tree.columns.len != plan.outputColumns()) return error.CompositionParityOutputShape;
         const legacy_output = (tree.columns[0].device orelse return error.CompositionParityLegacyOutputNotDevice).words;
         var alpha_words: [8]u32 = undefined;

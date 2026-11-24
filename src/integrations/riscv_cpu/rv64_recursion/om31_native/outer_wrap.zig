@@ -31,29 +31,9 @@ pub fn hybridProfileActive() bool {
 pub fn requireHybridProofBudget(total_nodes: usize) !void {
     if (total_nodes == 0 or total_nodes > 256) return error.OuterGkrProofBudget;
 }
-/// Outer shape versions (canon-vk M5; binding note §1 `S_out`). The shape is
-/// a function of the outer profile: the M5 canonical profiles
-/// (`Profile.canonical()`) use `uniform_v1`, every other profile `exact`.
-/// `STWO_RV64_OUTER_SHAPE` may only restate that (or force `uniform-v1` on a
-/// non-canonical profile for diagnostics); `exact` under a canonical profile
-/// is refused.
-/// - `exact`: every gate component is padded to the next power of
-///   two of its own row count, as in M4 (bytes unchanged).
-/// - `uniform_v1`: every recursion node (leaf and fold) is padded to the one
-///   shape `S_OUT_V1`. A fold's topology is a function of its children's
-///   shapes (fold v2 `classKey`), so with one shape a fold circuit depends
-///   only on its arity: one fold VK per arity, derivable without any block.
-///   A node whose exact shape exceeds `S_OUT_V1` fails closed
-///   (`ComponentExceedsTarget`). Padding only appends the builder's own
-///   padding gates; the padded sizes enter the preprocessed circuit, hence
-///   the FIXED root and authority identity, so producer and receiver must
-///   select the same shape (a mismatch is an authority mismatch).
-/// - `set_v2` (diagnostic, non-canonical profiles only; binding note §1
-///   fallback generalised): every node is padded to the FIRST shape of
-///   `SHAPE_SET_V2` that dominates its exact shape. A fold's topology is a
-///   function of its children's shapes, so the binary fold classes are the
-///   ordered pairs over 3 shapes (<= 9; 4-ary <= 81): still a constant set per
-///   build. [D] tax +2.1% cells vs +18.7% for uniform-v1 on both dev blocks.
+/// Exact shapes pad each component independently. Uniform profiles use one
+/// fixed target. Diagnostic shape sets select the first fitting target.
+/// The resulting FIXED root binds the selected shape on both sides.
 pub const Shape = enum {
     exact,
     uniform_v1,
@@ -273,7 +253,7 @@ pub const PPCache = struct {
         return bytes;
     }
     fn equal(left: *const PP, right: *const PP) bool {
-        if (left.n_outputs != right.n_outputs or left.first_permutation_row != right.first_permutation_row) return false;
+        if (left.mixed_arithmetic != right.mixed_arithmetic or left.n_outputs != right.n_outputs or left.first_permutation_row != right.first_permutation_row) return false;
         for (left.columns, right.columns) |l, r| if (!std.mem.eql(u8, l.id, r.id) or !std.mem.eql(u8, std.mem.sliceAsBytes(l.values), std.mem.sliceAsBytes(r.values))) return false;
         return true;
     }
@@ -338,6 +318,10 @@ pub const PPCache = struct {
         std.debug.print("GPU_OUTER_PP_PACK adopt class={x} logical_bytes={} physical_bytes={} held_bytes={} classes={} ns={}\n", .{ key[0..8], bytesOf(pp), bytes, held_bytes, entries.items.len, timer.read() });
     }
 };
+fn mixedArithmetic() bool {
+    return @import("stwo_circuit_cpu_integration").om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1;
+}
+
 /// Context must already be finalized by its concrete statement authority. Padding follows its exact graph counts; no external registry or legacy
 /// profile is accepted here.
 pub fn wrapGraph(a: std.mem.Allocator, ctx: *C.Context, digest: [32]u8) !Wrapped {
@@ -358,8 +342,8 @@ pub fn wrapGraphOrLoadWithFactory(a: std.mem.Allocator, ctx: *C.Context, digest:
     if (!ctx.trace_only and !try ctx.isCircuitValid()) return error.CurrentOm31LeafRejects;
     var timer = try std.time.Timer.start();
     const targets = try paddingTargets(ctx);
-    const mixed_enabled = @import("stwo_circuit_cpu_integration").om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1;
-    if (mixed_enabled and (factory != null or shape() != .exact)) return error.MixedArithmeticRequiresExactHost;
+    const mixed_enabled = mixedArithmetic();
+    if (mixed_enabled and shape() != .exact) return error.MixedArithmeticRequiresExactShape;
     var mixed = if (mixed_enabled) try Outer.selectMixed(a, &ctx.circuit, targets) else null;
     defer if (mixed) |*plan| plan.deinit(a);
     try circuit.common.finalize.padToTargets(C.Q, ctx, if (mixed) |*plan| try plan.paddingTargets(targets) else targets);
@@ -512,6 +496,7 @@ pub const HostPrep = struct {
 const ColumnsJob = struct {
     a: std.mem.Allocator,
     ctx: *const C.Context,
+    mixed_pp: ?*PP = null,
     pool: ?*@import("stwo_prover_engine").work_pool.WorkPool,
     device_authority: bool,
     /// Fold class (fold v2 classKey) when this node may share the class PP.
@@ -535,11 +520,17 @@ const ColumnsJob = struct {
         const mode = PPCache.mode();
         const shared: ?PPCache.Lease = if (self.class) |key| (if (mode == .on) try PPCache.acquire(self.a, key) else null) else null;
         const pp = if (shared) |hit| hit.pp else blk: {
+            if (self.mixed_pp) |mixed| break :blk mixed;
             const owned = try self.a.create(PP);
             errdefer self.a.destroy(owned);
             owned.* = try PP.fromBuilderCircuit(self.a, &self.ctx.circuit);
             break :blk owned;
         };
+        if (self.mixed_pp) |candidate| if (candidate != pp) {
+            candidate.deinit(self.a);
+            self.a.destroy(candidate);
+        };
+        self.mixed_pp = null;
         self.pp = pp;
         self.pp_borrowed = if (shared) |hit| hit.borrowed else false;
         if (self.class) |key| if (mode == .check) if (try PPCache.acquire(self.a, key)) |cached| {
@@ -559,20 +550,57 @@ pub fn prepareHost(a: std.mem.Allocator, ctx: *C.Context, factory: Device.Factor
     return prepareHostForOutputs(a, ctx, factory, 8);
 }
 pub fn prepareHostForOutputs(a: std.mem.Allocator, ctx: *C.Context, factory: Device.Factory, n_outputs: usize) !HostPrep {
+    return prepareHostGraph(a, ctx, factory, factory.precommit_fixed != null, n_outputs, null);
+}
+
+/// Prepare immutable circuit parameters and the root-independent authority.
+/// The class installer then binds the FIXED root committed by its live worker.
+pub fn prepareClass(a: std.mem.Allocator, ctx: *C.Context, n_outputs: usize) !HostPrep {
+    return prepareHostGraph(a, ctx, null, true, n_outputs, null);
+}
+
+/// Fires exactly once after padding and mixed-table placement finish. All
+/// subsequent readers, including an optional assignment builder, read the same graph.
+pub const Finalized = struct {
+    state: *anyopaque,
+    notify: *const fn (*anyopaque) void,
+};
+
+pub fn prepareClassAndNotify(a: std.mem.Allocator, ctx: *C.Context, n_outputs: usize, finalized: Finalized) !HostPrep {
+    return prepareHostGraph(a, ctx, null, true, n_outputs, finalized);
+}
+
+fn prepareHostGraph(a: std.mem.Allocator, ctx: *C.Context, factory: ?Device.Factory, device_authority: bool, n_outputs: usize, finalized: ?Finalized) !HostPrep {
     if (n_outputs > Wire.MAX_OUTPUTS or ctx.circuit.output.items.len != n_outputs + 1) return error.CurrentOm31OutputCount;
-    if (!ctx.trace_only or factory.prepare_from_circuit == null) return error.TraceOnlySourceRequired;
+    if (!ctx.trace_only or (if (factory) |f| f.prepare_from_circuit == null else false)) return error.TraceOnlySourceRequired;
     var timer = try std.time.Timer.start();
-    try circuit.common.finalize.padToTargets(C.Q, ctx, try paddingTargets(ctx));
+    const targets = try paddingTargets(ctx);
+    if (mixedArithmetic() and (shape() != .exact or !device_authority))
+        return error.MixedArithmeticRequiresExactDeviceFixed;
+    var mixed = if (mixedArithmetic()) try Outer.selectMixed(a, &ctx.circuit, targets) else null;
+    defer if (mixed) |*plan| plan.deinit(a);
+    try circuit.common.finalize.padToTargets(C.Q, ctx, if (mixed) |*plan| try plan.paddingTargets(targets) else targets);
+    const mixed_pp: ?*PP = if (mixed) |*plan| blk: {
+        const pp = try a.create(PP);
+        errdefer a.destroy(pp);
+        pp.* = try Outer.prepareMixed(a, &ctx.circuit, plan);
+        break :blk pp;
+    } else null;
     var result = HostPrep{ .pp = null, .finalize_ns = timer.lap() };
     errdefer result.deinit(a);
     // Fold v2 classes only (class_hint is threadlocal: read it on this thread).
-    const class: ?[32]u8 = if (factory.precommit_fixed != null) Device.class_hint else null;
-    var columns = ColumnsJob{ .a = a, .ctx = ctx, .pool = @import("stwo_prover_engine").work_pool.currentScopedPool(), .device_authority = factory.precommit_fixed != null, .class = class };
+    const class: ?[32]u8 = if (factory != null and device_authority) Device.class_hint else null;
+    var columns = ColumnsJob{ .a = a, .ctx = ctx, .mixed_pp = mixed_pp, .pool = @import("stwo_prover_engine").work_pool.currentScopedPool(), .device_authority = device_authority, .class = class };
+    if (finalized) |signal| signal.notify(signal.state);
     const side = std.Thread.spawn(.{ .stack_size = 8 << 20 }, ColumnsJob.run, .{&columns}) catch null;
     if (side == null) columns.run();
-    const plan: ?(anyerror!Device.HostPrepared) = if (factory.prepare_host) |prepare| prepare(factory.context, a, ctx) else null;
+    const plan: ?(anyerror!Device.HostPrepared) = if (factory) |f| (if (f.prepare_host) |prepare| prepare(f.context, a, ctx) else null) else null;
     result.host_plan_ns = timer.read();
     if (side) |thread| thread.join();
+    if (columns.mixed_pp) |pp| {
+        pp.deinit(a);
+        a.destroy(pp);
+    }
     result.pp = columns.pp;
     result.pp_borrowed = columns.pp_borrowed;
     result.authority = columns.authority;

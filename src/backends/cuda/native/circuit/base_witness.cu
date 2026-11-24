@@ -87,12 +87,13 @@ __device__ __forceinline__ void xor_count(
     }
 }
 
-template <unsigned Kind>
+template <unsigned Kind, bool Mixed = false>
 __device__ void generate_row(
     const std::uint32_t *values, std::uint32_t value_count,
     std::uint32_t row_count, std::uint32_t first_permutation_row,
     Columns columns, std::uint32_t *error, unsigned row,
     std::uint32_t *const *rel2 = nullptr) {
+    static_assert(!Mixed || Kind == 1);
     (void)row_count;
     std::uint32_t result[kMaxOutput] = {};
     std::uint32_t limbs[4];
@@ -113,6 +114,10 @@ __device__ void generate_row(
                 result[4 + i] = limbs[i];
                 result[8 + i] = limbs[i];
             }
+        }
+        if constexpr (Mixed) {
+            if (!read_value(values, value_count, columns.pp[3][row], limbs, error)) return;
+            for (unsigned i = 0; i < 4; ++i) result[12 + i] = limbs[i];
         }
     } else if constexpr (Kind == 2) {
         std::uint32_t words[4];
@@ -210,19 +215,19 @@ __device__ void generate_row(
             result[51], error);
     }
     constexpr unsigned widths[] = {4, 12, 20, 4, 52};
-    for (unsigned column = 0; column < widths[Kind]; ++column)
+    for (unsigned column = 0; column < (Mixed ? 16u : widths[Kind]); ++column)
         columns.out[column][row] = result[column];
 }
 
 #if !defined(STWO_CIRCUIT_BASE_HOST_EMULATION)
-template <unsigned Kind>
+template <unsigned Kind, bool Mixed = false>
 __global__ void generate(
     const std::uint32_t *values, std::uint32_t value_count,
     std::uint32_t row_count, std::uint32_t first_permutation_row,
     Columns columns, std::uint32_t *error) {
     const unsigned row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < row_count)
-        generate_row<Kind>(values, value_count, row_count,
+        generate_row<Kind, Mixed>(values, value_count, row_count,
             first_permutation_row, columns, error, row);
 }
 
@@ -253,7 +258,7 @@ static bool witness_coalesce() {
     return base_coalesce == 1;
 }
 
-template <unsigned Kind>
+template <unsigned Kind, bool Mixed = false>
 int launch(const std::uint32_t *values, std::uint32_t value_count,
     std::uint32_t row_count, std::uint32_t first_permutation_row,
     Columns columns, std::uint32_t *error, cudaStream_t stream) {
@@ -262,7 +267,7 @@ int launch(const std::uint32_t *values, std::uint32_t value_count,
         generate_shared<<<blocks, kThreads, 0, stream>>>(values, value_count,
             row_count, first_permutation_row, columns, error);
     else
-        generate<Kind><<<blocks, kThreads, 0, stream>>>(values, value_count,
+        generate<Kind, Mixed><<<blocks, kThreads, 0, stream>>>(values, value_count,
             row_count, first_permutation_row, columns, error);
     return static_cast<int>(cudaGetLastError());
 }
@@ -284,7 +289,7 @@ extern "C" int stwo_circuit_base_witness_on(
     if (component >= 5 || values == nullptr || value_count == 0 ||
         row_count < 16 || (row_count & (row_count - 1u)) != 0 ||
         pp_host == nullptr || pp_count != pp_widths[component] ||
-        out_host == nullptr || out_count != out_widths[component] ||
+        out_host == nullptr || (out_count != out_widths[component] && !(component == 1 && out_count == 16)) ||
         counts_host == nullptr || count_count != kCountColumns ||
         error == nullptr || stream == nullptr ||
         (component == 1 && (first_permutation_row > row_count ||
@@ -304,6 +309,8 @@ extern "C" int stwo_circuit_base_witness_on(
         columns.counts[i] = counts_host[i];
     }
     const cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+    if (component == 1 && out_count == 16)
+        return launch<1, true>(values, value_count, row_count, first_permutation_row, columns, error, cuda_stream);
     switch (component) {
         case 0: return launch<0>(values, value_count, row_count, first_permutation_row, columns, error, cuda_stream);
         case 1: return launch<1>(values, value_count, row_count, first_permutation_row, columns, error, cuda_stream);
@@ -326,7 +333,7 @@ extern "C" int stwo_circuit_base_witness_emulate(
     if (component >= 5 || values == nullptr || value_count == 0 ||
         row_count < 16 || (row_count & (row_count - 1u)) != 0 ||
         pp_host == nullptr || pp_count != pp_widths[component] ||
-        out_host == nullptr || out_count != out_widths[component] ||
+        out_host == nullptr || (out_count != out_widths[component] && !(component == 1 && out_count == 16)) ||
         counts_host == nullptr || count_count != kCountColumns || error == nullptr)
         return 1;
     Columns columns{};
@@ -334,6 +341,10 @@ extern "C" int stwo_circuit_base_witness_emulate(
     for (unsigned i = 0; i < out_count; ++i) columns.out[i] = out_host[i];
     for (unsigned i = 0; i < count_count; ++i) columns.counts[i] = counts_host[i];
     for (unsigned row = 0; row < row_count; ++row) {
+        if (component == 1 && out_count == 16) {
+            generate_row<1, true>(values, value_count, row_count, first_permutation_row, columns, error, row);
+            continue;
+        }
         switch (component) {
             case 0: generate_row<0>(values, value_count, row_count, first_permutation_row, columns, error, row); break;
             case 1: generate_row<1>(values, value_count, row_count, first_permutation_row, columns, error, row); break;

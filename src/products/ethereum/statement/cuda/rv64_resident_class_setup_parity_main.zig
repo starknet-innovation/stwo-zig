@@ -458,7 +458,7 @@ pub fn main() !void {
     var gmutex = std.Thread.Mutex{};
     const host = try NCBC.HostArtifacts.init(a);
     defer host.deinit(a);
-    var build_env = NCB.Env{ .a = a, .catalogue = &catalogue, .gcatalogue = &gcatalogue, .gmutex = &gmutex, .psym = try NP.Symbols.load(&libs.addon), .composition = NCBC.of(&host.context), .wide = wide, .config = config, .byte_cap = byte_cap };
+    var build_env = NCB.Env{ .a = a, .catalogue = &catalogue, .gcatalogue = &gcatalogue, .gmutex = &gmutex, .psym = try NP.Symbols.load(&libs.addon), .composition = host.composition(), .wide = wide, .config = config, .byte_cap = byte_cap };
 
     // ---- 1. legacy run with the recorders ----
     var recorder = Recorder{ .a = a, .env = &build_env, .inner = undefined };

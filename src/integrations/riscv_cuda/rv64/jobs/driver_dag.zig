@@ -51,7 +51,10 @@ pub const Segment = struct {
     stage2_cost: u64 = 1,
 };
 
-pub const Truth = struct { cost: u64 = 1 };
+pub const Truth = struct {
+    cost: u64 = 1,
+    first_cost: ?u64 = null,
+};
 
 /// One recursion node, children before parents (ready_dag order).
 pub const RecursionNode = struct {
@@ -234,7 +237,7 @@ pub fn build(a: std.mem.Allocator, shape: Shape) !Dag {
             e += 1;
         }
         const proof: ?G.ProofId = if (shape.truth_two_stage) null else .{ .kind = .truth, .ordinal = @intCast(t) };
-        nodes[at] = .{ .kind = .truth, .ordinal = @intCast(t), .proof = proof, .deps = deps, .cost = shape.truths[t].cost, .rank = if (shape.truth_after_seal) 3 else 1 };
+        nodes[at] = .{ .kind = .truth, .ordinal = @intCast(t), .proof = proof, .deps = deps, .cost = if (T2 != 0) shape.truths[t].first_cost orelse shape.truths[t].cost else shape.truths[t].cost, .rank = if (shape.truth_after_seal) 3 else 1 };
         at += 1;
     }
     std.debug.assert(T == 0 or truth[0] == truth_base);
@@ -277,10 +280,14 @@ pub fn build(a: std.mem.Allocator, shape: Shape) !Dag {
     std.debug.assert(at == n_nodes and e == n_edges and c == n_children);
 
     // ---- placement ----
+    // The seal drains the first phase across all GPUs. Balancing total
+    // device work alone can leave a straggler on each side of that barrier.
+    var before_seal: [G.max_devices]u64 = @splat(0);
+    var after_seal: [G.max_devices]u64 = @splat(0);
     // Segments: LPT on stage1+stage2 cost, constrained by main capacity.
-    const by_cost = try a.alloc(u32, S);
+    const by_cost = try a.alloc(u32, @max(S, T));
     defer a.free(by_cost);
-    for (by_cost, 0..) |*x, i| x.* = @intCast(i);
+    for (by_cost[0..S], 0..) |*x, i| x.* = @intCast(i);
     const Ctx = struct {
         segs: []const Segment,
         fn less(ctx: @This(), l: u32, r: u32) bool {
@@ -289,30 +296,46 @@ pub fn build(a: std.mem.Allocator, shape: Shape) !Dag {
             return if (cl != cr) cl > cr else l < r;
         }
     };
-    std.mem.sort(u32, by_cost, Ctx{ .segs = shape.segments }, Ctx.less);
-    for (by_cost) |s| {
+    std.mem.sort(u32, by_cost[0..S], Ctx{ .segs = shape.segments }, Ctx.less);
+    for (by_cost[0..S]) |s| {
         const seg = shape.segments[s];
         var best: ?u32 = null;
         for (0..shape.devices) |d| {
-            if (shape.main_capacity.len != 0 and mains[d] + seg.main_words > shape.main_capacity[d]) continue;
-            if (best == null or loads[d] < loads[best.?]) best = @intCast(d);
+            if (shape.main_capacity.len != 0 and seg.main_words > shape.main_capacity[d] -| mains[d]) continue;
+            if (best == null or preferLane(before_seal[0..shape.devices], after_seal[0..shape.devices], loads, d, best.?, seg.stage1_cost, seg.stage2_cost)) best = @intCast(d);
         }
         const d = best orelse return error.GpuNativeMainResidentExhausted;
         nodes[stage1[s]].device = d;
         nodes[stage2[s]].device = d;
-        loads[d] += seg.stage1_cost + seg.stage2_cost;
+        before_seal[d] +|= seg.stage1_cost;
+        after_seal[d] +|= seg.stage2_cost;
+        loads[d] +|= seg.stage1_cost +| seg.stage2_cost;
         mains[d] += seg.main_words;
     }
     loads[shape.seal_device] += shape.seal_cost;
-    for (truth, 0..) |id, t| {
-        const d = argmin(loads);
-        nodes[id].device = d;
-        loads[d] += nodes[id].cost;
-        // Stage 2 of a truth stays on its stage-1 GPU.
-        if (T2 != 0) {
-            nodes[truth2[t]].device = d;
-            loads[d] += nodes[truth2[t]].cost;
+    for (by_cost[0..T], 0..) |*ordinal, i| ordinal.* = @intCast(i);
+    if (shape.devices > 1) std.mem.sort(u32, by_cost[0..T], shape, struct {
+        fn less(ctx: Shape, left: u32, right: u32) bool {
+            const l = ctx.truths[left];
+            const r = ctx.truths[right];
+            const lc = l.cost +| (if (ctx.truth_two_stage) l.first_cost orelse l.cost else 0);
+            const rc = r.cost +| (if (ctx.truth_two_stage) r.first_cost orelse r.cost else 0);
+            return if (lc != rc) lc > rc else left < right;
         }
+    }.less);
+    for (by_cost[0..T]) |t| {
+        const id = truth[t];
+        const first = if (shape.truth_after_seal) 0 else nodes[id].cost;
+        const second = if (T2 != 0) nodes[truth2[t]].cost else if (shape.truth_after_seal) nodes[id].cost else 0;
+        var d: u32 = 0;
+        for (1..shape.devices) |other| {
+            if (preferLane(before_seal[0..shape.devices], after_seal[0..shape.devices], loads, other, d, first, second)) d = @intCast(other);
+        }
+        nodes[id].device = d;
+        if (T2 != 0) nodes[truth2[t]].device = d;
+        before_seal[d] +|= first;
+        after_seal[d] +|= second;
+        loads[d] +|= first +| second;
     }
     var votes: [G.max_devices]u32 = undefined;
     for (recursion) |id| {
@@ -335,11 +358,25 @@ pub fn build(a: std.mem.Allocator, shape: Shape) !Dag {
     defer a.free(placed);
     @memset(placed, false);
     for (nodes, 0..) |nd, i| indegree[i] = @intCast(nd.deps.len);
+    const tail = try a.alloc(u64, n_nodes);
+    defer a.free(tail);
+    @memset(tail, 0);
+    if (shape.devices > 1) {
+        for (truth) |id| tail[id] = nodes[id].cost;
+        var pos: usize = n_nodes;
+        while (pos > 0) {
+            pos -= 1;
+            const node = nodes[pos];
+            if (node.kind != .node and node.kind != .truth2) continue;
+            tail[pos] +|= node.cost;
+            for (node.deps) |dep| tail[dep] = @max(tail[dep], tail[pos]);
+        }
+    }
     for (0..n_nodes) |k| {
         var pick: ?u32 = null;
         for (nodes, 0..) |nd, i| {
             if (placed[i] or indegree[i] != 0) continue;
-            if (pick == null or before(nd, nodes[pick.?], @intCast(i), pick.?)) pick = @intCast(i);
+            if (pick == null or before(nd, nodes[pick.?], @intCast(i), pick.?, tail)) pick = @intCast(i);
         }
         const p = pick orelse return error.GpuNativeDagCycle;
         placed[p] = true;
@@ -389,7 +426,11 @@ fn kindRank(k: Kind) u8 {
     };
 }
 
-fn before(x: Node, y: Node, xi: u32, yi: u32) bool {
+fn before(x: Node, y: Node, xi: u32, yi: u32, tail: []const u64) bool {
+    // Native Stage2 releases the shared MAIN region. Once only recursive
+    // jobs and truth completions are ready, favor the longest route to root.
+    if ((x.kind == .node or x.kind == .truth2) and (y.kind == .node or y.kind == .truth2) and tail[xi] != tail[yi]) return tail[xi] > tail[yi];
+    if (x.kind == .truth and y.kind == .truth and tail[xi] != tail[yi]) return tail[xi] > tail[yi];
     if (x.rank != y.rank) return x.rank < y.rank;
     const kx = kindRank(x.kind);
     const ky = kindRank(y.kind);
@@ -397,12 +438,12 @@ fn before(x: Node, y: Node, xi: u32, yi: u32) bool {
     return xi < yi;
 }
 
-fn argmin(loads: []const u64) u32 {
-    var best: u32 = 0;
-    for (loads, 0..) |l, d| if (l < loads[best]) {
-        best = @intCast(d);
-    };
-    return best;
+fn preferLane(before_seal: []const u64, after_seal: []const u64, loads: []const u64, trial: usize, incumbent: usize, first: u64, second: u64) bool {
+    const max_first = std.mem.max(u64, before_seal);
+    const max_second = std.mem.max(u64, after_seal);
+    const trial_cost = @max(max_first, before_seal[trial] +| first) +| @max(max_second, after_seal[trial] +| second);
+    const incumbent_cost = @max(max_first, before_seal[incumbent] +| first) +| @max(max_second, after_seal[incumbent] +| second);
+    return if (trial_cost != incumbent_cost) trial_cost < incumbent_cost else loads[trial] < loads[incumbent];
 }
 
 /// Binary carry topology over `leaves` leaves, each leaf verifying the
@@ -413,6 +454,7 @@ pub const Topology = struct {
     nodes: []RecursionNode,
     children: []u32,
     root: u32,
+    grouped_recursion: bool = false,
     /// Leaf input ordinals the leaves' slices point into (carry only).
     ids: []u32 = &.{},
     pub fn deinit(self: *Topology) void {
@@ -453,20 +495,29 @@ pub const Topology = struct {
     /// i - segments. Node ids equal ready_dag's, so recursion publishes
     /// fold-<id>.proof / leaf-<first_leaf>.proof under the golden names.
     pub fn carry(a: std.mem.Allocator, segments: u32, truths: u32, arity: u32) !Topology {
-        const plan = try CarryPlan.init(segments + truths, arity);
-        const ids = try a.alloc(u32, segments + truths);
+        return carryExecution(a, segments, truths, arity, false);
+    }
+
+    pub fn carryExecution(a: std.mem.Allocator, segments: u32, truths: u32, arity: u32, grouped: bool) !Topology {
+        const total = std.math.add(u32, segments, truths) catch return error.InvalidRecursiveLeafCount;
+        if (grouped and (segments == 0 or truths < 3 or arity != 4 or total > CarryPlan.max_leaves)) return error.InvalidRecursiveServiceGroup;
+        const plan = try CarryPlan.init(total - @as(u32, if (grouped) 2 else 0), arity);
+        const ids = try a.alloc(u32, total);
         errdefer a.free(ids);
         for (ids, 0..) |*x, i| x.* = if (i < segments) @intCast(i) else @intCast(i - segments);
         const Leaf = struct {
             ids: []const u32,
             segments: u32,
+            grouped: bool,
             pub fn of(self: @This(), first: usize) struct { segments: []const u32, truths: []const u32 } {
-                const one = self.ids[first..][0..1];
-                return if (first < self.segments) .{ .segments = one, .truths = &.{} } else .{ .segments = &.{}, .truths = one };
+                const count: usize = if (self.grouped and first == self.ids.len - 3) 3 else 1;
+                const members = self.ids[first..][0..count];
+                return if (first < self.segments) .{ .segments = members, .truths = &.{} } else .{ .segments = &.{}, .truths = members };
             }
         };
-        var t = try Topology.fromPlan(a, &plan, Leaf{ .ids = ids, .segments = segments });
+        var t = try Topology.fromPlan(a, &plan, Leaf{ .ids = ids, .segments = segments, .grouped = grouped });
         t.ids = ids;
+        t.grouped_recursion = grouped;
         return t;
     }
 };
@@ -717,4 +768,58 @@ test "recursion including native leaves runs after every Stage2 in all truth mod
             }
         }
     }
+}
+
+test "dag: multi-GPU truth placement respects size and prioritizes the critical fold" {
+    const a = testing.allocator;
+    const segs = [_]Segment{ .{}, .{} };
+    // Ordinals reverse construction cost. Placing them in ordinal order
+    // packs the 90-unit truth behind smaller work on device 0.
+    const truths = [_]Truth{ .{ .cost = 10 }, .{ .cost = 20 }, .{ .cost = 30 }, .{ .cost = 90 } };
+    const rec = [_]RecursionNode{
+        .{ .segments = &.{0}, .cost = 2 },
+        .{ .segments = &.{1}, .cost = 2 },
+        .{ .truths = &.{3}, .cost = 3 },
+        .{ .children = &.{ 1, 2 }, .cost = 100 },
+        .{ .children = &.{ 0, 3 }, .cost = 5 },
+    };
+    var dag = try build(a, .{ .devices = 2, .segments = &segs, .truths = &truths, .truth_two_stage = true, .recursion = &rec, .root = 4 });
+    defer dag.deinit();
+    const large_device = dag.nodes[dag.truth[3]].device;
+    try testing.expectEqual(@as(u32, 1), large_device);
+    for (dag.truth[0..3]) |id| try testing.expect(dag.nodes[id].device != large_device);
+    for (dag.truth, dag.truth2) |first, second| try testing.expectEqual(dag.nodes[first].device, dag.nodes[second].device);
+    const rank = struct {
+        fn position(order: []const u32, id: u32) usize {
+            return std.mem.indexOfScalar(u32, order, id).?;
+        }
+    }.position;
+    try testing.expect(rank(dag.order, dag.truth[3]) < rank(dag.order, dag.truth[2]));
+    try testing.expect(rank(dag.order, dag.truth2[3]) < rank(dag.order, dag.recursion[0]));
+    try testing.expect(rank(dag.order, dag.recursion[3]) < rank(dag.order, dag.recursion[0]));
+    for (dag.stage2) |id| try testing.expect(rank(dag.order, id) < rank(dag.order, dag.truth2[3]));
+}
+
+test "dag: balancing both phases avoids a different straggler at each seal boundary" {
+    const a = testing.allocator;
+    const segments = [_]Segment{
+        .{ .stage1_cost = 70, .stage2_cost = 70 },
+        .{ .stage1_cost = 40, .stage2_cost = 60 },
+        .{ .stage1_cost = 30, .stage2_cost = 20 },
+        .{ .stage1_cost = 20, .stage2_cost = 60 },
+        .{ .stage1_cost = 10, .stage2_cost = 40 },
+        .{ .stage1_cost = 20, .stage2_cost = 20 },
+    };
+    var dag = try build(a, .{ .devices = 2, .segments = &segments });
+    defer dag.deinit();
+    var first: [2]u64 = @splat(0);
+    var second: [2]u64 = @splat(0);
+    for (dag.stage1, dag.stage2, segments) |stage1, stage2, segment| {
+        const device = dag.nodes[stage1].device;
+        try testing.expectEqual(device, dag.nodes[stage2].device);
+        first[device] += segment.stage1_cost;
+        second[device] += segment.stage2_cost;
+    }
+    // LPT by combined job cost yields max(120, 70) + max(110, 160) = 280.
+    try testing.expectEqual(@as(u64, 250), std.mem.max(u64, &first) + std.mem.max(u64, &second));
 }

@@ -16,12 +16,12 @@ const api = @import("api.zig");
 const G = @import("gpu_native.zig");
 
 /// STWO_RV64_M8_GPU_NATIVE=1 selects the GPU-native
-/// driver; unset keeps the separately gated feeder/reference path. Missing
+/// driver by default; 0 explicitly selects the reference path. Missing
 /// installed classes and factory hooks fail closed on the selected path.
 pub const env_select = "STWO_RV64_M8_GPU_NATIVE";
 
 pub fn selected(env: *const fn ([]const u8) ?[]const u8) !bool {
-    const v = env(env_select) orelse return false;
+    const v = env(env_select) orelse return true;
     if (std.mem.eql(u8, v, "0")) return false;
     if (!std.mem.eql(u8, v, "1")) return error.InvalidM8GpuNativeSelection;
     return true;
@@ -88,7 +88,7 @@ test "probe topology: one leaf per artifact, binary folds, root last" {
     try std.testing.expectEqual(G.ProofKind.root, d.nodes[d.recursion[topo.len - 1]].proof.?.kind);
 }
 
-test "selection: primary default off and strict values" {
+test "selection: GPU-native by default with an explicit reference control" {
     const E = struct {
         var gpu: ?[]const u8 = null;
         fn get(name: []const u8) ?[]const u8 {
@@ -97,7 +97,7 @@ test "selection: primary default off and strict values" {
         }
     };
     E.gpu = null;
-    try testing.expect(!try selected(E.get));
+    try testing.expect(try selected(E.get));
     E.gpu = "0";
     try testing.expect(!try selected(E.get));
     E.gpu = "1";

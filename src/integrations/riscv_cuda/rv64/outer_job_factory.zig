@@ -138,6 +138,8 @@ pub const GnReport = struct {
 
 pub const Prover = @import("outer_node_prover.zig").Prover;
 pub const NodeClasses = @import("outer_node_prover.zig").NodeClasses;
+pub const PrestageInput = @import("outer_job_prestage.zig").Input;
+pub const SetupAssignment = @import("outer_job_prestage.zig").SetupAssignment;
 pub const Recorder = @import("outer_node_checks.zig").Recorder;
 pub const Lane = @import("outer_hybrid_owner.zig").Lane;
 pub const Hybrid = @import("outer_hybrid_owner.zig").Hybrid;

@@ -148,6 +148,14 @@ pub const Driver = struct {
         return self;
     }
 
+    /// Close an idle, published plan before changing the worker's class epoch.
+    pub fn retire(self: *Driver) !void {
+        for (self.in_flight) |slot| if (slot != null) return error.GpuNativePipelineFull;
+        if (self.poisoned) return error.GpuNativeDriverPoisoned;
+        self.poisoned = true;
+        try self.resources.retire();
+    }
+
     /// Teardown. A request still in flight (begun, never finished) is
     /// quiesced and aborted first: no slab, mirror or event is freed while a
     /// GPU still D2Hs into it or peer-copies into its replica.
@@ -227,6 +235,13 @@ pub const Driver = struct {
     }
 };
 
+// Class geometry is available at install for every producer. Use bounded
+// Miword units while classes lack timings instead of pricing every proof at
+// the default weight of one. This affects placement only, never admission.
+fn placementWeight(class: *const G.ClassEntry, words: usize) u64 {
+    return if (class.cost_us > 1) class.cost_us else @max(1, words >> 20);
+}
+
 pub const InFlight = struct {
     driver: *Driver,
     parity: u1,
@@ -291,6 +306,7 @@ pub const InFlight = struct {
         var claims: u32 = 1;
         const segs = try a.alloc(D.Segment, S);
         const ring_words: ?u64 = if (req.capture) |cap| if (cap.ring) |r| r.capacityWords() else null else null;
+        const retain_main_nodes = devices == 1 and drv.lanes[0].retain_main_nodes;
         for (req.segment_rows, 0..) |rows, s| {
             native_keys[s] = if (drv.native.vtable.class_of_block) |cob| try cob(drv.native.ctx, self.req.block, @intCast(s), rows) else try drv.native.vtable.class_of(drv.native.ctx, @intCast(s), rows);
             native_cls[s] = try drv.classes.get(native_keys[s]);
@@ -298,7 +314,11 @@ pub const InFlight = struct {
             // A segment the ring cannot hold would deadlock its own capture
             // (its buffers return only after its Stage1, gated on its seal).
             if (ring_words) |rw| if (native_cls[s].capture_words > rw) return error.GpuNativeCaptureRingTooSmall;
-            segs[s] = .{ .main_words = native_cls[s].main_resident_words, .stage1_cost = native_cls[s].cost_us, .stage2_cost = native_cls[s].cost_us };
+            segs[s] = .{
+                .main_words = try Memory.addWords(native_cls[s].main_resident_words, if (retain_main_nodes) native_cls[s].main_node_words else 0),
+                .stage1_cost = placementWeight(native_cls[s], native_cls[s].main_resident_words),
+                .stage2_cost = placementWeight(native_cls[s], native_cls[s].arena_peak_words),
+            };
         }
         const truths = try a.alloc(D.Truth, req.truths);
         const truth_cls = try a.alloc(*const G.ClassEntry, req.truths);
@@ -306,7 +326,10 @@ pub const InFlight = struct {
         for (truths, 0..) |*t, i| {
             truth_keys[i] = try drv.recursion.vtable.class_of(drv.recursion.ctx, .{ .kind = .truth, .ordinal = @intCast(i) }, &.{});
             truth_cls[i] = try drv.classes.get(truth_keys[i]);
-            t.* = .{ .cost = truth_cls[i].cost_us };
+            t.* = .{
+                .cost = placementWeight(truth_cls[i], truth_cls[i].arena_peak_words),
+                .first_cost = placementWeight(truth_cls[i], truth_cls[i].phase_a_peak_words),
+            };
         }
         const rec = try a.dupe(D.RecursionNode, req.recursion);
         const shape_probe = D.Shape{ .devices = devices, .segments = segs, .recursion = rec, .root = req.root };
@@ -331,7 +354,7 @@ pub const InFlight = struct {
             }
             node_keys[id] = try drv.recursion.vtable.class_of(drv.recursion.ctx, .{ .kind = kind, .ordinal = @intCast(id) }, children);
             node_cls[id] = try drv.classes.get(node_keys[id]);
-            rn.cost = node_cls[id].cost_us;
+            rn.cost = placementWeight(node_cls[id], node_cls[id].arena_peak_words);
         }
         const main_cap = try a.alloc(u64, devices);
         for (drv.lanes, main_cap) |l, *m| m.* = l.main.words;

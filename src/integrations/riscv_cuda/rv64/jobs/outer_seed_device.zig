@@ -139,8 +139,56 @@ pub const Shape = struct {
         cursor.* = r.at;
         return .{ .pow_bits = h[0], .log_blowup = h[1], .log_last = h[2], .n_queries = h[3], .fold_step = h[4], .lifting = if (h[5] == 0xffff_ffff) null else h[5], .degree_log = h[6], .trees = trees };
     }
+    pub const TreeStorage = [Enc.max_trees]Tree;
+
+    /// Wrap the admitted Stage 2 geometry directly. The caller owns storage
+    /// and holds the native class alive for the lifetime of the shape.
+    pub fn fromPcs(source: @import("../pcs_assembly.zig").Shape, storage: *TreeStorage) !Shape {
+        if (source.trees.len == 0 or source.trees.len > storage.len) return error.GnSeedShapeInvalid;
+        const trees = storage[0..source.trees.len];
+        for (trees, source.trees) |*out, tree| {
+            const columns = tree.coefficient_logs.len;
+            if (columns == 0 or columns > Enc.max_columns or
+                tree.sorted_to_original.len != columns or tree.sample_counts.len != columns)
+                return error.GnSeedShapeInvalid;
+            out.* = .{ .logs = tree.coefficient_logs, .sorted_to_original = tree.sorted_to_original, .sample_counts = tree.sample_counts };
+        }
+        const c = source.config;
+        return .{
+            .pow_bits = c.pow_bits,
+            .log_blowup = c.fri_config.log_blowup_factor,
+            .log_last = c.fri_config.log_last_layer_degree_bound,
+            .n_queries = std.math.cast(u32, c.fri_config.n_queries) orelse return error.GnSeedShapeInvalid,
+            .fold_step = c.fri_config.fold_step,
+            .lifting = c.lifting_log_size,
+            .degree_log = source.degree_log,
+            .trees = trees,
+        };
+    }
+
+    pub fn eql(self: Shape, other: Shape) bool {
+        if (!std.meta.eql(self.config(), other.config()) or self.degree_log != other.degree_log or
+            self.trees.len != other.trees.len) return false;
+        for (self.trees, other.trees) |left, right| {
+            if (!std.mem.eql(u32, left.logs, right.logs) or
+                !std.mem.eql(u32, left.sorted_to_original, right.sorted_to_original) or
+                !std.mem.eql(u32, left.sample_counts, right.sample_counts)) return false;
+        }
+        return true;
+    }
+
     pub fn config(self: Shape) Enc.Config {
         return .{ .pow_bits = self.pow_bits, .log_blowup = self.log_blowup, .log_last_layer = self.log_last, .n_queries = self.n_queries, .fold_step = self.fold_step, .lifting = self.lifting };
+    }
+
+    pub fn append(self: Shape, a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u32)) !void {
+        try out.appendSlice(a, &.{ self.pow_bits, self.log_blowup, self.log_last, self.n_queries, self.fold_step, self.lifting orelse 0xffff_ffff, self.degree_log, @intCast(self.trees.len) });
+        for (self.trees) |tree| {
+            try out.append(a, @intCast(tree.logs.len));
+            try out.appendSlice(a, tree.logs);
+            try out.appendSlice(a, tree.sorted_to_original);
+            try out.appendSlice(a, tree.sample_counts);
+        }
     }
 };
 
@@ -244,8 +292,8 @@ pub const P = struct {
     pub const self_key = 21; // offset of 16 words: own identity, own FIXED root
     pub const profile = 22; // offset of 8 words: om31 wire profile (wire bytes 8..40)
     pub const output_map = 23; // 0 = digest word w -> Q(w & 0xffff, w >> 16, 0, 0)
-    /// statement 2 (leaf): child 0's region word offset of the node's
-    /// outputs (QM31, 4 words each), written by the native producer.
+    /// Statement 2 uses the region offset of the native producer's outputs.
+    /// Statement 3 uses the group's first native ordinal.
     pub const outputs_at = 24;
     pub const header_words = 32;
 };
@@ -448,7 +496,7 @@ const Builder = struct {
 
 pub const Statement = struct {
     /// 1 = fold (outputs = Blake2s(messageWords)), 2 = outputs read from
-    /// child 0's region at `outputs_at` (leaf: the native producer's words).
+    /// child 0's region at `outputs_at`, 3 = grouped truth frame digest.
     kind: u32 = 1,
     outputs_at: u32 = 0,
     domain: u32,
@@ -488,10 +536,40 @@ pub fn buildLeaf(a: std.mem.Allocator, child: ChildClass, cap_log: u32, tail: u3
     var b = Builder{ .a = a };
     defer b.ops.deinit(a);
     defer b.caps.deinit(a);
-    try b.proof(0, child.shape, cap_log);
-    const L = try Layout.of(child.shape);
-    try b.op(.q, 0, .region, child.wire_words + L.words, tail, 4, 1, 0);
+    try appendLeaf(&b, 0, child, cap_log, tail);
     return finish(a, &b, &.{child}, cap_log, vars, constants, statement);
+}
+
+fn appendLeaf(b: *Builder, k: u32, child: ChildClass, cap_log: u32, tail: u32) !void {
+    try b.proof(k, child.shape, cap_log);
+    const L = try Layout.of(child.shape);
+    try b.op(.q, k, .region, child.wire_words + L.words, tail, 4, 1, 0);
+}
+
+pub const service_group_members = 3;
+pub const service_group_domain = 0x47565253;
+pub const service_group_version = 1;
+pub const service_group_public_words = 19;
+pub const service_group_claim_words = 8;
+pub const service_group_tail_seeds = 2 * service_group_public_words + service_group_claim_words / 4;
+
+/// The group reads each native proof and its unchanged statement suffix in
+/// circuit order. Singleton outer proofs and their parent are unnecessary.
+pub fn buildServiceGroup(a: std.mem.Allocator, children: [service_group_members]ChildClass, first: u32, cap_log: u32, vars: []const u32, constants: []const [4]u32, statement: Statement) !Program {
+    if (first > std.math.maxInt(u32) - service_group_members or statement.n_outputs != 8) return error.GnSeedProgramInvalid;
+    var b = Builder{ .a = a };
+    defer b.ops.deinit(a);
+    defer b.caps.deinit(a);
+    for (children, 0..) |child, k| {
+        if (child.n_outputs != 0) return error.GnSeedProgramInvalid;
+        try appendLeaf(&b, @intCast(k), child, cap_log, service_group_tail_seeds);
+    }
+    var group = statement;
+    group.kind = 3;
+    group.outputs_at = first;
+    group.domain = service_group_domain;
+    group.version_word = service_group_version;
+    return finish(a, &b, &children, cap_log, vars, constants, group);
 }
 pub fn leafTapeLength(a: std.mem.Allocator, child: ChildClass, cap_log: u32) !u32 {
     var b = Builder{ .a = a };

@@ -123,6 +123,27 @@ test "opening tail: OODS draw on the device channel, base point and PCS seed com
     defer pcs.deinit(a);
     try std.testing.expectEqual(@as(u64, output_words), pcs.outputWords());
     try std.testing.expect(pcs.base_shift.x.eql(step.x) and pcs.base_shift.y.eql(step.y));
+    // Same mixed-height framing as the scalar binder, in a buffer whose
+    // producer offsets deliberately differ from PCS sort order.
+    const coefficients = [_]u32{0} ** 40;
+    const offsets: []const u64 = &.{ 16, 0, 24 };
+    for (offsets, 0..) |off, original| try pcs.bindColumn(0, original, coefficients[off..].ptr);
+    const expected = [3][*]const u32{
+        pcs.prepared.coefficients[0].words.?,
+        pcs.prepared.coefficients[1].words.?,
+        pcs.prepared.coefficients[2].words.?,
+    };
+    for (pcs.prepared.coefficients) |*column| {
+        column.kind = 0;
+        column.words = null;
+    }
+    try pcs.bindTree(0, &coefficients, offsets);
+    for (pcs.prepared.coefficients, expected) |column, ptr| {
+        try std.testing.expectEqual(@as(u32, 1), column.kind);
+        try std.testing.expectEqual(ptr, column.words.?);
+    }
+    try std.testing.expectError(error.InvalidPcsColumn, pcs.bindTree(0, coefficients[0..39], offsets));
+    try std.testing.expectError(error.InvalidPcsColumn, pcs.bindTree(0, &coefficients, offsets[0..2]));
 
     const w = try W.Worker.create(a, &fake.ops, .{ .device = 0, .arena_words = 1 << 16, .pinned_slot_words = 1 << 12, .max_outstanding = 2 });
     var probe = OpeningProbe{ .pcs = &pcs };
@@ -138,4 +159,37 @@ test "opening tail: OODS draw on the device channel, base point and PCS seed com
     try std.testing.expectEqual(probe.slab_ptr.?, @as([*]const u32, Seen.oods_out.?));
     try std.testing.expectEqual([2]u32{ step.x.v, step.y.v }, Seen.oods_shift);
     try std.testing.expectEqual(@as(usize, 1), fake.counters.host_waits);
+}
+
+test "PCS passes complete and nodes-only spans with independent modes and rejects older addons" {
+    const Enqueue = struct {
+        pub fn ctx(self: *@This()) *anyopaque {
+            return self;
+        }
+        pub fn alloc(_: *@This(), _: usize) !api.DeviceBuffer {
+            return error.UnexpectedAllocation;
+        }
+        pub fn free(_: *@This(), _: api.DeviceBuffer) void {
+            unreachable;
+        }
+        fn inspect(_: *anyopaque, lane: u32, _: *const @import("../pcs_native_abi.zig").Request, _: *const N.Memory, io: *const N.Io, images: *const [4]N.SourceImage, mask: u32) callconv(.c) c_int {
+            if (lane != 0 or mask != 0b1100 or images[0].words != null) return 1;
+            for (images[1..], 0..) |image, i| {
+                if (image.count != i + 1 or image.words != io.seed + i) return 2;
+            }
+            io.output[0] = mask;
+            return 0;
+        }
+    };
+    var job = N.PcsJob{ .prepared = undefined, .descriptor = .{ .sections = undefined, .coefficients = &.{}, .coefficient_count = 0 }, .base_shift = undefined, .plan = .{ .output_words = 1 }, .source_images = .{} };
+    job.prepared.geometry_only = false;
+    var words = [_]u32{0} ** 8;
+    for (1..4) |i| job.source_images.?.retain(@intCast(i), words[i - 1 ..].ptr, i, i >= 2);
+    var enqueue = Enqueue{};
+    const io = N.Io{ .seed = &words, .point = &words, .output = &words, .output_words = 1 };
+    try std.testing.expectError(error.MissingPcsJobSymbol, job.enqueue(symbols, &enqueue, &.{}, io));
+    var capable = symbols;
+    capable.open_node_images = Enqueue.inspect;
+    try job.enqueue(capable, &enqueue, &.{}, io);
+    try std.testing.expectEqual(@as(u32, 0b1100), words[0]);
 }

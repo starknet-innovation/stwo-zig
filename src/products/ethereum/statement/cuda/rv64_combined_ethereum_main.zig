@@ -36,9 +36,16 @@ pub fn main() !void {
     }
     if (arguments.len >= 2 and std.mem.eql(u8, arguments[1], "combined-serve")) {
         if (arguments.len != 4) return error.ExpectedCombinedServeManifestAndSpool;
-        // Explicit GPU-native selection remains default-off. Installed class,
+        // GPU-native is the default for the combined service. Installed class,
         // factory and library checks fail closed on the selected path.
-        if (try @import("stwo_riscv_cuda_integration").rv64.execution.jobs.driver.selected(posixEnv)) return @import("rv64/jobs/driver_ge.zig").serve(a, library, arguments[2], arguments[3], @import("rv64/class_setup_composition.zig"));
+        if (try @import("stwo_riscv_cuda_integration").rv64.execution.jobs.driver.selected(posixEnv)) {
+            // Circuit setup repeatedly allocates large temporary columns across proof classes.
+            // Bound retained free pages independently of live request and device memory.
+            const Recycler = @import("stwo_riscv_cpu_integration").rv64_large_block_recycler.LargeBlockRecycler;
+            var host_pages = Recycler.init(std.heap.smp_allocator, 2 << 30);
+            defer host_pages.deinit();
+            return @import("rv64/jobs/driver_ge.zig").serve(host_pages.allocator(), library, arguments[2], arguments[3], @import("rv64/class_setup_composition.zig"));
+        }
         return @import("rv64/resident_batch.zig").runServe(a, library, arguments[2], arguments[3]);
     }
     const planned_text = (try env(a, "STWO_RV64_GPU_PLANNED_CPU_WORKERS")) orelse return error.CombinedRequiresResidentPlan;

@@ -219,8 +219,34 @@ fn testKey(seed: u8) VerifierKey {
     vk.max_evaluation_log_size = 20;
     vk.fixed_root = @splat(seed);
     vk.identity = @splat(seed +% 1);
+    vk.mixed_plan_hash = null;
     return vk;
 }
 fn testTable(a: std.mem.Allocator) !Table {
     return Table.init(a, .{ .profile = Profile.m4_fold_v2_compat.id(), .native_profile = "n", .outer_domain = Om31.protocol.domainName(), .fold_version = Bridge.version, .source_commit = "c", .receiver_sha256 = "r", .image = "i" });
+}
+
+test "root_verify: mixed arithmetic remains bound to the table pin and fold class" {
+    const a = std.testing.allocator;
+    var ordinary = try testTable(a);
+    defer ordinary.deinit();
+    const base = testKey(1);
+    _ = try ordinary.put(.leaf, @splat(1), base, "");
+    var mixed = try testTable(a);
+    defer mixed.deinit();
+    var key = base;
+    key.mixed_plan_hash = 0x0123_4567_89ab_cdef;
+    _ = try mixed.put(.leaf, @splat(1), key, "");
+    try std.testing.expect(!std.mem.eql(u8, &ordinary.root(), &mixed.root()));
+    try std.testing.expect(!std.mem.eql(u8, &foldClassKey(&base, &base), &foldClassKey(&key, &base)));
+    const encoded = try mixed.toJson(a);
+    defer a.free(encoded);
+    var decoded = try Table.fromJson(a, encoded);
+    defer decoded.deinit();
+    try std.testing.expectEqual(mixed.root(), decoded.root());
+    try std.testing.expectEqual(key.mixed_plan_hash, decoded.find(.leaf, @splat(1)).?.mixed_plan_hash);
+    decoded.entries.items[0].vk.mixed_plan_hash = null;
+    const pin = try hexAlloc(a, &mixed.root());
+    defer a.free(pin);
+    try std.testing.expectError(error.VkTableRootPinMismatch, requirePinnedRoot(&decoded, pin));
 }

@@ -124,6 +124,9 @@ pub fn validate(request: Request) !void {
             !std.mem.eql(u32, &Code.Source.Frame.originWords(item.artifact.descriptor.origin), &component.origin) or
             item.fixed.len != shape.fixed or item.main.len != shape.main or component.row_log < 5 or component.row_log > 23) return error.NativeGkrSourceRoster;
         const rows = @as(usize, 1) << @intCast(component.row_log);
+        const d = item.artifact.descriptor;
+        if (d.origin == .core and d.origin.core == .cpu and d.cpu_wide_clock != (component.row_log == 23))
+            return error.NativeGkrSourceRoster;
         for (item.fixed) |column| if (column.log_size != component.row_log or (column.device == null and column.coefficients.len != rows)) return error.NativeGkrSourceColumn;
         for (item.main) |column| if (column.log_size != component.row_log or (column.device == null and column.coefficients.len != rows)) return error.NativeGkrSourceColumn;
         for (item.parameters) |value| for (value.toM31Array()) |word| if (word.v >= core.fields.m31.Modulus) return error.NoncanonicalNativeGkrParameter;
@@ -374,4 +377,36 @@ test "native GKR exact allocation census matches the qualified six-lease fixture
     var bounded = request;
     bounded.byte_cap = total - 1;
     try std.testing.expectError(error.NativeGkrWorkspaceBudget, cost(bounded));
+}
+
+test "wide shard GKR allocation counts include the wider domain and reject a narrow source" {
+    const a = std.testing.allocator;
+    for ([_]u32{ 22, 23 }) |log| {
+        const wide = log == 23;
+        var source = try Code.record(a, .{ .origin = .{ .core = .cpu }, .cpu_u8_pairs = !wide, .cpu_compact_decode = true, .cpu_wide_clock = wide }, .fractions);
+        defer source.deinit();
+        const Spec = std.meta.Child(@FieldType(Roster, "components"));
+        var roster = try V.derive(a, &[_]Spec{.{ .origin = Code.Source.Frame.originWords(source.descriptor.origin), .row_log = log, .terms = source.terms }});
+        defer roster.deinit();
+        // The census reads column extents only. No backing GPU storage is accessed.
+        const rows = @as(u64, 1) << @intCast(log);
+        const col = D.Column{ .log_size = log, .device = .{ .words = @ptrFromInt(4096), .count = rows, .context_token = 1, .generation = 1 } };
+        const shape = try Code.Authority.shape(source.descriptor);
+        const fixed = try a.alloc(D.Column, shape.fixed);
+        defer a.free(fixed);
+        const main = try a.alloc(D.Column, shape.main);
+        defer a.free(main);
+        @memset(fixed, col);
+        @memset(main, col);
+        const parameters: [P.count]O = @splat(O.zero());
+        var request = Request{ .scope = .{ .statement = @splat(1), .fixed = @splat(2), .main = @splat(3), .shared = @splat(4), .ordinal = 0 }, .roster = &roster, .byte_cap = std.math.maxInt(usize), .items = &.{.{ .artifact = &source, .callbacks = undefined, .fixed = fixed, .main = main, .parameters = &parameters }} };
+        const census = try cost(request);
+        try std.testing.expectEqual((shape.fixed + shape.main) * rows * 4, census.decoded_source_bytes);
+        std.debug.print("CPU_SOURCE row_log={} terms={} transient_bytes={} gkr_workspace_bytes={} decoded_source_bytes={}\n", .{ log, source.terms[0], census.transient_bytes, census.workspace_bytes, census.decoded_source_bytes });
+        request.byte_cap = census.transient_bytes - 1;
+        try std.testing.expectError(error.NativeGkrWorkspaceBudget, cost(request));
+        source.descriptor.cpu_wide_clock = !wide;
+        source.descriptor.cpu_u8_pairs = wide;
+        try std.testing.expectError(error.NativeGkrSourceRoster, validate(request));
+    }
 }

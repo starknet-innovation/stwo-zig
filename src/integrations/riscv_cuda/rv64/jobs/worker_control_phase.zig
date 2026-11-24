@@ -152,6 +152,43 @@ pub fn persistentWords(self: *Worker) u64 {
     return words;
 }
 
+/// Before request arenas are sealed, admit temporary setup scratch and its
+/// persistent fills together. The caller serializes setup on this worker.
+pub fn admitSetupArena(self: *Worker, footprint: api.Footprint, fills: u64, capacity_words: u64) !void {
+    const Census = struct {
+        required: u64,
+        cap: u64,
+        fn run(raw: *anyopaque, worker: *Worker) anyerror!void {
+            const census: *@This() = @ptrCast(@alignCast(raw));
+            if (census.required > census.cap) return error.GpuNativeFixedSealExceedsCapacity;
+            const remaining = census.cap - census.required;
+            if (worker.persistentWords() > remaining) _ = try discardUnclaimed(worker);
+            if (worker.persistentWords() > remaining) return error.GpuNativeFixedSealExceedsCapacity;
+        }
+    };
+    const needed = try @import("resources.zig").aligned(try footprint.peakWords());
+    const arena = self.arenaWords();
+    var census: Census = .{ .required = try std.math.add(u64, fills, @max(needed, arena)), .cap = capacity_words };
+    try self.call(.{ .ctx = &census, .run = Census.run });
+    if (needed > arena) {
+        if (!self.isParked()) _ = try self.park(.{});
+        try unparkForSetup(self, needed);
+    }
+}
+
+/// Retry admission before submitting the FIXED job. A failed submission or
+/// root check cannot release capacity or reuse a partially filled class.
+pub fn admitInstallArena(self: *Worker, footprint: api.Footprint, fills: u64, capacity: api.SetupCapacity) !void {
+    self.admitSetupArena(footprint, fills, try capacity.available()) catch |err| switch (err) {
+        error.GpuNativeFixedSealExceedsCapacity, error.CudaDeviceOutOfMemory => {
+            const region = capacity.reclaimable orelse return err;
+            if (!try region.reclaim(capacity.words, "fixed_setup")) return err;
+            return self.admitSetupArena(footprint, fills, try capacity.available());
+        },
+        else => return err,
+    };
+}
+
 pub fn releasePersistent(self: *Worker) !usize {
     var words: usize = 0;
     var first: ?anyerror = null;
@@ -163,6 +200,7 @@ pub fn releasePersistent(self: *Worker) !usize {
         };
     }
     self.persistent_map.clearRetainingCapacity();
+    self.carried_persistent.clearRetainingCapacity();
     for (self.retired.items) |b| O.check(self.ops.exec.free_u32(self.context, b.ptr)) catch |err| {
         first = first orelse err;
     };
@@ -180,13 +218,115 @@ pub fn releasePersistent(self: *Worker) !usize {
     return words;
 }
 
+const Carry = struct {
+    keys: []const [32]u8 = &.{},
+    words: u64 = 0,
+    canonical_tables: bool = false,
+};
+
+/// Start a new class scope on the parked worker. Only caller-authorized
+/// immutable keys survive. Existing bytes count toward the next admission.
+pub fn replaceClassEpoch(self: *Worker, setup_words: usize, carry: Carry) !void {
+    const Retire = struct {
+        carry: Carry,
+        fn run(raw: *anyopaque, worker: *Worker) !void {
+            if (!worker.isParked()) return error.WorkerNotParked;
+            const spec: *@This() = @ptrCast(@alignCast(raw));
+            const transferable = worker.regions_buffer == null;
+            const keys = if (transferable) spec.carry.keys else &.{};
+            const tables = if (transferable and spec.carry.canonical_tables) &@import("circle_twiddles.zig").carry_keys else &.{};
+            const capacity = keys.len + tables.len;
+            const Entry = struct { key: [32]u8, buffer: api.DeviceBuffer };
+            const saved = try worker.a.alloc(Entry, capacity);
+            defer worker.a.free(saved);
+            try worker.carried_persistent.ensureTotalCapacity(worker.a, capacity);
+            var remaining = spec.carry.words;
+            var count: usize = 0;
+            for ([_][]const [32]u8{ keys, tables }) |group| for (group) |key| {
+                const b = worker.persistent_map.get(key) orelse continue;
+                if (b.words > remaining) continue;
+                remaining -= b.words;
+                _ = worker.persistent_map.remove(key);
+                saved[count] = .{ .key = key, .buffer = b };
+                count += 1;
+            };
+            defer for (saved[0..count]) |e| {
+                worker.persistent_map.putAssumeCapacity(e.key, e.buffer);
+                worker.carried_persistent.appendAssumeCapacity(e.key);
+            };
+            _ = try releasePersistent(worker);
+        }
+    };
+    var retire: Retire = .{ .carry = carry };
+    try self.call(.{ .ctx = &retire, .run = Retire.run });
+    try unparkForSetup(self, setup_words);
+}
+
+pub fn unparkForSetup(self: *Worker, words: usize) !void {
+    _ = self.unpark(words) catch |err| retry: {
+        if (err != error.CudaDeviceOutOfMemory or try self.releaseUnclaimed() == 0) return err;
+        break :retry try self.unpark(words);
+    };
+}
+
+pub fn unmarkCarried(self: *Worker, key: [32]u8) bool {
+    for (self.carried_persistent.items, 0..) |k, i| {
+        if (!std.mem.eql(u8, &k, &key)) continue;
+        _ = self.carried_persistent.swapRemove(i);
+        return true;
+    }
+    return false;
+}
+
+pub fn claimCarried(self: *Worker, key: [32]u8, words: usize) !bool {
+    const Query = struct {
+        key: [32]u8,
+        words: usize,
+        found: bool = false,
+        fn run(raw: *anyopaque, worker: *Worker) !void {
+            const q: *@This() = @ptrCast(@alignCast(raw));
+            const b = worker.persistent_map.get(q.key) orelse return;
+            if (b.words != q.words) return error.PersistentGeometryMismatch;
+            q.found = unmarkCarried(worker, q.key);
+        }
+    };
+    var query = Query{ .key = key, .words = words };
+    try self.call(.{ .ctx = &query, .run = Query.run });
+    return query.found;
+}
+
+fn discardUnclaimed(self: *Worker) !usize {
+    var words: usize = 0;
+    while (self.carried_persistent.items.len != 0) {
+        const key = self.carried_persistent.items[self.carried_persistent.items.len - 1];
+        const b = self.persistent_map.get(key) orelse return error.PersistentClassNotWarmed;
+        try O.check(self.ops.exec.free_u32(self.context, b.ptr));
+        _ = self.persistent_map.remove(key);
+        _ = self.carried_persistent.pop();
+        words += b.words;
+    }
+    return words;
+}
+
+pub fn releaseUnclaimed(self: *Worker) !usize {
+    const Release = struct {
+        fn run(raw: *anyopaque, worker: *Worker) !void {
+            const words: *usize = @ptrCast(@alignCast(raw));
+            words.* = try discardUnclaimed(worker);
+        }
+    };
+    var words: usize = 0;
+    try self.call(.{ .ctx = &words, .run = Release.run });
+    return words;
+}
+
 pub fn acquireArena(self: *Worker, words_in: usize) !Records.ParkReceipt {
     // Never overwrite (leak) a live static arena.
     if (self.arena_buffer != null) return error.WorkerNotParked;
     const words = if (words_in == 0) self.last_words else words_in;
     if (words == 0 or words % Records.Arena.granule != 0) return error.InvalidArena;
     var arena: ?[*]u32 = null;
-    try O.check(self.ops.exec.alloc_u32(self.context, words, &arena));
+    try O.checkDeviceAllocation(self.ops.exec.alloc_u32(self.context, words, &arena));
     self.arena_buffer = arena orelse return error.CudaArenaFailed;
     errdefer {
         _ = self.ops.exec.free_u32(self.context, self.arena_buffer.?);
@@ -194,7 +334,7 @@ pub fn acquireArena(self: *Worker, words_in: usize) !Records.ParkReceipt {
     }
     if (self.config.persistent_budget_words != 0 and self.regions_buffer == null) {
         var pool: ?[*]u32 = null;
-        try O.check(self.ops.exec.alloc_u32_long(self.context, self.config.persistent_budget_words, &pool));
+        try O.checkDeviceAllocation(self.ops.exec.alloc_u32_long(self.context, self.config.persistent_budget_words, &pool));
         self.regions_buffer = pool orelse return error.CudaAllocationFailed;
         self.regions.words = self.config.persistent_budget_words;
     }
@@ -315,6 +455,7 @@ pub fn shutdown(self: *Worker) void {
     var it = self.persistent_map.valueIterator();
     while (it.next()) |b| _ = self.ops.exec.free_u32(self.context, b.ptr);
     self.persistent_map.deinit(self.a);
+    self.carried_persistent.deinit(self.a);
     for (self.retired.items) |b| _ = self.ops.exec.free_u32(self.context, b.ptr);
     self.retired.deinit(self.a);
     if (self.regions_buffer) |p| _ = self.ops.exec.free_u32(self.context, p);

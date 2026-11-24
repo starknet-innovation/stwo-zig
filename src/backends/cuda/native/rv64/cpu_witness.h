@@ -12,6 +12,7 @@ struct StwoRv64CpuWitness {
   const uint32_t *rom;
   uint32_t *main;
   uint32_t *counts16;
+  // Null when gap highs are covered by pairs or the wide-clock U16 ledger.
   uint32_t *counts8;
   uint32_t *rom_counts;
   uint32_t *status;

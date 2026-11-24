@@ -29,6 +29,8 @@ fn fixture(dir: std.fs.Dir, id: usize, calls: usize, log: u32) !void {
                 input.c = std.math.maxInt(u256);
                 input.m = 2;
             },
+            5 => input.m = 0xfffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f,
+            6 => input.m = 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141,
             else => {},
         }
     }

@@ -85,6 +85,20 @@ pub fn prepareRequestWithCache(a: std.mem.Allocator, request: D.Request, initial
 pub fn prepareRequestWithFraming(a: std.mem.Allocator, request: D.Request, initial: D.Channel, cache: ?*GeometryCache, wide_framing: bool) !Prepared {
     return prepareMode(a, request, initial, cache, wide_framing, false);
 }
+/// Resident jobs keep canonical tables in their worker. Only their declared
+/// lengths cross the PCS job interface, along with the normal coefficients.
+pub fn prepareDeviceJob(a: std.mem.Allocator, request: D.Request, wide_framing: bool) !Prepared {
+    var prepared = try prepareMode(a, request, D.Channel.init(), null, wide_framing, true);
+    errdefer prepared.deinit(a);
+    var index: usize = 0;
+    for (request.trees, prepared.metadata.shape.trees) |tree, meta| for (meta.sorted_to_original) |original| {
+        const column = tree.columns[original];
+        if (columnCount(column) != @as(u64, 1) << @intCast(column.log_size)) return error.InvalidDevicePcsColumn;
+        prepared.coefficients[index] = nativeColumn(column);
+        index += 1;
+    };
+    return prepared;
+}
 /// Source-owned class geometry needs logs and opening-offset recipes only;
 /// coefficients may be empty and transcript/root values have no cost authority.
 /// This path takes no geometry-cache lock and generates no FFT/FRI coordinates.
@@ -335,7 +349,7 @@ pub const Prepared = struct {
         if (self.geometry_only) @panic("geometry-only PCS descriptor cannot be proved");
         return self.geometryDescriptor();
     }
-    fn geometryDescriptor(self: *const Prepared) Native.Request {
+    pub fn geometryDescriptor(self: *const Prepared) Native.Request {
         var result = Native.Request{ .sections = undefined, .coefficients = self.coefficients.ptr, .coefficient_count = self.coefficients.len, .scope = self.scope };
         for (self.section_storage, &result.sections) |section, *span| span.* = .{ .words = section.ptr, .count = section.len };
         if (self.geometry_only) {
@@ -411,6 +425,19 @@ test "geometry-only PCS cost matches real framing without coefficients or FFT pa
         const bare = geometry.geometryDescriptor();
         try std.testing.expect(bare.sections[12].words == null and bare.sections[14].words == null);
         for (geometry.coefficients) |column| try std.testing.expect(column.words == null);
+        var resident = try prepareDeviceJob(a, request, true);
+        defer resident.deinit(a);
+        const resident_descriptor = resident.geometryDescriptor();
+        for (full.sections, resident_descriptor.sections, 0..) |reference, section, i| {
+            try std.testing.expectEqual(reference.count, section.count);
+            if (i == 12 or i == 14) {
+                try std.testing.expectEqual(null, section.words);
+            } else if (section.count != 0) {
+                const n: usize = @intCast(section.count);
+                try std.testing.expectEqualSlices(u32, reference.words.?[0..n], section.words.?[0..n]);
+            }
+        }
+        try std.testing.expectEqualDeep(actual.coefficients, resident.coefficients);
         try std.testing.expectEqualSlices(u32, actual.section_storage[0], geometry.section_storage[0]);
         try std.testing.expectEqualSlices(u32, actual.section_storage[13], geometry.section_storage[13]);
         const Cost = @import("pcs_allocation_cost.zig");
@@ -423,5 +450,55 @@ test "geometry-only PCS cost matches real framing without coefficients or FFT pa
         try std.testing.expectEqual(x.result_words, y.result_words);
         try std.testing.expectEqualDeep(x.allocations.items, y.allocations.items);
         try std.testing.expectError(error.InvalidPcsCostSpan, Cost.init(a, &bare, options));
+    }
+}
+
+test "canonical inverse tower supplies the packed circle fold and every line fold" {
+    const a = std.testing.allocator;
+    const Twiddles = engine.poly.twiddles;
+    for ([_]u32{ 3, 5, 8, 11 }) |log| {
+        const half = core.poly.circle.canonic.CanonicCoset.new(log).circleDomain().half_coset;
+        var tower = try Twiddles.precomputeM31(a, half);
+        defer Twiddles.deinitM31(a, &tower);
+        for ([_]u32{ 1, 2 }) |beta| for ([_]u32{ 1, 2, 4 }) |fold_step| {
+            if (log - beta < fold_step) continue;
+            const plan = try F.Plan.init(log - beta, .{ .log_blowup_factor = beta, .log_last_layer_degree_bound = 0, .n_queries = 1, .fold_step = fold_step });
+            var descriptions: std.ArrayList(u32) = .empty;
+            defer descriptions.deinit(a);
+            var reference: std.ArrayList(M) = .empty;
+            defer reference.deinit(a);
+            try C.friMetadataWithAllocator(a, plan, &descriptions, &reference);
+            for (plan.layers[0..plan.len], 0..) |layer, li| {
+                var count: usize = layer.count;
+                for (0..layer.fold_step) |step| {
+                    const circle = li == 0 and step == 0;
+                    const len = if (circle) count / 4 else count / 2;
+                    const at = if (circle) 0 else tower.itwiddles.len - count;
+                    const reference_at = descriptions.items[8 * li + 4 + step];
+                    try std.testing.expectEqualSlices(M, reference.items[reference_at..][0..len], tower.itwiddles[at..][0..len]);
+                    count /= 2;
+                }
+            }
+        };
+    }
+}
+
+test "forward tower supplies the bit-reversed canonical DEEP points" {
+    const a = std.testing.allocator;
+    const Twiddles = engine.poly.twiddles;
+    for (3..14) |log| {
+        const domain = core.poly.circle.canonic.CanonicCoset.new(@intCast(log)).circleDomain();
+        var tower = try Twiddles.precomputeM31(a, domain.half_coset);
+        defer Twiddles.deinitM31(a, &tower);
+        for (0..domain.size()) |row| {
+            const i = row >> 2;
+            const opposite = (row >> 1) & 1;
+            const flip_y = (row ^ i ^ opposite) & 1;
+            const x = tower.twiddles[i];
+            const y = tower.twiddles[i ^ 1];
+            const point = domain.at(core.utils.bitReverseIndex(row, @intCast(log)));
+            try std.testing.expectEqual(point.x, if (opposite == 0) x else x.neg());
+            try std.testing.expectEqual(point.y, if (flip_y == 0) y else y.neg());
+        }
     }
 }

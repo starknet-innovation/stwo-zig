@@ -240,6 +240,15 @@
         "src/integrations/cairo_cuda/eval_codegen.zig"
       ]
     },
+    "STWO_BULK_INPUT": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/bulk_inputs.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/bulk_inputs.cuh"
+      ]
+    },
     "STWO_CAIRO_BASE_ACCUMULATOR_V1": {
       "owner": "src/frontends/cairo/conformance/checkpoint.zig",
       "default": "not applicable: compile-time constant, macro, ABI/domain tag or generated source marker; not an environment reader",
@@ -1323,6 +1332,24 @@
       },
       "expires": "2026-12-13"
     },
+    "STWO_COMPACT_FUNCTION": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/compact_program.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/compact_program.cuh"
+      ]
+    },
+    "STWO_COMPACT_INLINE": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/compact_program.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/compact_program.cuh"
+      ]
+    },
     "STWO_COMPACT_V2_DESC_WORDS": {
       "owner": "scripts/tests/test_cuda_witness_compact_v2.py",
       "default": "not applicable: compile-time constant, macro, ABI/domain tag or generated source marker; not an environment reader",
@@ -2065,6 +2092,7 @@
         "src/backends/cuda/native/pow/search.cu",
         "src/backends/cuda/native/quotient/field.cuh",
         "src/backends/cuda/native/runtime/context.cu",
+        "src/backends/cuda/native/rv64/guest_execution/guest.cu",
         "src/backends/cuda/native/witness/active_feeds.cu",
         "src/integrations/cairo_cuda/eval_codegen.zig",
         "src/products/cairo/tools/cuda_witness_aot/canonical.zig"
@@ -2077,6 +2105,24 @@
       "date": "2026-11-13",
       "references": [
         "src/backends/cuda/cumetal/include/stwo_cumetal_cuda_compat.cuh"
+      ]
+    },
+    "STWO_CURVE_INLINE": {
+      "owner": "src/backends/cuda/native/rv64/detail/curve_math.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/detail/curve_math.cuh"
+      ]
+    },
+    "STWO_CURVE_UNROLL": {
+      "owner": "src/backends/cuda/native/rv64/detail/curve_math.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/detail/curve_math.cuh"
       ]
     },
     "STWO_DEPENDENCY_RE": {
@@ -2162,6 +2208,24 @@
       },
       "expires": "2026-12-13"
     },
+    "STWO_EXECUTE_MOTIF": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh"
+      ]
+    },
+    "STWO_FACT_INLINE": {
+      "owner": "src/backends/cuda/native/rv64/detail/family_fact_projection.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/detail/family_fact_projection.cuh"
+      ]
+    },
     "STWO_FELT_INVERSE": {
       "owner": "tests/cuda/cumetal/felt252_execution.cu",
       "default": "not applicable: compile-time constant, macro, ABI/domain tag or generated source marker; not an environment reader",
@@ -2211,6 +2275,65 @@
         "text": "        \"STWO_GENERATE_SN2_RELATION_PARITY\",\n    ) catch return error.SkipZigTest;\n    defer allocator.free(enabled);\n    if (!std.mem.eql(u8, enabled, \"1\"))\n        return error.SkipZigTest;\n\n    var composition = try composition_bundle.Bundle.readFile("
       },
       "expires": "2026-12-13"
+    },
+    "STWO_GUEST_EVENT_HD": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/guest.h",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/guest.h"
+      ]
+    },
+    "STWO_GUEST_INLINE": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/arith256.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/bulk.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/curve.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/keccak.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/secp256k1.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/sha256.cuh"
+      ]
+    },
+    "STWO_GUEST_MOTIFS": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh"
+      ]
+    },
+    "STWO_GUEST_SERVICE": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/arith256.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/bulk.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/curve.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/keccak.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/secp256k1.cuh",
+        "src/backends/cuda/native/rv64/guest_execution/sha256.cuh"
+      ]
+    },
+    "STWO_GUEST_STATIC_REGIONS": {
+      "owner": "scripts/rv64/rv64_cuda_guest_aot.py",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "scripts/rv64/rv64_cuda_guest_aot.py",
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+        "tests/cuda/rv64/guest_execution_host.cpp"
+      ]
     },
     "STWO_HOST_MEMORY_PROFILE": {
       "owner": "src/engine/prover/host_budget_allocator.zig",
@@ -2309,6 +2432,15 @@
       "date": "2026-11-13",
       "references": [
         "src/backends/cuda/aot/native/witness_m31_permutation_trace_0ce5a65a150f8601.cu"
+      ]
+    },
+    "STWO_MATCH_MOTIF": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh"
       ]
     },
     "STWO_METAL_CORE_AOT_BUNDLE": {
@@ -2813,6 +2945,15 @@
       "date": "2026-11-13",
       "references": [
         "src/backends/cuda/native/commitment/progressive_scalar.cuh"
+      ]
+    },
+    "STWO_RAM_ORDER": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/ram_order.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/ram_order.cuh"
       ]
     },
     "STWO_RECURSION_ACTIVE_FRI_OUTER": {
@@ -3374,6 +3515,17 @@
         "tests/cuda/rv64/outer_gkr_bench.cu"
       ]
     },
+    "STWO_RV64_BINDING_MAX_ROW_LOG": {
+      "owner": "src/backends/cuda/native/rv64/gkr_loop.h",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/binding.cu",
+        "src/backends/cuda/native/rv64/gkr_loop.cu",
+        "src/backends/cuda/native/rv64/gkr_loop.h"
+      ]
+    },
     "STWO_RV64_BLAKE_SAMPLE_PREFILL": {
       "owner": "src/integrations/riscv_cpu/rv64_recursion/om31_native/blake_sample_capture.zig",
       "default": "false",
@@ -3821,6 +3973,16 @@
       },
       "expires": "2026-12-09"
     },
+    "STWO_RV64_GUEST_AOT": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+        "tests/cuda/rv64/guest_execution_host.cpp"
+      ]
+    },
     "STWO_RV64_HARNESS_ALLOW_BLOCKS": {
       "owner": "scripts/tests/test_rv64_gate.py",
       "default": "not applicable: retired duplicate environment alias; --allow-block remains the owner gate",
@@ -3905,7 +4067,8 @@
         "src/integrations/riscv_cuda/rv64/recording_dataset.zig",
         "src/products/ethereum/statement/cpu/tests/native_artifact_root.zig",
         "src/products/ethereum/statement/cpu/tests/native_artifact_root_test.zig",
-        "src/products/ethereum/statement/cuda/rv64/capture_execution_consumer_test.zig"
+        "src/products/ethereum/statement/cuda/rv64/capture_execution_consumer_test.zig",
+        "src/products/ethereum/statement/cuda/rv64/jobs/driver_ge.zig"
       ],
       "default_evidence": {
         "path": "src/integrations/riscv_cpu/tests/native_artifact_root.zig",
@@ -3997,9 +4160,9 @@
     },
     "STWO_RV64_M8_GPU_NATIVE": {
       "owner": "src/integrations/riscv_cuda/rv64/jobs/driver.zig",
-      "default": "false",
+      "default": "true",
       "status": "retire-after-native-default",
-      "date": "2026-11-16",
+      "date": "2026-11-24",
       "references": [
         "conformance/rv64/presets/integration-stack-preset.json",
         "scripts/rv64/rv64_gate.py",
@@ -4015,7 +4178,7 @@
       ],
       "default_evidence": {
         "path": "src/integrations/riscv_cuda/rv64/jobs/driver.zig",
-        "text": "pub const env_select = \"STWO_RV64_M8_GPU_NATIVE\";\n\npub fn selected(env: *const fn ([]const u8) ?[]const u8) !bool {\n    const v = env(env_select) orelse return false;\n    if (std.mem.eql(u8, v, \"0\")) return false;\n    if (!std.mem.eql(u8, v, \"1\")) return error.InvalidM8GpuNativeSelection;\n    return true;\n}"
+        "text": "pub const env_select = \"STWO_RV64_M8_GPU_NATIVE\";\n\npub fn selected(env: *const fn ([]const u8) ?[]const u8) !bool {\n    const v = env(env_select) orelse return true;\n    if (std.mem.eql(u8, v, \"0\")) return false;\n    if (!std.mem.eql(u8, v, \"1\")) return error.InvalidM8GpuNativeSelection;\n    return true;\n}"
       },
       "expires": "2026-12-09"
     },
@@ -4218,7 +4381,7 @@
       ],
       "default_evidence": {
         "path": "src/products/ethereum/statement/cuda/rv64/native_recursion_install.zig",
-        "text": "        const fs_path = std.posix.getenv(\"STWO_RV64_M8_OUTER_FS_LIBRARY\") orelse return error.MissingOuterFsLibrary;\n        self.* = .{ .a = a, .shared = try Outer.Shared.init(&libs.base, &libs.addon, fs_path) };\n        errdefer self.deinitContents();\n        const raw = try std.fs.cwd().readFileAlloc(a, manifest_path, 1 << 20);\n        defer a.free(raw);\n        var manifest = try std.json.parseFromSlice(std.json.Value, a, raw, .{ .allocate = .alloc_always });\n        defer manifest.deinit();\n        const root = manifest.value;"
+        "text": "        const fs_path = std.posix.getenv(\"STWO_RV64_M8_OUTER_FS_LIBRARY\") orelse return error.MissingOuterFsLibrary;"
       },
       "expires": "2026-12-09"
     },
@@ -4364,7 +4527,7 @@
       ],
       "default_evidence": {
         "path": "src/products/ethereum/statement/cuda/rv64/jobs/driver_ge.zig",
-        "text": "        .prewarm_resources = (try envUnsigned(\"STWO_RV64_M9_CLASS_PACKED_INGRESS\", 0)) == 1,\n        .slab_words = default_slab_bytes / 4,\n        // Shared retained metadata plus one measured-after-instantiation\n        // candidate. Opaque CUDA temporary peaks remain physically guarded.\n        .graph_exec_words = (512 << 20) / 4,\n        .batch_pinned_words = default_batch_pinned_bytes / 4,\n    };\n    const ring = S.RingConfig{ .buffers = default_ring_buffers, .words = default_ring_bytes / 4 };"
+        "text": "        .prewarm_resources = (try envUnsigned(\"STWO_RV64_M9_CLASS_PACKED_INGRESS\", 0)) == 1,"
       },
       "expires": "2026-12-09"
     },
@@ -4620,11 +4783,12 @@
         "conformance/rv64/presets/integration-stack-preset.json",
         "src/backends/cuda/native/rv64/jobs/pcs_enqueue.cu",
         "src/backends/cuda/native/rv64/pcs_pipeline.cuh",
+        "src/integrations/riscv_cuda/rv64/jobs/native_tail_test.zig",
         "src/integrations/riscv_cuda/rv64/pcs_native.zig"
       ],
       "default_evidence": {
         "path": "src/backends/cuda/native/rv64/jobs/pcs_enqueue.cu",
-        "text": "  const char *beta2_flag = std::getenv(\"STWO_RV64_PCS_ROLLING_BETA2\");\n  const bool rolling_beta2 = beta2_flag && std::strcmp(beta2_flag, \"1\") == 0;\n  plan.output_words = out;\n  plan.ingress_words = 14 + 9 + 16 + 3 + uint64_t(sample_count) + 5ull * sc +\n                       4ull * tc + 12ull * gc + h[19] + h[20] + 6ull * sc +\n                       48ull * gc + host_words + input.domain.size() +\n                       16ull * 24; // per-upload 16-word alignment slack\n  plan.ingress_words += 16ull * (uint64_t(sc) + 2ull * gc + sgc + nt);"
+        "text": "  const char *beta2_flag = std::getenv(\"STWO_RV64_PCS_ROLLING_BETA2\");\n  const bool rolling_beta2 = beta2_flag && std::strcmp(beta2_flag, \"1\") == 0;"
       },
       "expires": "2026-12-09"
     },
@@ -4782,6 +4946,15 @@
       },
       "expires": "2026-12-13"
     },
+    "STWO_SECP_INLINE": {
+      "owner": "src/backends/cuda/native/rv64/detail/secp256k1.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/detail/secp256k1.cuh"
+      ]
+    },
     "STWO_SEGMENT_V2_CHILD_BUNDLE": {
       "owner": "src/frontends/riscv/compat/assembly/recursion/detached_child_capture.zig",
       "default": "error.EnvironmentVariableNotFound (required value)",
@@ -4926,6 +5099,15 @@
       },
       "expires": "2026-12-13"
     },
+    "STWO_SERVICE_INLINE": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/service_inputs.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/service_inputs.cuh"
+      ]
+    },
     "STWO_SMALL_MEMORY_FIXTURE": {
       "owner": "tests/cuda/cumetal/memory_base_execution.cu",
       "default": "not applicable: compile-time constant, macro, ABI/domain tag or generated source marker; not an environment reader",
@@ -4948,6 +5130,24 @@
         "text": "    if (!std.process.hasEnvVarConstant(\"STWO_SPARSE_MERKLE_AUTORESEARCH\"))\n        return error.SkipZigTest;\n\n    const allocator = std.testing.allocator;\n    const leaf_count: usize = 1 << 18;\n    const leaves = try allocator.alloc(Leaf, leaf_count);\n    defer allocator.free(leaves);"
       },
       "expires": "2026-12-13"
+    },
+    "STWO_STATIC_DISPATCH": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh"
+      ]
+    },
+    "STWO_STATIC_SLOT": {
+      "owner": "src/backends/cuda/native/rv64/guest_execution/execute.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/guest_execution/execute.cuh"
+      ]
     },
     "STWO_STORE_PROGRESSIVE": {
       "owner": "src/backends/cuda/native/commitment/progressive.cu",
@@ -5081,6 +5281,33 @@
       "date": "2026-11-13",
       "references": [
         "tools/stwo-trace-digest/src/lib.rs"
+      ]
+    },
+    "STWO_UINT256_INLINE": {
+      "owner": "src/backends/cuda/native/rv64/detail/uint256_mod.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/detail/uint256_mod.cuh"
+      ]
+    },
+    "STWO_UINT256_LOOP": {
+      "owner": "src/backends/cuda/native/rv64/detail/uint256_mod.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/detail/uint256_mod.cuh"
+      ]
+    },
+    "STWO_UINT256_UNROLL": {
+      "owner": "src/backends/cuda/native/rv64/detail/uint256_mod.cuh",
+      "default": "compile-time CUDA source definition; no runtime environment reader",
+      "status": "constant",
+      "date": "2026-11-24",
+      "references": [
+        "src/backends/cuda/native/rv64/detail/uint256_mod.cuh"
       ]
     },
     "STWO_UPDATE_CUDA_RECORDED_MATRIX_FIXTURE": {

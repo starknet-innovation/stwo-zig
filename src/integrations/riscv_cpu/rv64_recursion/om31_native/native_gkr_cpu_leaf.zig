@@ -146,7 +146,7 @@ pub const Statement = struct {
         const a = ctx.scratch();
         var accumulator = E.lane.PointAccumulator(F).init(alpha);
         for (self.source_plan.slots, self.native_plan.spans, self.publics, self.bindings) |slot, span, public, binding| {
-            const descriptor = CPU.Authority.Source.Descriptor{ .origin = slot.origin, .cpu_u8_pairs = self.setup.materials.geometry.cpu_u8_pairs, .cpu_compact_decode = self.setup.materials.geometry.cpu_compact_decode };
+            const descriptor = CPU.Authority.Source.Descriptor.forGeometry(slot.origin, self.setup.materials.geometry);
             const shape = try CPU.Authority.shape(descriptor);
             const fixed = try a.alloc(F, shape.fixed);
             defer a.free(fixed);

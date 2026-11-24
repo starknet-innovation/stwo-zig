@@ -112,7 +112,7 @@ const Variable = struct {
 
 /// Replace one already rebound role. All following MAIN allocations shift
 /// by four columns. INTER keeps the same two eight-coordinate fractions.
-pub fn bind(a: std.mem.Allocator, bundle: *Bundle.Bundle, layout: *const @import("stwo_circuit_frontend").common.preprocessed.ColumnLayout) !void {
+pub fn bind(a: std.mem.Allocator, bundle: *Bundle.Bundle, layout: ?*const @import("stwo_circuit_frontend").common.preprocessed.ColumnLayout) !void {
     const list = @import("stwo_circuit_frontend").common.component_list;
     const qm31_ops = @intFromEnum(list.ComponentList.qm31_ops);
     const component = &bundle.components[qm31_ops];
@@ -139,11 +139,11 @@ pub fn bind(a: std.mem.Allocator, bundle: *Bundle.Bundle, layout: *const @import
     // The original recording's eight IDs may be listed in first-use order.
     // The caller derives these indices from the actual preprocessed layout.
     const pp = @import("stwo_circuit_frontend").common.preprocessed;
-    for (pp.QM31_OPS_COLUMN_IDS, component.preprocessed_indices) |id, *index| {
-        index.* = for (layout.entries, 0..) |entry, i| {
+    if (layout) |physical| for (pp.QM31_OPS_COLUMN_IDS, component.preprocessed_indices) |id, *index| {
+        index.* = for (physical.entries, 0..) |entry, i| {
             if (std.mem.eql(u8, entry.id, id)) break @intCast(i);
         } else return error.InvalidMixedFixedLayout;
-    }
+    };
     parts[0] = .{ .rc_base = 0, .semantic_hash = program.header.semantic_hash, .program = program };
 
     for (component.parts) |*part| part.program.deinit();

@@ -114,7 +114,7 @@ pub fn requireParameters(actual: core.pcs.PcsConfig) !void {
 pub fn requireProfileParameters(profile: Profile, actual: core.pcs.PcsConfig) !void {
     if (!std.meta.eql(actual, configFor(profile))) return error.UnrecognizedOm31CandidateParameters;
 }
-pub const D2_ID_DOMAIN = "rv64-om31-rawblake-native-localgkr-d2-b4-q54-p20-fold4/EXPERIMENTAL-v1\x00";
+pub const D2_ID_DOMAIN = "rv64-om31-rawblake-native-localgkr-d2-b4-q54-p20-fold4/EXPERIMENTAL-v2-fixed-root\x00";
 pub const CONJECTURED_ID_DOMAIN = "rv64-om31-rawblake-native-localgkr-128-CONJECTURED-ethstark/v2\x00";
 /// Profile identity. The proven profile keeps `identity()`; the conjectured
 /// profile hashes a distinct domain, its label, every PCS parameter and the
@@ -126,8 +126,7 @@ pub fn profileIdentity(profile: Profile) [32]u8 {
     const d2 = profile == .d2_native_b4_q54_p20_fold4;
     h.update(if (d2) D2_ID_DOMAIN else CONJECTURED_ID_DOMAIN);
     h.update(profile.name());
-    // Pin the separately source-owned D2 spec and its framing as well as the
-    // real ten-relation roster. The old profile byte sequence stays frozen.
+    // Pin the separately source-owned D2 spec and the ten-relation roster.
     if (d2) h.update(&candidateIdentity(.d2_native_b4_q54_p20_fold4));
     h.update(&Channel.profile.identity());
     for ([_]u64{ 8, c.fri_config.n_queries, c.fri_config.log_blowup_factor, c.fri_config.fold_step, c.pow_bits, c.fri_config.log_last_layer_degree_bound, conjecturedBits(profile), MAX_PROOFS, MAX_TRACE_LOG, MAX_PUBLIC_BOUNDARY_LOG, MAX_COLUMNS, MAX_CONSTRAINTS, MAX_SAMPLES_PER_COLUMN, MAX_AIR_DEGREE, MAX_LOCAL_INSTANCES, MAX_TUPLE_ARITY, if (d2) ROSTER_LOCAL_RELATIONS else LOCAL_RELATIONS, GLOBAL_RELATIONS, MAX_GKR_VARIABLES, MAX_ROUND_COUNT, TARGET_BITS }) |n| {

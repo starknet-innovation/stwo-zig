@@ -13,9 +13,11 @@ pub const Catalog = @import("projection_fixture_support.zig");
 pub const count = Catalog.count + 2;
 pub fn descriptors() [count]G.Source.Descriptor {
     var out: [count]G.Source.Descriptor = undefined;
-    @memcpy(out[0..Catalog.count], &Catalog.descriptors());
-    out[Catalog.count] = .{ .origin = .{ .core = .initial } };
-    out[Catalog.count + 1] = .{ .origin = .{ .core = .terminal } };
+    const projection = Catalog.descriptors();
+    @memcpy(out[0..Catalog.standard_count], projection[0..Catalog.standard_count]);
+    out[Catalog.standard_count] = .{ .origin = .{ .core = .initial } };
+    out[Catalog.standard_count + 1] = .{ .origin = .{ .core = .terminal } };
+    out[Catalog.standard_count + 2] = Catalog.wide_cpu;
     return out;
 }
 pub fn random(rng: std.Random) O {
@@ -54,7 +56,7 @@ pub fn nativeResiduals(a: std.mem.Allocator, descriptor: G.Source.Descriptor, pa
     const width = local_width + global.width();
     if (current.len != width or shifted.len != width or aux.len != (if (local) @as(usize, 10) else 0)) return error.InvalidJoinedFixtureShape;
     var public: G.Authority.PublicFor(O) = .{
-        .cpu = .{ .steps = try integer(params[P.cpu_steps]), .initial_pc = undefined, .final_pc = undefined, .epoch = try integer(params[P.epoch]) },
+        .cpu = .{ .wide_clock = descriptor.cpu_wide_clock, .steps = try integer(params[P.cpu_steps]), .initial_pc = undefined, .final_pc = undefined, .epoch = try integer(params[P.epoch]) },
         .rows = try integer(params[P.rows]),
         .nonempty = {},
         .span = .{ .calls = try integer(params[P.calls]), .first_id = try integer(params[P.first_id]) },

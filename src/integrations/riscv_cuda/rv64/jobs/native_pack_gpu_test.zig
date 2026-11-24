@@ -68,7 +68,7 @@ const Probe = struct {
     }
     pub fn footprint(self: *Probe) api.Footprint {
         const img = std.mem.alignForward(usize, self.seg.image_words, 64);
-        return .{ .device_words = img + self.p.arenaWords() + 4096, .staged_words = self.p.arenaWords(), .slab_words = 64, .pinned_words = 1 << 12 };
+        return .{ .device_words = img + self.p.arenaWords() + 4096, .slab_words = 64, .pinned_words = 1 << 12 };
     }
     pub fn stage(self: *Probe, s: *api.Stager) !void {
         var t = try std.time.Timer.start();
@@ -159,7 +159,7 @@ const GlueProbe = struct {
         const c = self.cls;
         const img = std.mem.alignForward(usize, c.image_words, 64);
         const commit = @max(c.main.deviceWords(), c.main.coefficient_cells + c.main.eval_cells);
-        return .{ .device_words = 2 * img + commit + c.main.coefficient_cells + self.p.arenaWords() + c.main.stagedWords(0) + (1 << 20), .staged_words = self.p.arenaWords() + c.main.stagedWords(0) + 4096, .slab_words = 64, .pinned_words = c.main.tw.twiddles.len + c.main.tw.itwiddles.len + (1 << 16) };
+        return .{ .device_words = 2 * img + @max(commit + self.p.retained_words, self.p.arenaWords()) + c.main.coefficient_cells + c.main.stagedWords(0) + (1 << 20), .staged_words = c.main.stagedWords(0) + 4096, .slab_words = 64, .pinned_words = c.main.twiddleWords() + (1 << 16) };
     }
     pub fn stage(self: *GlueProbe, s: *api.Stager) !void {
         const c = self.cls;
@@ -196,7 +196,7 @@ const GlueProbe = struct {
         }
         if (self.events.record(self.ev[0].?, stream) != 0) return error.CudaTimingFailed;
         const witness: S1.Witness = if (self.compact) .{ .compact = .{ .chunks = self.chunks, .roms = self.roms, .program = self.p, .bound = &self.bound } } else .{ .device = cols };
-        const pro = try S1.enqueuePrologue(c, self.sym, e, self.seed.?, self.region.?, witness, &.{}, &self.main, self.inputs, main_view, root_out);
+        const pro = try S1.enqueuePrologue(c, self.sym, e, self.seed.?, self.region.?, witness, &.{}, &self.main, self.inputs, main_view, root_out, null);
         if (self.events.record(self.ev[1].?, stream) != 0) return error.CudaTimingFailed;
         try e.channel.snapshot(e.slab, 8);
         var spec = S1.CheckSpec{ .check = @intFromEnum(G.Check.witness_status) };

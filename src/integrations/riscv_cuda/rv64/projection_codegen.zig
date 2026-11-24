@@ -110,6 +110,7 @@ fn sourceAuthority(descriptor: Source.Descriptor) ![32]u8 {
         hash.update(&bytes);
     }
     hash.update(&.{ @intFromBool(descriptor.cpu_u8_pairs), @intFromBool(descriptor.cpu_compact_decode) });
+    if (descriptor.cpu_wide_clock) hash.update("wide-clock-u16");
     return hash.finalResult();
 }
 pub fn record(a: std.mem.Allocator, descriptor: Source.Descriptor) !Artifact {
