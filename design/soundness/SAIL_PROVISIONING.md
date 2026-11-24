@@ -24,8 +24,7 @@ in CI), builds the pinned workspace, regenerates the Sail Lean theorem backend
 from the exact `rv32im-zkvm-v1` configuration, runs the full pilot gate, and
 mints the live-evidence refinement receipt as a build artifact.
 
-The workflow runs on schedule, on `workflow_dispatch`, and on pushes to
-`main`. It does not run on pull requests: a cold run rebuilds the Sail
+Maintainers run the workflow through `workflow_dispatch`. A cold run rebuilds the Sail
 simulator, Spike, the Lean backend, and the whole proof tree, which is far too
 slow for a per-PR required check. Normal publication has **no skipped proof leg**:
 if Sail cannot be downloaded, hash-verified, or built, the job is RED. Explicit
