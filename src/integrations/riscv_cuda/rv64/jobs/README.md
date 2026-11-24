@@ -9,6 +9,36 @@ These are the three developer entrypoints:
 | Before every push | `bash scripts/rv64_gate.sh --stream m8-gn-bind --out <new-receipt-dir> --source-commit <sha> --runtime <pinned-runtime.json>` |
 | GPU-native regression set | `python3 scripts/rv64_m8_bench15.py run --assets <pinned-assets.json> --out <regression-dir> --arms gpu-native` |
 
+## Single-GPU live service
+
+For a live basket run, point `RV64_M3_ROOT` at the pod installation containing
+the original basket inputs and the shared GPU lock. Its `src/<stream>` entry
+must resolve to the running checkout. Supply a complete proving request from
+the maintained guest build, including its terminal PC and symbols, and its
+independently measured per-block census. Use the hardware preset and capacity
+of the comparison.
+
+```sh
+python3 scripts/rv64_m8_bench15.py live --assets "$ASSETS" --preset "$PRESET" \
+  --workload "$GUEST_CENSUS" --guest-request "$GUEST_REQUEST" --guest-elf "$GUEST_ELF" \
+  --guest-execution cuda --device-cap-bytes "$DEVICE_CAP_BYTES" --out "$RESULTS"
+```
+
+The harness creates a private plan and request directory under `$RESULTS/service`.
+It uses the ABI from the qualified guest request and checks the original input
+bytes, output pins, guest ELF digest and measured shard counts before launch.
+The existing lock, binaries and catalogues stay shared. The census maps decimal block numbers to `instructions`, `cpu_segments`,
+`elf_sha256`, `input_sha256` and `output` (hex). Add `--prepare-only` to
+validate the same pins without acquiring a GPU. For a subsequent run, set
+`RV64_M3_ROOT` to that prepared `service` directory and supply a new results
+directory. With prepared inputs, omit `--guest-request` and `--guest-elf`.
+
+The default live route keeps a single CUDA proof worker for native and recursive
+jobs. The installed witness executor can run on the host or on CUDA. Receipts
+report its execution domain separately from the GPU proof span. Each retained
+root goes through a fresh CPU receiver. The archived comparison arms use their
+own pinned configurations.
+
 Use `dev_test.py --optimize ReleaseFast <changed-paths>` to reproduce optimized
 CI failures. Without an override, focused tests use Debug and package fallbacks
 use ReleaseSafe.

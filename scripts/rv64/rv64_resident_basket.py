@@ -212,18 +212,22 @@ def request_markers(log, block, count, repeat=2):
     return result
 
 
-def recursive_snapshot(proof, leaf_count):
+def recursive_snapshot(proof, leaf_count, grouped=False):
     """Freeze every physical proof and ordered sidecar before independent replay."""
-    directory = proof / "recursion-om31"
+    directory = proof / ("recursion-service-group" if grouped else "recursion-om31")
     tree = B.load(directory / "tree.json")
     nodes = tree.get("nodes", [])
-    arity = tree.get("fold_arity", 2) if tree.get("schema") == 3 else 2
-    expected = leaf_count + planned_fold_count(leaf_count, arity) if leaf_count >= 1 else -1
-    if leaf_count < 1 or len(nodes) != expected or tree.get("root") != len(nodes) - 1:
+    schema = tree.get("schema")
+    arity = tree.get("fold_arity", 2) if schema in (3, 4) else 2
+    if (grouped and (schema != 4 or arity != 4 or leaf_count < 4)) or (not grouped and schema == 4):
+        raise ValueError("recursive group schema mismatch")
+    physical_leaves = leaf_count - (2 if grouped else 0)
+    expected = physical_leaves + planned_fold_count(physical_leaves, arity) if physical_leaves >= 1 else -1
+    if physical_leaves < 1 or len(nodes) != expected or tree.get("root") != len(nodes) - 1:
         raise ValueError("recursive tree coverage mismatch")
     names, leaves, uses = set(), set(), [0] * len(nodes)
     for index, node in enumerate(nodes):
-        if tree.get("schema") == 3:
+        if schema in (3, 4):
             children = node.get("children")
             if type(children) is not list:
                 raise ValueError("recursive child ordering mismatch")
@@ -232,10 +236,15 @@ def recursive_snapshot(proof, leaf_count):
             children = [] if left is None and right is None else [left, right]
         if not children:
             first = node.get("first_leaf")
-            if type(first) is not int or not 0 <= first < leaf_count or first in leaves or node.get("leaf_count") != 1:
+            span = 3 if grouped and first == leaf_count - 3 else 1
+            if type(first) is not int or not 0 <= first < leaf_count or node.get("leaf_count") != span:
                 raise ValueError("recursive leaf coverage mismatch")
-            leaves.add(first)
-            names.add(f"leaf-{first:06}.proof")
+            coverage = set(range(first, first + span))
+            if coverage & leaves:
+                raise ValueError("recursive leaf coverage mismatch")
+            leaves.update(coverage)
+            name = "service-group" if span == 3 else "leaf"
+            names.add(f"{name}-{first:06}.proof")
         else:
             if (not 2 <= len(children) <= arity or any(type(c) is not int or not 0 <= c < index for c in children)
                     or len(set(children)) != len(children)):
@@ -255,7 +264,7 @@ def recursive_snapshot(proof, leaf_count):
     if {p.name for p in directory.glob("*.proof")} != names:
         raise ValueError("missing or extra physical recursive proofs; verification cannot re-prove")
     hashes = {name: B.sha(directory / name) for name in sorted(names)}
-    final = f"fold-{len(nodes)-1:06}.proof" if leaf_count > 1 else "leaf-000000.proof"
+    final = f"fold-{len(nodes)-1:06}.proof" if physical_leaves > 1 else "leaf-000000.proof"
     if hashes["root.proof"] != hashes[final]:
         raise ValueError("root proof differs from the physical final node")
     return {"proof_sha256": hashes, "tree_sha256": B.sha(directory / "tree.json")}

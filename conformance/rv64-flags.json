@@ -3504,13 +3504,14 @@
       "date": "2026-11-08",
       "references": [
         "scripts/rv64/rv64_m3_pod.py",
-        "scripts/rv64/rv64_m4_resident.py",
         "scripts/rv64/rv64_m5_canon_vk_tamper.py",
         "scripts/rv64/rv64_m5_negative_corpus.py",
         "scripts/rv64/rv64_m5_receiver_class_ab.py",
         "scripts/rv64/rv64_m7_coalesced_tamper.py",
         "scripts/rv64/rv64_negative_mutations.py",
+        "scripts/rv64/rv64_resident_receiver.py",
         "scripts/rv64/rv64_validation.py",
+        "scripts/tests/test_rv64_m8_bench15.py",
         "scripts/tests/test_rv64_validation.py",
         "src/integrations/riscv_cpu/rv64_recursion/om31_native/execution_wrap_ownership.zig"
       ],
@@ -3722,6 +3723,7 @@
         "scripts/rv64/rv64_m3_pod.py",
         "scripts/rv64/rv64_m4_resident.py",
         "scripts/rv64/rv64_resident_basket.py",
+        "scripts/rv64_m8_bench15.py",
         "scripts/tests/test_rv64_ethereum_basket.py",
         "src/products/ethereum/statement/cuda/rv64/resident_batch.zig",
         "src/products/ethereum/statement/cuda/rv64_combined_ethereum_main.zig",
@@ -3767,12 +3769,13 @@
       "date": "2026-11-08",
       "references": [
         "scripts/rv64/rv64_m3_pod.py",
-        "scripts/rv64/rv64_m4_resident.py",
         "scripts/rv64/rv64_m5_negative_corpus.py",
         "scripts/rv64/rv64_m5_rootverify_corpus.py",
         "scripts/rv64/rv64_m7_coalesced_tamper.py",
         "scripts/rv64/rv64_resident_basket.py",
+        "scripts/rv64/rv64_resident_receiver.py",
         "scripts/rv64/rv64_validation.py",
+        "scripts/tests/test_rv64_m8_bench15.py",
         "scripts/tests/test_rv64_resident_basket.py",
         "scripts/tests/test_rv64_validation.py",
         "src/products/ethereum/statement/cuda/rv64_hybrid_ethereum_main.zig"
@@ -4000,10 +4003,13 @@
       "references": [
         "conformance/rv64/presets/integration-stack-preset.json",
         "scripts/rv64/rv64_gate.py",
+        "scripts/rv64/rv64_live_service.py",
+        "scripts/rv64/rv64_m4_resident.py",
         "scripts/rv64/rv64_m7_integration_stack.py",
         "scripts/rv64/rv64_validation.py",
         "scripts/rv64_m8_bench15.py",
         "scripts/tests/test_rv64_gate.py",
+        "scripts/tests/test_rv64_m8_bench15.py",
         "scripts/tests/test_rv64_validation.py",
         "src/integrations/riscv_cuda/rv64/jobs/driver.zig"
       ],
@@ -4142,6 +4148,7 @@
       "status": "retire-after-native-default",
       "date": "2026-11-08",
       "references": [
+        "scripts/rv64_m8_bench15.py",
         "src/integrations/riscv_cuda/rv64/jobs/outer_class_plan.zig",
         "src/products/ethereum/statement/cuda/rv64/native_recursion_install.zig"
       ],
@@ -4512,7 +4519,9 @@
         "scripts/rv64/rv64_m4_resident.py",
         "scripts/rv64/rv64_m5_negative_corpus.py",
         "scripts/rv64/rv64_m7_coalesced_tamper.py",
+        "scripts/rv64/rv64_resident_receiver.py",
         "scripts/rv64/rv64_validation.py",
+        "scripts/tests/test_rv64_m8_bench15.py",
         "scripts/tests/test_rv64_validation.py",
         "src/integrations/riscv_cuda/rv64/outer_assignment.zig"
       ],
@@ -6603,7 +6612,9 @@
         "scripts/rv64/rv64_m5_rootverify_corpus.py",
         "scripts/rv64/rv64_m7_coalesced_tamper.py",
         "scripts/rv64/rv64_negative_mutations.py",
+        "scripts/rv64/rv64_resident_receiver.py",
         "scripts/rv64/rv64_validation.py",
+        "scripts/tests/test_rv64_m8_bench15.py",
         "scripts/tests/test_rv64_validation.py",
         "src/products/ethereum/statement/cpu/rv64_recursion/root_verify_main.zig",
         "src/products/ethereum/statement/cpu/word16_global_execution/ethereum/gkr_resources.zig",

@@ -21,6 +21,10 @@ KV = re.compile(r"(\w+)=([^\s]+)")
 PHASES = {  # record prefix -> fields summed across all nodes (ns unless *_ms)
     "CUDA_OUTER_PREPROCESS": ("finalize_ns", "columns_ns", "authority_ns", "total_ns"),
     "GPU_OUTER_ASSIGNMENT_PLAN": ("plan_ns", "seeds_ns", "tasks_ns", "dependency_walk_ns", "ordering_ns", "task_pack_ns", "seed_pack_ns", "hash_ns"),
+    "GPU_RECURSION_INSTALL": ("preprocessed_ns", "fixed_commit_ns", "assignment_plan_ns", "assignment_wait_ns",
+                              "class_install_ns", "leaf_trace_ns", "leaf_wait_ns"),
+    "GPU_RECURSION_FIXED_CACHE": ("hits", "misses", "lookup_ns"),
+    "GPU_M9_PACKED_CLASS": ("logical_words", "resident_words", "pack_ns"),
     "GPU_OUTER_ASSIGNMENT_TIMING": ("total_ns", "static_ingress_ns", "levels_enqueue_ns", "levels_join_ns", "launches"),
     "GPU_PCS_NATIVE": ("prepare_ns", "device_ns", "total_ns"),
     "GPU_COMPOSITION_TIMING": ("domain_fft_ms", "rows_ms", "finalize_ms", "commit_fft_ms", "commit_hash_ms", "gpu_enqueued_kernel_spans_ms"),

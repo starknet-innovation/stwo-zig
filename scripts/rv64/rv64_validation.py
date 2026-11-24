@@ -35,6 +35,7 @@ CORPUS_ISOLATION = {'CUDA_VISIBLE_DEVICES': '', 'STWO_RV64_GPU_PCS_HELPER': '/bi
 
 JOBS_FLAGS = ('STWO_RV64_M8_GPU_NATIVE',)
 NATIVE_LIBRARIES = ('STWO_RV64_M8_JOBS_LIBRARY', 'STWO_RV64_M8_OUTER_FS_LIBRARY')
+LIVE_PROOF_CONTENT_SCHEMA = 'rv64-live-proof-content/v1'
 
 
 def service_label(out, prefix='gate'):
@@ -204,7 +205,19 @@ def check_corpus(receipt, receiver_sha256):
             'nonsemantic_rejects': limitations}
 
 
-def validate_receivers(verdicts, proofs, receiver_sha256):
+def proof_artifact_binding(proof):
+    """Identify the complete, immutable live producer output by content."""
+    directory = Path(proof)
+    files = {p.relative_to(directory).as_posix(): sha(p) for p in sorted(directory.rglob('*')) if p.is_file()}
+    roots = {'recursion-om31/root.proof', 'recursion-service-group/root.proof'} & files.keys()
+    if len(roots) != 1:
+        raise RuntimeError('fresh receiver proof directory must contain exactly one recursive root')
+    payload = json.dumps(files, sort_keys=True, separators=(',', ':')).encode()
+    digest = hashlib.sha256(LIVE_PROOF_CONTENT_SCHEMA.encode() + b'\0' + payload).hexdigest()
+    return {'schema': LIVE_PROOF_CONTENT_SCHEMA, 'files': len(files), 'sha256': digest}
+
+
+def validate_receivers(verdicts, proofs, receiver_sha256, *, require_artifact_binding=False):
     if not isinstance(receiver_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', receiver_sha256):
         raise RuntimeError('fresh CPU receiver binary is not pinned')
     expected = set(proofs)
@@ -226,8 +239,14 @@ def validate_receivers(verdicts, proofs, receiver_sha256):
                 or isolation.get('STWO_RV64_OUTER_PLAN_CLASS_STORE') != 'unset'
                 or row.get('store_present_during_receive') is not False):
             raise RuntimeError('fresh isolated CPU acceptance is incomplete')
-        if not isinstance(proof, str) or not proof or proof in seen:
+        if not isinstance(proof, str) or not proof or proof not in expected or proof in seen:
             raise RuntimeError('fresh CPU receiver proof is absent or duplicated')
+        if require_artifact_binding:
+            content = row.get('artifact_binding')
+            if not isinstance(content, dict) or content.get('schema') != LIVE_PROOF_CONTENT_SCHEMA:
+                raise RuntimeError('fresh CPU receiver proof content binding is missing')
+            if content != proof_artifact_binding(proof):
+                raise RuntimeError('fresh CPU receiver verified different proof content')
         seen.add(proof)
     if seen != expected:
         raise RuntimeError('fresh CPU receiver verified a different producer proof')

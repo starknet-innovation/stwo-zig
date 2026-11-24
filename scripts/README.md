@@ -16,7 +16,7 @@ The top level holds only the developer entry points:
 | [`dev_test.py`](dev_test.py) | Local path-based developer test runner |
 | `ci.py` | CI driver (`--fast` is static; `--check-toolchains` checks declarations; `--installed-toolchains cpu\|oracles\|formal` executes and fingerprints the selected installed tools) |
 | `rv64_gate.sh` | RV64 / CUDA gate on the pod (implementation in `rv64/rv64_gate.py`) |
-| `rv64_m8_bench15.py` | 15-block RV64 benchmark |
+| [rv64_m8_bench15.py](rv64_m8_bench15.py) | [15-block RV64 benchmark and live single-GPU service](../src/integrations/riscv_cuda/rv64/jobs/README.md) |
 
 Everything else lives in one area package, each a Python package
 (`__init__.py`) importable as `scripts.<area>.<module>`:

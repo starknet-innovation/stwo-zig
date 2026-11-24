@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """RV64 M4 stream `resident`: resident prover service + persisted ArtifactStore harness.
 
-Runs ON the pod. One producer process (the resident service: `combined-batch`) holds the selected
-CUDA contexts, the program image/authority session and the SetupCache for its whole life
-and serves an ordered list of requests (blocks x repeat).  Immutable setup comes from a
-persisted, content-addressed ArtifactStore under /workspace/m3/store/<branch>/<key>/.
+One producer keeps the selected CUDA contexts, program authority and setup cache
+across requests. The store is keyed by the executable, runtime and guest image.
 
   python3 rv64_m4_resident.py store-key [--stream S]            # print the store key + components
   python3 rv64_m4_resident.py serve BLOCK [BLOCK ...] --repeat N --tag T [--loading eager|lazy]
@@ -17,7 +15,7 @@ Every request in the service gets: request wall (driver marker), stage breakdown
 (native bins, bundle, every recursive proof, tree), and (optionally) the verdict of a fresh,
 separate, CPU-only receiver run while the ArtifactStore directory does not exist.
 
-Store keying (see design/riscv/rv64-m4-artifact-store.md):
+Store key (design/riscv/rv64-m4-artifact-store.md):
   key = SHA-256("rv64-m4-artifact-store/v1" || canonical JSON of
         {driver_sha256 (code identity), library_sha256, catalogue_sha256 (generator output),
          elf_sha256 (image), profile, field_hash, store_format})
@@ -45,6 +43,7 @@ HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.rv64 import rv64_m3_pod as P  # noqa: E402
 from scripts.rv64 import rv64_resident_basket as R  # noqa: E402
+from scripts.rv64.rv64_resident_receiver import receive_one, receive_run, use_grouped_verifier  # noqa: E402
 
 B = R.B
 M3 = P.M3
@@ -86,8 +85,14 @@ def plan_for(blocks, args, run, paths, root):
                 schedule.pop("device_affinity", None)
             else:
                 schedule["device_affinity"] = gpus
+        if getattr(args, "grouped_service_recursion", False):
+            if not getattr(args, "live", False) or getattr(args, "guest_execution", None) != "cuda":
+                raise ValueError("grouped service recursion requires live GPU guest execution")
+            job["resources"] = dict(job["resources"], grouped_service_recursion=True)
         if getattr(args, "coalesce_truth_families", False):
             job["resources"] = dict(job["resources"], coalesce_truth_families=True)
+        if getattr(args, "guest_execution", "cpu") == "cuda":
+            job["resources"] = dict(job["resources"], guest_execution="cuda")
         jobs.append(job)
     resources = jobs[0]["resources"]
     if any(j["resources"] != resources for j in jobs):
@@ -116,6 +121,13 @@ def service_manifest(plan):
             **({"recursion_device_fixed_candidate": True} if plan.get("recursion_device_fixed_candidate") else {})}
 
 
+def live_manifest(plan):
+    manifest = service_manifest(plan)
+    tickets = manifest.pop("blocks")
+    manifest.update(schema="rv64-ethereum-live-service/v1", blocks={}, execution_order=[], repeat=1)
+    return manifest, tickets
+
+
 def allowed_blocks(args):
     """Explicit owner opt-in through the existing repeated --allow-block CLI."""
     return set(getattr(args, "allow_block", None) or [])
@@ -126,6 +138,12 @@ def require_measurement_blocks(args):
     (allowed_blocks), one block per service and --repeat <= 2; or the M7 scale probe.
     Never opens a basket loop. --bench-basket-block: the 15-block benchmark
     (scripts/rv64_m8_bench15.py) serves exactly one M3-basket block per service."""
+    if getattr(args, "live", False):
+        basket = {j["block"] for j in P.plan_template()["jobs"]}
+        if (args.gpus != 1 or args.warm or args.repeat not in (1, 2) or args.receive != "all" or
+                not args.blocks or len(set(args.blocks)) != len(args.blocks) or not set(args.blocks) <= basket):
+            raise SystemExit("live benchmark requires one GPU, distinct pinned blocks, fresh receivers and no prewarming")
+        return
     large = [block for block in args.blocks if block not in P.DEV_BLOCKS]
     if not large:
         return
@@ -373,7 +391,16 @@ def daemon(args):
     store_before = store_census(store_dir)
     spool = run / "spool"
     spool.mkdir()
-    manifest = service_manifest(plan)
+    tickets = None
+    selection = plan["resident_environment"].setdefault("STWO_RV64_M8_GPU_NATIVE", "1")
+    native_live = args.live and selection == "1"
+    if getattr(args, "guest_execution", "cpu") == "cuda" and (not native_live or args.gpus != 1):
+        raise ValueError("CUDA guest execution requires the single-device native live service")
+    if args.live and not native_live:
+        manifest, tickets = live_manifest(plan)
+        (run / "admissions").mkdir()
+    else:
+        manifest = service_manifest(plan)
     if args.warm:
         # Service boot pre-warm (setup only: capture, plan, keys, FIXED; no proof) maps the
         # ArtifactStore into the session before READY. Counted in service_start_s, never in a request.
@@ -394,6 +421,8 @@ def daemon(args):
             environment["STWO_RV64_OUTER_PLAN_CLASS_STORE"] = str(store_dir / "classes")
     plan["environment"] = {k: v for k, v in environment.items() if k.startswith(("STWO_", "CUDA_")) or k in ("LD_PRELOAD", "LD_LIBRARY_PATH")}
     plan["store"] = {"mode": args.store, "directory": str(store_dir) if store_dir else None, "key": key, "components": components}
+    if args.live and environment["STWO_RV64_M8_GPU_NATIVE"] != ("1" if native_live else "0"):
+        raise SystemExit("live backend selection differs from the plan")
     B.atomic_json(run / "plan.json", plan)
     argv = [plan["assets"]["driver"], "combined-serve", str(run / "manifest.json"), str(spool)]
     if args.nsys:
@@ -435,6 +464,14 @@ def daemon(args):
                     time.sleep(0.01)
                 ready_ns = time.monotonic_ns() - started
                 ready = json.loads((spool / 'READY').read_text())
+                if native_live and ready.get("runtime") != "m8-gpu-native":
+                    raise RuntimeError("driver did not attest the GPU-native scheduler")
+                if args.live and not native_live and ready.get("live_admission") is not True:
+                    raise RuntimeError("driver did not attest an empty live service")
+                if args.live:
+                    B.atomic_json(run / 'service-ready-clock.json', dict(
+                        pid=ready['pid'], launch_monotonic_ns=started,
+                        observed_ready_monotonic_ns=started + ready_ns))
                 B.atomic_json(run / 'loaded-native-runtime.json',
                               loaded_native_runtime(ready['pid'], plan['assets']['library']))
                 producer_pid = int(ready['pid'])
@@ -443,12 +480,17 @@ def daemon(args):
                     # The background memory sampler also forks nvidia-smi.
                     # Pause only sampling during admission; it resumes before
                     # submitting the request and remains active while proving.
-                    with monitor.sample_lock:
-                        quiet_records.append(quiet_checkpoint(process, args, run, index, guard, producer_pid))
+                    # The diagnostic stream measures back-to-back service throughput.
+                    # Enforced latency runs retain a quiet admission for every request.
+                    if index == 0 or not args.live or args.quiet_mode == "enforce":
+                        with monitor.sample_lock:
+                            quiet_records.append(quiet_checkpoint(process, args, run, index, guard, producer_pid))
                     name = f"{index:04d}-{block}"
                     resource_before = cgroup_cpu_snapshot()
                     submitted = time.monotonic_ns()
                     submitted_utc = time.time_ns()
+                    if tickets is not None and index < len(args.blocks):
+                        B.atomic_json(run / "admissions" / f"{block}.json", tickets[str(block)])
                     (spool / "inbox" / f"{name}.tmp").write_text(f"{block}\n")
                     os.rename(spool / "inbox" / f"{name}.tmp", spool / "inbox" / f"{name}.request")
                     # Preserve the exact client clock even when proof execution
@@ -466,7 +508,10 @@ def daemon(args):
                             raise SystemExit(f"service exited during {name} ({process.returncode})")
                         time.sleep(0.005)
                     latency = time.monotonic_ns() - submitted
-                    timeline.append({"name": name, "block": block, "client_latency_ns": latency, "service": B.load(done),
+                    reply = B.load(done)
+                    if args.live and (reply.get("ok") is not True or reply.get("block") != block or reply.get("sequence") != index):
+                        raise RuntimeError(f"service rejected or misordered {name}: {reply}")
+                    timeline.append({"name": name, "block": block, "client_latency_ns": latency, "service": reply,
                                      "utc_window_ns": [submitted_utc, time.time_ns()], "cpu_resource_before": resource_before, "cpu_resource_after": cgroup_cpu_snapshot()})
                     # Preserve completed windows even if a later request fails.
                     B.atomic_json(run / "request-timeline.json", timeline)
@@ -511,6 +556,17 @@ def daemon(args):
                       "scope": "Sampled device activity, not process-exclusive GPU time or exact peak; preserved on success/failure"})
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
+        failure = sys.exc_info()[1]
+        if args.live and timeline and isinstance(failure, (Exception, SystemExit)):
+            # Keep the original producer error and independently check each published prefix root.
+            rows = [{"block": t["block"], "trial": i // len(args.blocks), "proof": str(
+                spool / "out" / t["name"] / str(t["block"]) / "proof")} for i, t in enumerate(timeline)]
+            B.atomic_json(run / "receipt.json", {"schema": "rv64-m4-resident-daemon/v1",
+                          "status": "incomplete", "error": str(failure), "requests": rows, "receivers": []})
+            try:
+                receive_run(run, "all", args.receiver_workers)
+            except Exception as error:
+                failure.add_note(f"partial-basket verification failed: {error}")
     process_usage = {"argv": argv, "exit_code": code, "wall_ns": wall_ns, "user_seconds": usage.ru_utime,
                      "system_seconds": usage.ru_stime, "peak_rss_bytes": usage.ru_maxrss * 1024,
                      "minor_faults": usage.ru_minflt, "major_faults": usage.ru_majflt}
@@ -535,10 +591,15 @@ def daemon(args):
         entry["stages"] = stages
         entry["setup_breakdown"] = combined.get("setup_breakdown")
         entry["output_matches_pin"] = bytes(report.get("output", [])).hex() == next(j for j in plan["jobs"] if j["block"] == block)["expected_output"]
-        root_proof = proof / "recursion-om31/root.proof"
+        job = next(j for j in plan["jobs"] if j["block"] == block)
+        grouped = use_grouped_verifier(job["resources"], proof)
+        root_proof = proof / ("recursion-service-group" if grouped else "recursion-om31") / "root.proof"
         entry["proof_bytes_root"] = root_proof.stat().st_size if root_proof.is_file() else None
         entry["leaves"] = report.get("cpu_proofs", 0) + report.get("truth_proofs", 0)
-        entry["parity_vs_m3"] = m3_parity(block, proof, entry["leaves"])
+        entry["parity_vs_m3"] = m3_parity(block, proof, entry["leaves"]) if not grouped else None
+        if grouped:
+            entry["grouped_service_recursion"] = True
+            entry["recursive_snapshot"] = R.recursive_snapshot(proof, entry["leaves"], grouped=True)
         requests.append(entry)
     receipt = {"schema": "rv64-m4-resident-daemon/v1", "label": "measured", "stream": args.stream, "run": str(run),
                "blocks": args.blocks, "repeat": args.repeat, "loading": args.loading, "nsys": bool(args.nsys),
@@ -552,86 +613,22 @@ def daemon(args):
                "physical_budget_guard": guard.record if guard else None,
                "service_overhead_s": round(wall_ns / 1e9 - sum(r["marker"]["request_wall_ns"] for r in requests) / 1e9, 3),
                "requests": requests, "receivers": []}
+    if args.live:
+        receipt["live_service"] = {"producer_pid": producer_pid, "start_ticks": producer_start_ticks,
+                                   "preinstalled_blocks": receipt["service_ready_record"].get("preinstalled_blocks", len(args.blocks) if native_live else 0),
+                                   "distinct_blocks": len(set(order)),
+                                   "first_submit_to_last_done_ns": timeline[-1]["utc_window_ns"][1] - timeline[0]["utc_window_ns"][0],
+                                   "qualified_latency": args.quiet_mode == "enforce",
+                                   "request_clock": "ticket publication through recursive proof completion"}
     B.atomic_json(run / "receipt.json", receipt)
     print_summary(receipt)
     print(json.dumps({"service_start_s": receipt["service_start_s"], "service_stop_s": receipt["service_stop_s"],
                       "client_latency_s": [round(r["client_latency_ns"] / 1e9, 3) for r in requests]}))
     if args.receive != "none":
-        receive_run(run, args.receive, args.receiver_workers)
+        verdicts = receive_run(run, args.receive, args.receiver_workers)
+        if args.live and (len(verdicts) != len(timeline) or not all(v["accepted"] for v in verdicts)):
+            raise RuntimeError("fresh verification of every live block is required")
     return run
-
-
-def receive_one(plan, block, proof, out_root, workers):
-    job = next(j for j in plan["jobs"] if j["block"] == block)
-    report = B.load(proof / "report.json")
-    count = report["cpu_proofs"] + report["truth_proofs"]
-    out = out_root / f"receiver-{block}-{proof.parent.parent.name}-{P.now()}"
-    out.mkdir()
-    request = B.load(job["request"])
-    request["workers"] = workers
-    request["output_directory"] = str(out / "capture")
-    request_path = out / "receiver-request.json"
-    B.atomic_json(request_path, request)
-    environment = {k: v for k, v in os.environ.items() if k not in ("STWO_ZIG_RV64_SETUP_CACHE", "STWO_RV64_OUTER_PLAN_CLASS_STORE")}
-    environment = R.receiver_environment(environment, out / "gpu-disabled")
-    environment = P.format_environment(environment, plan)
-    environment["STWO_RV64_FOLD_CLASS_CACHE"] = "0"
-    receiver = Path(plan["assets"]["recursive_receiver"])
-    before = {str(p.relative_to(proof)): P.sha(p) for p in sorted(proof.rglob("*")) if p.is_file()}
-    command = ["nice", "-n", "10", *B.command(receiver, plan["profile"], "verify-recursion-candidate", request_path, proof,
-                                               job["resources"]["fixed_setup_bytes"], 32 << 30)]
-    usage = B.measure(command, out, "strict-receiver", environment, cwd=plan["producer_cwd"])
-    verdict = {"block": block, "proof": str(proof), "status": "rejected", "accepted": False, "receiver_sha256": P.sha(receiver),
-               "process": usage, "directory": str(out),
-               "isolation": {"CUDA_VISIBLE_DEVICES": "", "STWO_RV64_GPU_PCS_HELPER": "/bin/false",
-                             "STWO_ZIG_RV64_SETUP_CACHE": "unset", "STWO_RV64_OUTER_PLAN_CLASS_STORE": "unset",
-                             "STWO_RV64_FOLD_CLASS_CACHE": "0"}}
-    try:
-        if usage.get("exit_code") != 0:
-            raise ValueError(f"receiver exit {usage.get('exit_code')}")
-        received = B.load(out / "strict-receiver.stdout")
-        R.check_trial(report, received["native"], job, plan["profile"])
-        if received.get("accepted") is not True or received.get("completed_ethereum_block") is not True:
-            raise ValueError("fresh recursive receiver rejected the complete statement")
-        R.check_recursive_report(received["recursive"], count, restored=True)
-        after = {str(p.relative_to(proof)): P.sha(p) for p in sorted(proof.rglob("*")) if p.is_file()}
-        if after != before:
-            raise ValueError("receiver changed producer artifacts")
-        verdict.update(status="accepted", accepted=True)
-    except Exception as error:
-        verdict["error"] = repr(error)
-    return verdict
-
-
-def receive_run(run, which="all", workers=16):
-    """Fresh CPU-only receivers while the ArtifactStore directory is DELETED (moved out of reach)."""
-    run = Path(run)
-    receipt = B.load(run / "receipt.json")
-    plan = B.load(run / "plan.json")
-    store = plan.get("store", {}).get("directory")
-    quarantine = None
-    if store and Path(store).exists():
-        quarantine = Path(str(store) + f".quarantine-{P.now()}")
-        Path(store).rename(quarantine)
-    try:
-        if store and Path(store).exists():
-            raise SystemExit("store still visible to the receiver")
-        verdicts = []
-        for entry in receipt["requests"]:
-            if "error" in entry or (which == "first" and entry["trial"] != 0):
-                continue
-            verdict = receive_one(plan, entry["block"], Path(entry["proof"]), run, workers)
-            verdict["trial"] = entry["trial"]
-            verdict["store_present_during_receive"] = bool(store and Path(store).exists())
-            verdicts.append(verdict)
-            print(json.dumps({k: verdict[k] for k in ("block", "trial", "status")} | {"wall_s": round(verdict["process"]["wall_ns"] / 1e9, 1)}))
-    finally:
-        if quarantine is not None:
-            quarantine.rename(store)
-    receipt["receivers"] = verdicts
-    receipt["all_received"] = bool(verdicts) and all(v["accepted"] for v in verdicts)
-    B.atomic_json(run / "receipt.json", receipt)
-    return verdicts
 
 
 # ----------------------------------------------------------------------------- catalogue gate
@@ -746,6 +743,8 @@ def main():
     s.add_argument("--allow-block", type=int, action="append", default=[],
                    help="explicit owner opt-in for one non-development block (e.g. 26235159): one block per service, --repeat <= 2")
     s.add_argument("--recursion-max-pending-authorities", type=int, help="source queue admission floor; 4logical lanes atarity4 require21 (2lanes require17)")
+    s.add_argument("--grouped-service-recursion", action="store_true",
+                   help="prove the ordered ADD/SHA/ARITH triple in one recursion leaf")
     s.add_argument("--coalesce-truth-families", action="store_true", help="opt-in non-Keccak family coalescing; preserves bounded Keccak shards")
     s.add_argument("--security-profile", choices=("conjectured128_b2_q108_p20_fold4", "d2_native_b4_q54_p20_fold4"), help="explicit opt-in native profile; preserves template default when absent")
     s.add_argument("--stream", default="m4-resident")
@@ -769,6 +768,9 @@ def main():
         if action.dest in ("help",):
             continue
         d._add_action(action)
+    d.add_argument("--live", action="store_true", help="single GPU, empty READY service, publish each pinned block ticket on arrival")
+    d.add_argument("--guest-execution", choices=("cpu", "cuda"), default="cpu",
+                   help="guest execution source for the installed native live service")
     d.add_argument("--request-timeout", type=float, help="bounded correctness diagnostic only; kill producer group and close guard on timeout")
     d.add_argument("--process-budget-guard", help="physical CUDA reservation executable; held under same GPU lease through driver exit")
     d.add_argument("--gap", type=float, default=0.0, help="idle seconds between requests")
