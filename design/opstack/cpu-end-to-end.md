@@ -1,5 +1,18 @@
 # CPU proof latency across Ethereum and OP Stack
 
+## Main-branch CPU execution roots on 24 November
+
+One run per profile and block on the 18-core M5 Max. The native and recursive executables were built in ReleaseFast from `9fac7e741`. Each profile wrapped the same native bundle for that block. Time to root includes native production and recursion. The independent receiver ran afterward, checked the pinned 43-byte execution output and restored every leaf and fold. The native profile was `d2_native_b4_q54_p20_fold4`. The receiver reports `security_qualified=false`.
+
+| Block | Steps | CPU + service proofs | Native s | Default recursion s | Default to root s | Fresh verify s | Mixed recursion s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| OP Mainnet 120,794,432 | 923,894 | 1 + 1 | 7.90 | 17.70 | 25.60 | 2.64 | 18.76 |
+| OP Mainnet 121,049,889 | 5,501,937 | 6 + 5 | 30.19 | 154.29 | 184.49 | 12.22 | 155.41 |
+| Mantle 103,132,217 | 3,237,854 | 4 + 2 | 17.07 | 62.67 | 79.74 | 6.03 | 78.07 |
+| OP Mainnet 121,135,704 | 15,340,173 | 4 + 4 | 67.00 | 125.16 | 192.16 | 13.57 | 108.75 |
+
+The direct-products profile saved 15.40 s of recursion on the Mantle deposit. The mixed profile saved 16.41 s on the 15.34M-step OP block. Shard geometry matters for comparison across blocks. The 5.50M-step block produced eleven leaves and four folds, while the 15.34M-step block produced eight leaves and three folds. These are CPU execution-statement measurements. OP anchored derivation, Mantle derivation and on-chain settlement have separate acceptance gates.
+
 ## Current full-block results
 
 These complete CPU measurements include native production, recursion and a
