@@ -51,6 +51,8 @@ def clean_environment(environment):
 
 def arm_environment(preset, arm, assets):
     result = dict(preset['common'], **preset['arms'][arm])
+    if arm == 'baseline':
+        result.setdefault('STWO_RV64_M8_GPU_NATIVE', '0')  # Frozen comparison arm.
     substitutions = dict(assets, library_dir=str(Path(assets['library']).parent))
     return {key: value.format(**substitutions) for key, value in result.items()}
 
@@ -149,14 +151,18 @@ def validate_manifest(manifest):
         raise RuntimeError('canonical source changed after freeze')
 
 
-def command(manifest, arm, round_index, run_root, profile, label="one-stack"):
+def command(manifest, arm, round_index, run_root, profile, label="one-stack", *, live_blocks=None):
     root = Path(manifest['source_root'])
     assets = manifest['assets']
     preset = manifest['preset']
     tag = f'{label}-{round_index:02d}-{arm}'
-    argv = [sys.executable, str(root / 'scripts/rv64/rv64_m4_resident.py'), 'daemon', str(manifest['block']),
-            '--stream', run_root, '--build-stream', run_root, '--repeat', '2', '--store', 'none',
-            '--receive', 'none', '--security-profile', preset['security_profile'],
+    live = live_blocks is not None
+    if live and (manifest.get('gpus') != 1 or not live_blocks or len(set(live_blocks)) != len(live_blocks)):
+        raise ValueError('live basket requires one GPU and distinct blocks')
+    blocks = live_blocks if live else [manifest['block']]
+    argv = [sys.executable, str(root / 'scripts/rv64/rv64_m4_resident.py'), 'daemon', *map(str, blocks),
+            '--stream', run_root, '--build-stream', run_root, '--repeat', '1' if live else '2', '--store', 'none',
+            '--receive', 'all' if live else 'none', '--security-profile', preset['security_profile'],
             '--driver', assets['driver'], '--library', assets['library'], '--receiver', assets['receiver'],
             '--tag', tag, '--no-default-env', '--recursion-max-pending-authorities', str(preset['operational'][arm]['recursion_max_pending_authorities']), '--quiet-load-max', str(preset['measurement']['quiet_load_max']),
             '--quiet-steal-max', str(preset['measurement']['quiet_steal_max']), '--quiet-resource', preset['measurement'].get('quiet_resource', 'host-load'),
@@ -170,6 +176,13 @@ def command(manifest, arm, round_index, run_root, profile, label="one-stack"):
     for name in ('gpus', 'device_cap_bytes'):
         if name in manifest:
             argv += ['--' + name.replace('_', '-'), str(manifest[name])]
+    grouped = preset.get('grouped_service_recursion', False)
+    if type(grouped) is not bool:
+        raise ValueError('grouped_service_recursion must be a boolean')
+    if grouped:
+        if not live or manifest.get('guest_execution') != 'cuda':
+            raise ValueError('grouped service recursion requires live GPU guest execution')
+        argv.append('--grouped-service-recursion')
     if preset.get('coalesce_truth_families', True):
         argv.append('--coalesce-truth-families')
     if manifest.get('allowed_block'):
@@ -180,7 +193,13 @@ def command(manifest, arm, round_index, run_root, profile, label="one-stack"):
         argv.append('--nsys')
         if preset['measurement'].get('nsys_root'):
             argv += ['--nsys-root', preset['measurement']['nsys_root']]
-    for key, value in sorted(arm_environment(preset, arm, assets).items()):
+    environment = arm_environment(preset, arm, assets)
+    if live:
+        argv.append('--live')
+        if manifest.get('guest_execution') == 'cuda':
+            argv.extend(['--guest-execution', 'cuda'])
+        environment['CUDA_VISIBLE_DEVICES'] = '0'
+    for key, value in sorted(environment.items()):
         argv += ['--env', f'{key}={value}']
     return argv, tag
 

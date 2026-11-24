@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """RV64 M8 15-block benchmark: one command, the M3 basket, the final M8 path.
 
-Seed of the post-M8 repeatable benchmark set (`bench --tier smoke|dev|basket`).
-It drives the canonical interleaved runner's service command
-(`rv64_m7_integration_stack.command`, the same one `rv64_gate.py` uses), so
-every arm runs the frozen preset's `baseline` environment plus an arm overlay
-of `STWO_RV64_M8_*` flags. Nothing here changes a proof byte.
+Runs the live recursive service or compares pinned benchmark arms.
 
 Subcommands (run on the pod from /workspace/m3/src/<stream>, never wrapped in
 `flock gpu.lock`: the harness takes the GPU lock per service itself):
@@ -15,10 +11,10 @@ Subcommands (run on the pod from /workspace/m3/src/<stream>, never wrapped in
             report anything missing and how to regenerate it; no GPU
   estimate  wall-time estimate per arm [E]; no GPU
   run       the benchmark (or --smoke: one small block, short GPU use)
+  live      one empty-start single-GPU service for the maintained guest basket
   report    rebuild bench15.json + bench15.md from the per-block receipts
 
-Per block, in ascending M3 request time, stopping on the first failure
-(owner rule: never loop the basket blind; scale one block at a time):
+The comparison runner stops at the first failure:
 
   1. headline services, interleaved over arms (A B C A B C ...), each a fresh
      `combined-serve` with a cold and a warm request, quiet gate enforced;
@@ -55,6 +51,7 @@ ROOT = HERE.parent
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from scripts.rv64 import rv64_m7_integration_stack as stack  # noqa: E402
 from scripts.rv64.rv64_validation import frozen_parity, validate_assets, validate_receivers, validate_library_environment, FROZEN_D2_PACKAGE as GOLDEN  # noqa: E402
+from scripts.rv64.rv64_m8_bench15_lib.presentation import markdown
 from scripts.rv64.rv64_m8_bench15_lib.metrics import (
     fields,
     split_requests,
@@ -211,85 +208,6 @@ def aggregate(blocks, arms, rows):
     failed = {arm: [b['block'] for b in result['blocks'] if arm in (b.get('arm_failures') or {})] for arm in arms}
     result['arm_failures'] = {arm: blocks for arm, blocks in failed.items() if blocks}
     return result
-
-
-def fmt(value, digits=1):
-    return '-' if value is None else f'{value:.{digits}f}'
-
-
-def markdown(result):
-    """Short tables: warm/cold proving per arm next to M3/M7, then the warm critical path per arm."""
-    arms = result['arms']
-    config = result.get('config', {})
-    lines = ['# RV64 M8 15-block benchmark', '',
-             'proving = service request wall incl. witness generation, excl. fetch/submit. Warm/cold = median over headline services [M].',
-             'M3 = one request per block (`rv64-m3-20261104`) [M]; M7 = default warm where measured [M].', '',
-             f"Selected GPUs: {config.get('gpus', DEVICES)}; logical cap per device: {config.get('device_cap_bytes', 28 << 30)} bytes. Admission alone establishes neither measured peak nor 5090 fit.", '',
-             '| block | Minstr | seg | M3 s | M7 s | ' + ' | '.join(f'{a} warm / cold s' for a in arms) + ' | status |',
-             '|---|---:|---:|---:|---:|' + '---:|' * len(arms) + '---|']
-    for b in result['blocks']:
-        m7 = b['m7'] or {}
-        m7s = m7.get('warm_proving_s') or m7.get('cold_proving_s')
-        cells = []
-        for a in arms:
-            arm = b['arms'].get(a)
-            if a in (b.get('arm_failures') or {}):
-                cells.append('FAIL')
-            elif arm and arm['warm']['proving_s'] is not None:
-                cells.append(f"{fmt(arm['warm']['proving_s'], 2)} / {fmt(arm['cold']['proving_s'], 2)}")
-            else:
-                cells.append('-')
-        lines.append(f"| {b['block']} | {b['instructions'] / 1e6:.1f} | {b['cpu_segments']} | {fmt(b['m3_request_s'])} | "
-                     f"{fmt(m7s)}{' (cold)' if m7 and not m7.get('warm_proving_s') else ''} | " + ' | '.join(cells) + f" | {b['status']} |")
-    if result['totals']:
-        lines += ['', '| arm | blocks | warm sum s | cold sum s | M3 sum s (same blocks) | warm / M3 [D] |', '|---|---:|---:|---:|---:|---:|']
-        for a, t in result['totals'].items():
-            lines.append(f"| {a} | {t['blocks']} | {t['warm_proving_s_sum']:.1f} | {t['cold_proving_s_sum']:.1f} | {t['m3_request_s_sum_same_blocks']:.1f} | {t['warm_over_m3']:.3f} |")
-        lines += ['', '| arm | warm p50 / p90 / max s | cold p50 / p90 / max s | warm request p50 / p90 / max s |', '|---|---:|---:|---:|']
-        q = lambda d: '-' if not d else f"{d['p50']:.2f} / {d['p90']:.2f} / {d['max']:.2f}"
-        for a, t in result['totals'].items():
-            lines.append(f"| {a} | {q(t.get('warm_proving_s'))} | {q(t.get('cold_proving_s'))} | {q(t.get('warm_request_s'))} |")
-    failures = []
-    for b in result['blocks']:
-        if b['status'] == 'failed':
-            failures.append(f"- {b['block']} FAILED: `{b.get('error')}`")
-        for a, failure in (b.get('arm_failures') or {}).items():
-            failures.append(f"- {b['block']} {a} FAILED ({failure.get('kind')}): `{failure.get('reason')}`")
-    if failures:
-        lines += ['', '## Failures', ''] + failures
-    lines += ['', '## Warm critical path per arm', '',
-              '| block | arm | warm request s | capture | setup | native window | recursion after native | tail [D] | kernel GPU-s | GPU busy [D] | device peak GB | per-node peak GB | launches/node | syncs/node |',
-              '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|']
-    for b in result['blocks']:
-        for a in arms:
-            arm = b['arms'].get(a)
-            if not arm or arm['warm']['proving_s'] is None:
-                continue
-            w, p = arm['warm'], arm.get('profile_warm') or {}
-            launches = arm.get('job_launches_per_node', p.get('launches_per_node'))
-            syncs = arm.get('job_syncs_per_node', p.get('syncs_per_node'))
-            peak = arm.get('per_node_peak_bytes')
-            device = arm.get('device_peak_bytes_sampled')
-            lines.append(f"| {b['block']} | {a} | {fmt(w['request_s'], 2)} | {fmt(w['capture_s'], 2)} | {fmt(w['setup_s'], 2)} | {fmt(w['native_window_s'], 2)} | "
-                         f"{fmt(w['recursion_after_native_s'], 2)} | {fmt(w['tail_s'], 2)} | {fmt(p.get('kernel_gpu_s'), 2)} | "
-                         f"{fmt(p.get('gpu_busy') and p['gpu_busy'] * 100, 0)}{'%' if p.get('gpu_busy') else ''} | "
-                         f"{fmt(device and device / 1e9, 1)} | {fmt(peak and peak / 1e9, 1)} | {fmt(launches, 0)} | {fmt(syncs, 1)} |")
-    verified = [(block['block'], name, trial) for block in result['blocks']
-                for name, arm in block['arms'].items() for trial in arm.get('verified_requests', [])]
-    if verified:
-        lines += ['', '## Timed requests with fresh CPU verification', '',
-                  'Only retained proofs appear here. Startup is charged once to the first request. Totals sum the observed phases for the same proof.', '',
-                  '| block | arm | round | trial | service startup s | request s | verify s | request and verify s | first request incl. startup s |',
-                  '|---|---|---:|---:|---:|---:|---:|---:|---:|']
-        for block, arm, trial in verified:
-            lines.append(f"| {block} | {arm} | {trial['round'] + 1} | {trial['trial']} | "
-                         f"{fmt(trial['service_start_s'], 2)} | {fmt(trial['request_s'], 2)} | {fmt(trial['verify_s'], 2)} | "
-                         f"{fmt(trial['request_and_verify_s'], 2)} | {fmt(trial['startup_request_and_verify_s'], 2)} |")
-    lines += ['', 'launches/syncs per node: job receipts (`GPU_M8_OUTER_NODE launches/host_waits`) where the arm runs OuterNodeJobs [M], '
-              'else Nsight `cudaLaunchKernel`/`cudaStreamSynchronize` in the profiled warm window / nodes [D]. '
-              'device peak: NVML-sampled max used bytes over selected GPUs in the headline services [M]. '
-              'per-node peak: job arena peak words x 4 B [D]. GPU busy: CUPTI kernel union / (selected GPU count x profiled window) [D].', '']
-    return '\n'.join(lines)
 
 
 # ----------------------------------------------------------------------------- estimate (pure)
@@ -766,6 +684,79 @@ def report_files(out, arms):
     return result
 
 
+def live_basket(args):
+    from scripts.rv64.rv64_live_service import accepted_run, pin_workload, prepare_inputs
+    stream = ROOT.name
+    if ROOT.resolve() != (M3 / 'src' / stream).resolve():
+        raise SystemExit('run live from the synced source under RV64_M3_ROOT/src/<stream>')
+    assets = load_assets(args.assets)
+    paths, pins = assets['assets'], assets['asset_sha256']
+    preset = load(args.preset)
+    rows = selected_blocks(args.blocks)
+    blocks = args.blocks or [row['block'] for row in rows]
+    if len(set(blocks)) != len(blocks):
+        raise ValueError('duplicate live block')
+    if args.guest_elf and not args.guest_request:
+        raise ValueError('--guest-elf requires its qualified --guest-request')
+    args.out = args.out.resolve()
+    args.out.mkdir(parents=True, exist_ok=False)
+    census = load(args.workload)
+    service_root = M3.resolve()
+    if args.guest_request:
+        service_root = args.out / 'service'
+        workload = prepare_inputs(service_root, M3, blocks, args.guest_request, args.guest_elf, census,
+                                  guest_execution=args.guest_execution)
+    else:
+        workload = pin_workload(service_root / 'inputs', blocks, census, guest_execution=args.guest_execution)
+    # An oversized service family must split into the roster's bounded consecutive spans.
+    overlay = arm_environment('gpu-native', paths)
+    overlay.update(STWO_RV64_M8_TRUTH_SPLIT='1', STWO_RV64_M8_OUTER_CLASS_PLAN='1')
+    overlay.update(extra_environment(args.env))
+    environment = {**stack.arm_environment(preset, 'baseline', paths), **overlay}
+    if environment['STWO_RV64_M8_GPU_NATIVE'] != '1' or 'STWO_RV64_GPU_HOST_RETAINED' in environment:
+        raise ValueError('live benchmark requires the GPU-native scheduler and device-resident proofs')
+    validate_service_environment(environment, paths, pins)
+    manifest = dict(source_root=str(ROOT), assets=paths, preset=preset, gpus=1, device_cap_bytes=args.device_cap_bytes,
+                    guest_execution=args.guest_execution)
+    cmd, tag = stack.command(manifest, 'baseline', 0, stream, False, f'live-{time.time_ns()}', live_blocks=blocks)
+    cmd.extend(['--quiet-mode', args.quiet_mode, '--receiver-workers', str(args.receiver_workers)])
+    for key, value in sorted(overlay.items()):
+        cmd.extend(['--env', f'{key}={value}'])
+    run = service_root / 'runs' / stream / f'daemon-{"-".join(map(str, blocks))}-r1-{tag}'
+    config = dict(argv=cmd, run=str(run), service_root=str(service_root), source_commit=assets['source_commit'],
+                  workload_sha256=stack.sha(args.workload), workload=workload, assets=pins, preset_sha256=stack.sha(args.preset),
+                  guest_execution=args.guest_execution,
+                  guest_request_sha256=stack.sha(args.guest_request) if args.guest_request else None)
+    atomic(args.out / 'config.json', config)
+    if args.prepare_only:
+        print(json.dumps({'status': 'PREFLIGHT_PASSED', 'blocks': len(blocks), 'service_root': str(service_root)}))
+        return
+    hardware = subprocess.check_output(
+        ['nvidia-smi', '-i', '0', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'],
+        timeout=10, text=True).strip()
+    name, memory_mib = hardware.rsplit(',', 1)
+    config['gpu'] = dict(name=name.strip(), memory_mib=int(memory_mib))
+    atomic(args.out / 'config.json', config)
+    with (args.out / 'service.log').open('w') as log:
+        subprocess.run(cmd, cwd=ROOT, env=dict(stack.clean_environment(os.environ), RV64_M3_ROOT=str(service_root)),
+                       stdout=log, stderr=subprocess.STDOUT, check=True)
+    validate_assets(paths, pins)
+    if pin_workload(service_root / 'inputs', blocks, load(args.workload), guest_execution=args.guest_execution) != workload:
+        raise RuntimeError('live workload changed during the run')
+    result = accepted_run(run, blocks, pins, args.quiet_mode == 'enforce', require_native=True,
+                          guest_census=census if args.guest_execution == 'cuda' else None)
+    result['gpu'] = config['gpu']
+    atomic(args.out / 'live.json', result)
+    if args.compare_cpu:
+        from scripts.rv64.rv64_live_service import compare_cpu
+        result['comparison'] = compare_cpu(run, result, args.out / 'cpu', args.receiver_workers)
+        validate_assets(paths, pins)
+        if pin_workload(service_root / 'inputs', blocks, load(args.workload), guest_execution=args.guest_execution) != workload:
+            raise RuntimeError('live workload changed during the CPU comparison')
+        atomic(args.out / 'live.json', result)
+    print(json.dumps(result, indent=1))
+
+
 def arms_type(text):
     arms = [a for a in text.split(',') if a]
     for arm in arms:
@@ -818,6 +809,22 @@ def main():
                    help='explicit common arm override, e.g. STWO_RV64_M8_TRUTH_SPLIT=1; pinned for resume')
     r.add_argument('--smoke', action='store_true', help=f'one round on {SMOKE_BLOCK}, diagnostic quiet mode; walls unqualified')
     r.add_argument('--request-timeout', type=float, default=240)
+    live = sub.add_parser('live', help='one GPU-native service with a fresh receiver for every root')
+    live.add_argument('--assets', required=True, type=Path)
+    live.add_argument('--workload', required=True, type=Path, help='per-block maintained guest execution census JSON')
+    live.add_argument('--out', required=True, type=Path, help='new output directory')
+    live.add_argument('--guest-request', type=Path, help='qualified serving request supplying the maintained guest ABI')
+    live.add_argument('--guest-elf', type=Path, help='relocated ELF whose digest must match --guest-request')
+    live.add_argument('--guest-execution', choices=('cpu', 'cuda'), default='cuda',
+                      help='use on-demand device geometry with the installed guest executor, or the host capture control')
+    live.add_argument('--compare-cpu', action='store_true', help='after GPU qualification, prove the same basket with the CPU-only product')
+    live.add_argument('--prepare-only', action='store_true', help='validate/stage the workload without starting a GPU service')
+    live.add_argument('--preset', type=Path, default=stack.DEFAULT_PRESET)
+    live.add_argument('--device-cap-bytes', type=positive_capacity, default=28 << 30)
+    live.add_argument('--blocks', type=int, nargs='+', help='ordered subset of the 15 pinned blocks')
+    live.add_argument('--quiet-mode', choices=('enforce', 'diagnostic'), default='enforce')
+    live.add_argument('--receiver-workers', type=positive_capacity, default=16)
+    live.add_argument('--env', action='append', default=[], metavar='STWO_NAME=value')
     t = sub.add_parser('report', help='rebuild bench15.json/.md')
     t.add_argument('--out', required=True, type=Path)
     t.add_argument('--arms', type=arms_type)
@@ -829,6 +836,8 @@ def main():
             raise SystemExit(1)
     elif args.mode == 'estimate':
         print(json.dumps(estimate_walls(basket(), args.arms, args.rounds, not args.no_profile), indent=1))
+    elif args.mode == 'live':
+        live_basket(args)
     elif args.mode == 'run':
         if args.smoke:
             args.rounds = 1

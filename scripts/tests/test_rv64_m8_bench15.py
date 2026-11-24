@@ -189,6 +189,359 @@ class BasketTests(unittest.TestCase):
                 bench.extra_environment(bad)
 
 
+class LiveBasketTests(unittest.TestCase):
+    def test_maintained_overlay_reuses_the_actual_gpu_lock_and_original_block_bytes(self):
+        from scripts.rv64.rv64_live_service import prepare_inputs, pin_workload
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'assets'
+            for directory in ('locks', 'src', 'build', 'catalogues-v3', 'inputs/requests'):
+                (root / directory).mkdir(parents=True)
+            (root / 'locks/gpu.lock').write_bytes(b'')
+            for name in ('accepted-v7.json', 'source-authority.json'):
+                (root / 'inputs' / name).write_text('{}')
+            old_elf, new_elf, data = root/'old.elf', root/'new.elf', root/'10.bin'
+            old_elf.write_bytes(b'original'); new_elf.write_bytes(b'updated'); data.write_bytes(b'block')
+            digest = bench.stack.sha(data)
+            old = dict(elf=str(old_elf), elf_sha256=bench.stack.sha(old_elf), input=str(data),
+                       input_sha256=digest, expected_output='01', symbols={'heap': 20})
+            request_path = root/'inputs/requests/10.json'
+            request_path.write_text(json.dumps(old))
+            job = dict(block=10, expected_output='01', input_sha256=digest, segments=9)
+            plan_path = root/'inputs/plan-template.json'
+            plan_path.write_text(json.dumps({'jobs': [job]}))
+            common = root/'guest.json'
+            common.write_text(json.dumps(dict(old, elf='/former/guest.elf',
+                                             elf_sha256=bench.stack.sha(new_elf), symbols={'heap': 101}, terminal_pc=444,
+                                             execution_profile='ethereum_services_v3', batch_steps=64)))
+            pin = {'10': dict(elf_sha256=bench.stack.sha(new_elf), input_sha256=digest, output='01', instructions=100, cpu_segments=2)}
+            work = Path(tmp)/'work'
+            prepare_inputs(work, root, [10], common, new_elf, pin)
+            self.assertTrue((work/'locks/gpu.lock').samefile(root/'locks/gpu.lock'))
+            self.assertTrue((work/'inputs/guest.elf').samefile(new_elf))
+            self.assertEqual(pin_workload(work/'inputs', [10], pin)[10]['cpu_segments'], 2)
+            staged = json.loads((work/'inputs/requests/10.json').read_text())
+            self.assertEqual(staged['symbols'], {'heap': 101})
+            self.assertEqual(json.loads(request_path.read_text()), old)
+            self.assertEqual(json.loads(plan_path.read_text())['jobs'], [job])
+            self.assertEqual(staged['terminal_pc'], 444)
+            epilogue = {'10': dict(pin['10'], instructions=64, terminal_instructions=65)}
+            prepared = prepare_inputs(Path(tmp)/'epilogue', root, [10], common, new_elf, epilogue)
+            self.assertEqual(prepared[10]['cpu_segments'], 2)
+            replay = root / 'replay-only.json'
+            replay.write_text(json.dumps({k: v for k, v in json.loads(common.read_text()).items() if k != 'terminal_pc'}))
+            with self.assertRaisesRegex(ValueError, 'terminal PC'):
+                prepare_inputs(Path(tmp)/'replay', root, [10], replay, new_elf, pin)
+            with self.assertRaises(ValueError):
+                prepare_inputs(Path(tmp)/'bad', root, [10], common, old_elf, pin)
+            with self.assertRaises(ValueError):
+                prepare_inputs(Path(tmp)/'wrong', root, [10], common, new_elf, {'10': dict(pin['10'], output='00')})
+            (root/'locks/gpu.lock').unlink()
+            (root/'locks').rmdir()
+            with self.assertRaises(FileNotFoundError):
+                prepare_inputs(Path(tmp)/'unlocked', root, [10], common, new_elf, pin)
+
+    def test_workload_rejects_stale_guest_geometry_and_output(self):
+        from scripts.rv64.rv64_live_service import pin_workload
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = Path(tmp)
+            (inputs / 'requests').mkdir()
+            elf, data = inputs / 'guest.elf', inputs / '10.bin'
+            elf.write_bytes(b'guest')
+            data.write_bytes(b'block')
+            e, i = bench.stack.sha(elf), bench.stack.sha(data)
+            pin = {'10': {'cpu_segments': 2, 'input_sha256': i, 'elf_sha256': e, 'output': '01'}}
+            req = dict(elf=str(elf), input=str(data), elf_sha256=e, input_sha256=i, expected_output='01')
+            (inputs / 'requests/10.json').write_text(json.dumps(req))
+            job = dict(block=10, segments=2, input_sha256=i, expected_output='01')
+            (inputs / 'plan-template.json').write_text(json.dumps({'jobs': [job]}))
+            self.assertEqual(pin_workload(inputs, [10], pin)[10]['cpu_segments'], 2)
+            req['execution_profile'] = 'ethereum_services_v3_zbb'
+            (inputs / 'requests/10.json').write_text(json.dumps(req))
+            with self.assertRaisesRegex(ValueError, 'authenticated CUDA guest profile'):
+                pin_workload(inputs, [10], pin, guest_execution='cuda')
+            req['execution_profile'] = 'ethereum_services_v3'
+            (inputs / 'requests/10.json').write_text(json.dumps(req))
+            self.assertEqual(pin_workload(inputs, [10], pin, guest_execution='cuda')[10]['cpu_segments'], 2)
+            for key, value in [('cpu_segments', 3), ('elf_sha256', 'x'), ('output', '02')]:
+                with self.subTest(key=key), self.assertRaises(ValueError):
+                    pin_workload(inputs, [10], {'10': dict(pin['10'], **{key: value})})
+            data.write_bytes(b'substitution')
+            with self.assertRaises(ValueError):
+                pin_workload(inputs, [10], pin)
+
+    def test_live_receipt_accounts_for_all_distinct_roots_and_inter_request_gaps(self):
+        from scripts.rv64.rv64_live_service import accepted_run
+        from scripts.rv64.rv64_validation import proof_artifact_binding
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            manifest = dict(schema='rv64-ethereum-live-service/v1', blocks={}, execution_order=[])
+            (run / 'manifest.json').write_text(json.dumps(manifest))
+            pins = {name: 'a' * 64 for name in ('library', 'driver', 'receiver')}
+            blocks = [10, 11]
+            live = dict(preinstalled_blocks=0, distinct_blocks=2, qualified_latency=False, producer_pid=123)
+            receipt = dict(service_ready_record=dict(live_admission=True, pid=123), live_service=live,
+                           producer_process=dict(exit_code=0), assets=pins, repeat=1, blocks=blocks,
+                           environment={'CUDA_VISIBLE_DEVICES': '0'}, service_start_s=1, service_stop_s=2,
+                           requests=[], receivers=[])
+            for index, block in enumerate(blocks):
+                proof = str(run / 'out' / str(index) / str(block) / 'proof')
+                root = Path(proof) / 'recursion-om31/root.proof'
+                root.parent.mkdir(parents=True)
+                root.write_bytes(f'proof-{block}'.encode())
+                receipt['requests'].append(dict(block=block, proof=proof, ordinal=index, trial=0,
+                    output_matches_pin=True, proof_bytes_root=123, client_latency_ns=2_000_000_000,
+                    marker={'request_wall_ns': 1_999_000_000}))
+                isolation = {'CUDA_VISIBLE_DEVICES': '', 'STWO_RV64_GPU_PCS_HELPER': '/bin/false',
+                             'STWO_ZIG_RV64_SETUP_CACHE': 'unset', 'STWO_RV64_OUTER_PLAN_CLASS_STORE': 'unset',
+                             'STWO_RV64_FOLD_CLASS_CACHE': '0'}
+                receipt['receivers'].append(dict(proof=proof, accepted=True, status='accepted', receiver_sha256=pins['receiver'],
+                    process=dict(exit_code=0, wall_ns=5_000_000_000), store_present_during_receive=False,
+                    isolation=isolation, artifact_binding=proof_artifact_binding(proof)))
+                (run / f'submission-{index:04d}.json').write_text(json.dumps(dict(block=block, submitted_monotonic_ns=4_000_000_001+3_000_000_000*index)))
+            path = run / 'receipt.json'
+            path.write_text(json.dumps(receipt))
+            report = accepted_run(run, blocks, pins, False)
+            self.assertEqual(report['first_ticket_to_last_root_s'], 5)
+            self.assertEqual(report['ticket_to_root_s_sum'], 4)
+            self.assertEqual(report['ticket_to_root_mean_s'], 2)
+            self.assertEqual(report['proving_mean_s'], 1.999)
+            self.assertEqual(report['fresh_verify_mean_s'], 5)
+            self.assertNotIn('launch_to_first_root_s', report)
+            root.write_bytes(b'replacement root')
+            with self.assertRaisesRegex(RuntimeError, 'different proof content'):
+                accepted_run(run, blocks, pins, False)
+            root.write_bytes(f'proof-{blocks[-1]}'.encode())
+            old_binding = receipt['receivers'][0].pop('artifact_binding')
+            path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(RuntimeError, 'proof content binding is missing'):
+                accepted_run(run, blocks, pins, False)
+            receipt['receivers'][0]['artifact_binding'] = old_binding
+            path.write_text(json.dumps(receipt))
+            clock_file = run / 'service-ready-clock.json'
+            clock = dict(pid=123, launch_monotonic_ns=1, observed_ready_monotonic_ns=1_000_000_001)
+            clock_file.write_text(json.dumps(clock))
+            measured = accepted_run(run, blocks, pins, False)
+            self.assertEqual(measured['ready_to_first_ticket_s'], 3)
+            self.assertEqual(measured['launch_to_first_root_s'], 6)
+            self.assertEqual(measured['launch_to_last_root_s'], 9)
+            clock_file.write_text(json.dumps(dict(clock, pid=1)))
+            with self.assertRaisesRegex(ValueError, 'service clock'):
+                accepted_run(run, blocks, pins, False)
+            clock_file.unlink()
+            self.assertEqual([row['fresh_verify_s'] for row in report['requests']], [5, 5])
+            with self.assertRaises(ValueError):
+                accepted_run(run, blocks[::-1], pins, False)
+            with self.assertRaises(ValueError):
+                accepted_run(run, blocks, pins, True)
+            (run / 'manifest.json').write_text(json.dumps(dict(manifest, warm_order=[10])))
+            with self.assertRaises(ValueError):
+                accepted_run(run, blocks, pins, False)
+            (run / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'GPU-native service'):
+                accepted_run(run, blocks, pins, False, require_native=True)
+            native_manifest = dict(schema='rv64-ethereum-basket-inputs/v1', execution_order=blocks,
+                                   blocks={str(block): {} for block in blocks})
+            (run / 'manifest.json').write_text(json.dumps(native_manifest))
+            receipt['service_ready_record'] = dict(runtime='m8-gpu-native', pid=123)
+            receipt['environment']['STWO_RV64_M8_GPU_NATIVE'] = '1'
+            live['preinstalled_blocks'] = len(blocks)
+            path.write_text(json.dumps(receipt))
+            for index, request in enumerate(receipt['requests']):
+                folder = Path(request['proof']).parents[1]
+                folder.mkdir(parents=True, exist_ok=True)
+                native = dict(schema='rv64-m8-gpu-native-request/v1', block=request['block'],
+                              sequence=index, request_wall_ns=request['marker']['request_wall_ns'], proofs=15,
+                              receipt=dict(host_waits=1, d2h=1, d2h_bytes=199, capture_wait_ns=5,
+                                           device_gpu_us=[1_500_000, 0, 0, 0]))
+                (folder / 'm8-jobs.json').write_text(json.dumps(native))
+            accepted = accepted_run(run, blocks, pins, False, require_native=True)
+            self.assertEqual(accepted['preinstalled_blocks'], 2)
+            self.assertEqual([row['device_gpu_s'] for row in accepted['requests']], [1.5, 1.5])
+            native_manifest['resources'] = {'guest_execution': 'cuda'}
+            (run / 'manifest.json').write_text(json.dumps(native_manifest))
+            census = {str(block): {'instructions': 11, 'cpu_segments': 1} for block in blocks}
+            with self.assertRaisesRegex(ValueError, 'verified retirements'):
+                accepted_run(run, blocks, pins, False, require_native=True, guest_census=census)
+            for request, receiver in zip(receipt['requests'], receipt['receivers']):
+                receiver['verified_total_steps'] = 12
+                job = Path(request['proof']).parents[1] / 'm8-jobs.json'
+                native = json.loads(job.read_text())
+                native['guest'] = dict(mode='cuda_staged', retirements=12, launches=1,
+                                       trace_readback_bytes=240, state_readback_bytes=416,
+                                       device_allocated_bytes=8192, device_us=5, compact_d2d_bytes=576)
+                job.write_text(json.dumps(native))
+            path.write_text(json.dumps(receipt))
+            measured = accepted_run(run, blocks, pins, False, require_native=True, guest_census=census)
+            self.assertIn('staged trace ingress', measured['backend'])
+            self.assertEqual([row['guest']['retirements'] for row in measured['requests']], [12, 12])
+            self.assertEqual([row['census_instructions'] for row in measured['requests']], [11, 11])
+            receipt['live_service']['qualified_latency'] = True
+            path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, 'proofless device geometry setup'):
+                accepted_run(run, blocks, pins, True, require_native=True, guest_census=census)
+            ready = receipt['service_ready_record']
+            ready['setup_mode'] = 'device_geometry'
+            path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, 'on-demand proofless device geometry setup'):
+                accepted_run(run, blocks, pins, True, require_native=True, guest_census=census)
+            live['preinstalled_blocks'] = ready['preinstalled_blocks'] = 0
+            path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, 'measured block admission'):
+                accepted_run(run, blocks, pins, True, require_native=True, guest_census=census)
+            for request in receipt['requests']:
+                job = Path(request['proof']).parents[1] / 'm8-jobs.json'
+                native = json.loads(job.read_text())
+                native['admission_ns'] = 3
+                job.write_text(json.dumps(native))
+            with self.assertRaisesRegex(ValueError, 'requires resident guest ingress'):
+                accepted_run(run, blocks, pins, True, require_native=True, guest_census=census)
+            receipt['live_service']['qualified_latency'] = False
+            path.write_text(json.dumps(receipt))
+            for i, request in enumerate(receipt['requests']):
+                job = Path(request['proof']).parents[1] / 'm8-jobs.json'
+                native = json.loads(job.read_text())
+                native['guest'].update(mode='cuda_resident', launches=2, trace_readback_bytes=0, trace_readback_ns=0,
+                                       projection_ns=0, retired_host_metadata_bytes=0, retired_host_ls_bytes=0)
+                job.write_text(json.dumps(native))
+                if i == 0:
+                    with self.assertRaisesRegex(ValueError, 'modes changed'):
+                        accepted_run(run, blocks, pins, False, require_native=True, guest_census=census)
+            with self.assertRaisesRegex(ValueError, 'installed service clock'):
+                accepted_run(run, blocks, pins, False, require_native=True, guest_census=census)
+            clock_file.write_text(json.dumps(clock))
+            measured = accepted_run(run, blocks, pins, False, require_native=True, guest_census=census)
+            self.assertIn('resident trace ingress', measured['backend'])
+            self.assertEqual(measured['launch_to_last_root_s'], 9)
+            self.assertEqual(measured['setup_mode'], 'device_geometry')
+            self.assertEqual(measured['preinstalled_blocks'], 0)
+            self.assertEqual([row['admission_s'] for row in measured['requests']], [3e-9, 3e-9])
+            census[str(blocks[1])]['terminal_instructions'] = 13
+            with self.assertRaisesRegex(ValueError, 'verified retirements consistent'):
+                accepted_run(run, blocks, pins, False, require_native=True, guest_census=census)
+            del census[str(blocks[1])]['terminal_instructions']
+            self.assertAlmostEqual(measured['startup_amortized_proving_mean_s'],
+                                   measured['proving_mean_s'] + receipt['service_start_s'] / len(blocks))
+            receipt['receivers'][1]['verified_total_steps'] = 11
+            path.write_text(json.dumps(receipt))
+            with self.assertRaisesRegex(ValueError, 'inconsistent CUDA'):
+                accepted_run(run, blocks, pins, False, require_native=True, guest_census=census)
+            (run / 'manifest.json').write_text(json.dumps(manifest))
+            receipt['service_ready_record'] = dict(live_admission=True, pid=123)
+            live['preinstalled_blocks'] = 0
+            receipt['receivers'][1]['proof'] = receipt['receivers'][0]['proof']
+            path.write_text(json.dumps(receipt))
+            with self.assertRaises(RuntimeError):
+                accepted_run(run, blocks, pins, False)
+
+    def test_gpu_native_gate_rejects_host_and_non_attested_receipts(self):
+        from scripts.rv64.rv64_live_service import native_request_metrics
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'm8-jobs.json'
+            request = dict(block=17, proof=str(Path(tmp) / '17' / 'proof'))
+            receipt = dict(schema='rv64-m8-gpu-native-request/v1', block=17, sequence=2,
+                           request_wall_ns=9_000, proofs=6, receipt=dict(device_gpu_us=[8, 0], host_waits=1, d2h=1, d2h_bytes=10, capture_wait_ns=2))
+            path.write_text(json.dumps(receipt))
+            self.assertEqual(native_request_metrics(request, 2, 9_000)['device_gpu_s'], 8e-6)
+            for patch in [dict(schema='mixed'), dict(sequence=1), dict(proofs=0),
+                          dict(receipt=receipt['receipt'] | {'device_gpu_us': [8, 2]}),
+                          dict(receipt=receipt['receipt'] | {'host_waits': 2}),
+                          dict(receipt=receipt['receipt'] | {'d2h': 2})]:
+                with self.subTest(patch=patch), self.assertRaisesRegex(ValueError, 'single-GPU'):
+                    path.write_text(json.dumps(receipt | patch))
+                    native_request_metrics(request, 2, 9_000)
+            path.unlink()
+            with self.assertRaises(FileNotFoundError):
+                native_request_metrics(request, 2, 9_000)
+            guest = dict(mode='cuda_staged', retirements=12, launches=1, trace_readback_bytes=240,
+                         state_readback_bytes=416, device_allocated_bytes=8192, device_us=5,
+                         compact_d2d_bytes=576)
+            path.write_text(json.dumps(receipt | {'guest': guest}))
+            self.assertEqual(native_request_metrics(request, 2, 9_000, 12)['guest'], guest)
+            for executor in ('host_witness', 'cuda'):
+                path.write_text(json.dumps(receipt | {'guest': guest | {'executor': executor}}))
+                metrics = native_request_metrics(request, 2, 9_000, 12)
+                self.assertEqual(metrics['guest_execution_and_handoff_s'], 5e-6)
+                self.assertEqual('guest_device_s' in metrics, executor == 'cuda')
+            with self.assertRaisesRegex(ValueError, 'unexpected CUDA'):
+                native_request_metrics(request, 2, 9_000)
+            for bad in (None, guest | {'trace_readback_bytes': 15}, guest | {'retirements': 11},
+                        guest | {'compact_d2d_bytes': 0}):
+                path.write_text(json.dumps(receipt | {'guest': bad}))
+                with self.assertRaisesRegex(ValueError, 'inconsistent CUDA'):
+                    native_request_metrics(request, 2, 9_000, 12)
+            guest.update(mode='cuda_resident', trace_readback_bytes=0, trace_readback_ns=0,
+                         projection_ns=0, retired_host_metadata_bytes=0, retired_host_ls_bytes=0)
+            path.write_text(json.dumps(receipt | {'guest': guest}))
+            self.assertEqual(native_request_metrics(request, 2, 9_000, 12, 1)['guest'], guest)
+            with self.assertRaisesRegex(ValueError, 'inconsistent CUDA'):
+                native_request_metrics(request, 2, 9_000, 12, 2)
+            for key in ('trace_readback_bytes', 'trace_readback_ns', 'projection_ns',
+                        'retired_host_metadata_bytes', 'retired_host_ls_bytes'):
+                path.write_text(json.dumps(receipt | {'guest': guest | {key: 1}}))
+                with self.assertRaisesRegex(ValueError, 'reports host trace work'):
+                    native_request_metrics(request, 2, 9_000, 12)
+            replay = guest | dict(replayed_windows=1, retained_capture_bytes=256)
+            path.write_text(json.dumps(receipt | {'guest': replay}))
+            self.assertEqual(native_request_metrics(request, 2, 9_000, 12, 1)['guest'], replay)
+            for bad in (dict(replayed_windows=0), dict(replayed_windows=2), dict(retained_capture_bytes=191),
+                        dict(retained_capture_bytes=8193)):
+                path.write_text(json.dumps(receipt | {'guest': replay | bad}))
+                with self.assertRaisesRegex(ValueError, 'inconsistent retained CUDA'):
+                    native_request_metrics(request, 2, 9_000, 12, 1)
+
+    def test_on_demand_cuda_counts_discovery_and_only_unretained_execution(self):
+        from scripts.rv64.rv64_live_service import native_request_metrics
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'm8-jobs.json'
+            request = dict(block=17, proof=str(Path(tmp) / '17' / 'proof'))
+            report = dict(schema='rv64-m8-gpu-native-request/v1', block=17, sequence=0,
+                          request_wall_ns=9_000, admission_ns=3_000, proofs=6,
+                          receipt=dict(device_gpu_us=[8], host_waits=1, d2h=1, d2h_bytes=10, capture_wait_ns=2))
+            guest = dict(mode='cuda_resident', retirements=12, trace_readback_bytes=0, trace_readback_ns=0,
+                         projection_ns=0, retired_host_metadata_bytes=0, retired_host_ls_bytes=0,
+                         state_readback_bytes=3200, device_allocated_bytes=8192, device_us=5,
+                         compact_d2d_bytes=576)
+            for windows, retained, launches in ((0, 0, 6), (1, 96, 5), (3, 512, 3)):
+                with self.subTest(windows=windows):
+                    evidence = guest | dict(replayed_windows=windows, retained_capture_bytes=retained, launches=launches)
+                    path.write_text(json.dumps(report | {'guest': evidence}))
+                    got = native_request_metrics(request, 0, 9_000, 12, 3, on_demand=True)
+                    self.assertEqual(got['guest'], evidence)
+            retry = guest | dict(replayed_windows=3, retained_capture_bytes=512, launches=5, discovery_retry_launches=2)
+            path.write_text(json.dumps(report | {'guest': retry}))
+            self.assertEqual(native_request_metrics(request, 0, 9_000, 12, 3, on_demand=True)['guest'], retry)
+            for patch in (dict(launches=3, replayed_windows=1, retained_capture_bytes=96),
+                          dict(launches=5, replayed_windows=3, retained_capture_bytes=512, discovery_retry_launches=-2),
+                          dict(launches=6, replayed_windows=-1, retained_capture_bytes=0),
+                          dict(launches=2, replayed_windows=4, retained_capture_bytes=512),
+                          dict(launches=5, replayed_windows=1, retained_capture_bytes=15),
+                          dict(launches=6, replayed_windows=0, retained_capture_bytes=96)):
+                path.write_text(json.dumps(report | {'guest': guest | patch}))
+                with self.assertRaisesRegex(ValueError, 'inconsistent retained CUDA'):
+                    native_request_metrics(request, 0, 9_000, 12, 3, on_demand=True)
+
+    def test_command_sets_one_visible_device_and_one_service(self):
+        manifest = dict(source_root='/src', assets={k: '/bin/' + k for k in ('library', 'driver', 'receiver')},
+                        preset={'common': {'CUDA_VISIBLE_DEVICES': '0,1'}, 'arms': {'baseline': {}},
+                                'security_profile': 'test', 'operational': {'baseline': {'recursion_max_pending_authorities': 17}},
+                                'measurement': dict(quiet_load_max=1, quiet_steal_max=0, quiet_timeout_s=1, quiet_stable_samples=1)},
+                        gpus=1)
+        cmd, _ = bench.stack.command(manifest, 'baseline', 0, 'test', False, live_blocks=[12, 11])
+        self.assertEqual(cmd[2:5], ['daemon', '12', '11'])
+        self.assertIn('--live', cmd)
+        for option, expected in [('--repeat', '1'), ('--receive', 'all'), ('--gpus', '1')]:
+            self.assertEqual(cmd[cmd.index(option) + 1], expected)
+        self.assertIn('CUDA_VISIBLE_DEVICES=0', cmd)
+        self.assertNotIn('CUDA_VISIBLE_DEVICES=0,1', cmd)
+        cuda, _ = bench.stack.command(dict(manifest, guest_execution='cuda'), 'baseline', 0, 'test', False, live_blocks=[12, 11])
+        self.assertEqual(cuda[cuda.index('--guest-execution') + 1], 'cuda')
+        for bad, blocks in [(2, [11]), (1, [11, 11]), (1, [])]:
+            with self.subTest(bad=bad, blocks=blocks), self.assertRaises(ValueError):
+                bench.stack.command(dict(manifest, gpus=bad), 'baseline', 0, 'test', False, live_blocks=blocks)
+
+
 class ParsingTests(unittest.TestCase):
     def test_fields_parse_ints_floats_and_braced_lists(self):
         row = bench.fields('a=1 b=2.5 c=true d={ 1, 2 } e=-3')

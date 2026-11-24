@@ -14,6 +14,20 @@ from types import SimpleNamespace
 
 
 class GateTests(unittest.TestCase):
+    def test_live_basket_publishes_authorizations_only_after_ready(self):
+        jobs = [dict(block=n, request=f"r{n}.json", segments=3, resources={}) for n in (17, 19)]
+        plan = dict(profile="fixture", jobs=jobs, repeat=1, execution_order=[17, 19])
+        manifest, tickets = resident.live_manifest(plan)
+        self.assertEqual(({}, []), (manifest["blocks"], manifest["execution_order"]))
+        self.assertEqual({"17", "19"}, tickets.keys())
+        self.assertEqual(tickets["19"], {"request": "r19.json", "expected_cpu_segments": 3})
+        args = dict(live=True, gpus=1, warm=False, repeat=1, receive="all", blocks=[17, 19])
+        with patch.object(resident.P, "plan_template", return_value=plan):
+            resident.require_measurement_blocks(SimpleNamespace(**args))
+            for override in (dict(gpus=2), dict(warm=True), dict(blocks=[17, 17]), dict(blocks=[23]), dict(receive="none")):
+                with self.subTest(override=override), self.assertRaises(SystemExit):
+                    resident.require_measurement_blocks(SimpleNamespace(**(args | override)))
+
     def test_resident_gpu_count_binds_schedule_caps_and_guard(self):
         for count, lane_workers in ((1, [2, 2, 2, 2]), (2, [2, 2, 2, 2]),
                                     (4, [2, 2, 2, 2]), (1, [0, 2])):
@@ -254,6 +268,39 @@ class GateTests(unittest.TestCase):
         self.assertNotIn('--allow-block', argv)
         self.assertNotIn('--coalesce-truth-families', argv)
 
+
+    def test_grouped_service_preset_requires_live_cuda_execution(self):
+        stack = gate.stack
+        preset = dict(json.loads(stack.DEFAULT_PRESET.read_text()), grouped_service_recursion=True)
+        assets = {k: '/x/' + k for k in ('driver', 'receiver', 'library', 'sparse', 'observer')}
+        manifest = dict(source_root='/s', assets=assets, preset=preset, block=24628607, gpus=1,
+                        guest_execution='cuda')
+        def command(value, live):
+            return stack.command(value, 'baseline', 0, 'r', False, live_blocks=live)[0]
+        self.assertIn('--grouped-service-recursion', command(manifest, [24628607]))
+        self.assertNotIn('--grouped-service-recursion', command(
+            dict(manifest, preset=dict(preset, grouped_service_recursion=False)), [24628607]))
+        with self.assertRaisesRegex(ValueError, 'boolean'):
+            command(dict(manifest, preset=dict(preset, grouped_service_recursion='false')), [24628607])
+        for guest, live in (('cuda', None), ('cpu', [24628607])):
+            with self.assertRaisesRegex(ValueError, 'live GPU guest'):
+                command(dict(manifest, guest_execution=guest), live)
+
+    def test_grouped_verifier_uses_the_admitted_service_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proof = Path(tmp)
+            options = {"grouped_service_recursion": True}
+            self.assertFalse(resident.use_grouped_verifier({}, proof))
+            for families, expected in [
+                (["keccak", "add", "sha256", "arith256_mod"], True),
+                (["add", "sha256", "sha256", "arith256_mod"], False),
+                (["add", "sha256", "arith256_mod", "bn254_fp2_mul"], False),
+                (["sha256", "add", "arith256_mod"], False),
+                ([], False),
+            ]:
+                truths = [{"declaration": {"family": f}} for f in families]
+                (proof / "bundle.json").write_text(json.dumps({"truths": truths}))
+                self.assertEqual(expected, resident.use_grouped_verifier(options, proof))
 
     def test_daemon_owner_rule_needs_explicit_block_opt_in(self):
         def args(blocks, repeat=2, allow=(), probe=False):

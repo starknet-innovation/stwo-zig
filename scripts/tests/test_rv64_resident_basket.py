@@ -460,6 +460,24 @@ class ResidentBasket(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "ordering"):
             R.recursive_snapshot(proof, 2)
 
+    def test_recursive_snapshot_binds_the_terminal_three_service_span(self):
+        proof, original, _ = self.recursive_tree()
+        directory = proof / "recursion-service-group"
+        original.rename(directory)
+        (directory / "leaf-000001.proof").rename(directory / "service-group-000001.proof")
+        tree = {"schema": 4, "fold_arity": 4, "root": 2,
+                "nodes": [{"first_leaf": 0, "leaf_count": 1, "children": []},
+                          {"first_leaf": 1, "leaf_count": 3, "children": []},
+                          {"first_leaf": 0, "leaf_count": 4, "children": [0, 1]}]}
+        (directory / "tree.json").write_text(json.dumps(tree))
+        snapshot = R.recursive_snapshot(proof, 4, grouped=True)
+        self.assertEqual(len(snapshot["proof_sha256"]), 4)
+        self.assertIn("service-group-000001.proof", snapshot["proof_sha256"])
+        tree["nodes"][1]["leaf_count"] = 1
+        (directory / "tree.json").write_text(json.dumps(tree))
+        with self.assertRaisesRegex(ValueError, "leaf coverage"):
+            R.recursive_snapshot(proof, 4, grouped=True)
+
     def test_recursive_reports_cannot_count_restores_as_proving_or_reprove_in_receiver(self):
         report = {"accepted": True, "leaf_proofs": 2, "fold_proofs": 1, "restored_leaves": 0,
                   "restored_folds": 0, "gpu_new_leaf_proofs": 2, "gpu_new_fold_proofs": 1,
