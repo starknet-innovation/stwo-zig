@@ -37,6 +37,34 @@ def service(arm, role, warm_s, cold_s=None, status='ok', **extra):
 
 
 class BasketTests(unittest.TestCase):
+    def test_verified_request_cost_joins_only_the_matching_proof(self):
+        row = service('gpu-native', 'headline', 5, run='retained', service_start_s=3, round=0)
+        for ordinal, request in enumerate(row['requests']):
+            request['ordinal'] = ordinal
+        verdicts = {'retained': [{'trial': 0, 'accepted': True, 'wall_s': 2},
+                                 {'trial': 1, 'accepted': False, 'wall_s': 4}]}
+        costs = bench.verified_requests([row, dict(row, run='discarded')], verdicts)
+        self.assertEqual(1, len(costs))
+        self.assertEqual(12.4, costs[0]['request_and_verify_s'])
+        self.assertEqual(15.4, costs[0]['startup_request_and_verify_s'])
+
+    def test_subset_rejects_unknown_blocks_without_discarding_known_ones(self):
+        expected = [row['block'] for row in bench.basket() if row['block'] in (24628607, 26235156)]
+        self.assertEqual(expected, [row['block'] for row in bench.selected_blocks(expected[::-1])])
+        with self.assertRaisesRegex(SystemExit, 'regression basket: 1'):
+            bench.selected_blocks([24628607, 1])
+
+    def test_check_reports_missing_mount_without_creating_gpu_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'unmounted'
+            with patch.object(bench, 'M3', root), patch.object(bench, 'GPU_LOCK', root / 'locks/gpu.lock'), patch('builtins.print'):
+                result = bench.check(argparse.Namespace(assets=None, out=None, blocks=[24628607]))
+            self.assertEqual('MISSING', result['status'])
+            self.assertEqual([24628607], [row['block'] for row in result['blocks']])
+            self.assertIsNone(result['disk_free_bytes'])
+            self.assertIsNone(result['gpu_lock_free_now'])
+            self.assertFalse(root.exists())
+
     def test_prune_unlinks_profile_symlink_without_following_target(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(bench, 'M3', Path(tmp)):
             run = Path(tmp) / 'runs/test/daemon-case'

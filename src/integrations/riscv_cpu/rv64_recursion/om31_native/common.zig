@@ -2,6 +2,13 @@
 const circuit = @import("stwo_circuit_frontend");
 const core = @import("stwo_core");
 pub const lane = @import("../om31_circuit_lane.zig");
+
+/// Graph lowering follows the admitted profile on the thread that emits it.
+pub fn productScope() lane.ProductScope {
+    const profile = @import("stwo_circuit_cpu_integration").om31.protocol.active();
+    return lane.ProductScope.init(profile == .cpu_direct_products_k4_cap3_b2_q108_p20_fold4_v1 or
+        profile == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1);
+}
 pub const F = lane.Lane;
 pub const Inner = @import("../circuit_lane.zig").Lane;
 pub const Context = lane.Context;
