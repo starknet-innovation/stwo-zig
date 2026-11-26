@@ -106,11 +106,11 @@ pub fn main() !void {
         try std.fs.cwd().makePath(args[2]);
         var d = try std.fs.cwd().openDir(args[2], .{});
         defer d.close();
-        const oracle = @import("rv64/secp_witness_fixture.zig");
-        try oracle.write(a, d, 0, .add, 0);
-        try oracle.write(a, d, 1, .double, 1);
-        try oracle.write(a, d, 2, .add, 3);
-        try oracle.write(a, d, 3, .double, 9);
+        const oracle = @import("rv64/curve_witness_fixture.zig");
+        try oracle.writeSecp(a, d, 0, .add, 0);
+        try oracle.writeSecp(a, d, 1, .double, 1);
+        try oracle.writeSecp(a, d, 2, .add, 3);
+        try oracle.writeSecp(a, d, 3, .double, 9);
         return;
     }
     if (args.len == 3 and std.mem.eql(u8, args[1], "--keccak-triple")) {

@@ -1,5 +1,5 @@
 //! Producer diagnostics owner: native encoder mirror, seed binding and optional captures.
-const Timer = @import("outer_gpu_timer.zig");
+const Timer = @import("cuda_events.zig");
 const Schema = @import("outer_job_factory.zig");
 const std = @import("std");
 const Outer = @import("stwo_circuit_cpu_integration").om31;

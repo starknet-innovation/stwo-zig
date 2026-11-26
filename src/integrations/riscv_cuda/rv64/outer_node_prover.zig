@@ -1,5 +1,5 @@
 //! Node proving and installed-class custody owner; class locks never cross into the facade.
-const Timer = @import("outer_gpu_timer.zig");
+const Timer = @import("cuda_events.zig");
 const Checks = @import("outer_node_checks.zig");
 const Schema = @import("outer_job_factory.zig");
 const std = @import("std");

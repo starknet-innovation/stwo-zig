@@ -303,3 +303,19 @@ test "replay tape keeps exact device planes and retires every budgeted allocatio
     try tape.release(device);
     try t.expectEqual(model.allocated, model.freed);
 }
+
+/// Select the live ring slot or the sealed device spans used by witness kernels.
+pub fn windowBatch(self: *const @import("guest_execution.zig").Session, slot: u1) @import("guest_kernels.zig").Batch {
+    var batch = self.batch;
+    if (self.replaying) {
+        const recorded = self.owner.replay.?.findWindow(self.ram.?.windows - 1).?;
+        batch.records = @ptrCast(@alignCast(recorded.span(.records).ptr));
+        batch.seeds = @ptrCast(@alignCast(recorded.span(.seeds).ptr));
+        batch.events = @ptrCast(@alignCast(recorded.span(.events).ptr));
+        batch.ram_predecessors = @ptrCast(@alignCast(recorded.span(.predecessors).ptr));
+        return batch;
+    }
+    batch.records += @as(usize, slot) * self.window_rows;
+    batch.seeds += @as(usize, slot) * Ingress.seedCount(self.window_rows);
+    return batch;
+}
