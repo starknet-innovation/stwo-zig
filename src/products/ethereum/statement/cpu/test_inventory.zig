@@ -61,6 +61,7 @@ test {
     _ = @import("word16_global_execution/ethereum/observations.zig");
     _ = @import("word16_global_execution/ethereum/options.zig");
     _ = @import("word16_global_execution/ethereum/plan.zig");
+    _ = @import("word16_global_execution/ethereum/truth_plan.zig");
     _ = @import("word16_global_execution/ethereum/plan_scope_test.zig");
     _ = @import("word16_global_execution/ethereum/receiver_budget.zig");
     _ = @import("word16_global_execution/ethereum/receiver_test.zig");

@@ -17,50 +17,12 @@ const CachePack = @import("stwo_circuit_cpu_integration").om31.cache_pack;
 const CacheUnpack = @import("stwo_circuit_cpu_integration").om31.cache_unpack;
 pub const Task = Pack.Task;
 pub const Seed = extern struct { out: u32, value: [4]u32 };
-pub const Job = extern struct { values: [*]u32, records: [*]const u32, indices: ?[*]const u32, status: *u32, value_count: u32, record_count: u32, index_count: u32, first: u32, count: u32, reserved: u32 = 0 };
-pub const Launch = *const fn (*anyopaque, u32, *const Job) callconv(.c) c_int;
-pub const LaunchRun = *const fn (*anyopaque, u32, *const Job, [*]const u32, u32) callconv(.c) c_int;
-/// M6 hint-tape chain runs (circuit_fill_chain.cu): device level ends, first level, level count.
-pub const LaunchChain = *const fn (*anyopaque, u32, *const Job, [*]const u32, u32, u32) callconv(.c) c_int;
-/// Level grouping for the device DAG. Chain runs (default when the image has
-/// them; STWO_RV64_OUTER_ASSIGNMENT_CHAIN=0 off, =1 required) take precedence
-/// over the M5 narrow runs (STWO_RV64_OUTER_ASSIGNMENT_NARROW_RUNS=1). All
-/// groupings execute the same tasks in the same level order: proof-neutral.
-const Grouping = struct {
-    plan: ?Runs.Plan,
-    narrow: ?LaunchRun,
-    chain: ?LaunchChain,
-    /// Vectorised grid level (circuit_fill_chain.cu) for the wide levels of a chain plan.
-    wide: ?Launch,
-    narrow_enabled: bool,
-    chain_enabled: bool,
-    fn init(a: std.mem.Allocator, library: *std.DynLib, level_ends: []const usize, task_count: usize) !Grouping {
-        const option = std.process.getEnvVarOwned(a, "STWO_RV64_OUTER_ASSIGNMENT_NARROW_RUNS") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => null,
-            else => return err,
-        };
-        defer if (option) |value| a.free(value);
-        const narrow_enabled = try Runs.parseOptIn(option);
-        const narrow = library.lookup(LaunchRun, "stwo_circuit_assignment_narrow_run_on");
-        if (narrow_enabled and narrow == null) return error.MissingCircuitAssignmentNarrowRunKernel;
-        const chain = library.lookup(LaunchChain, "stwo_circuit_assignment_chain_run_on");
-        const width = library.lookup(*const fn () callconv(.c) u32, "stwo_circuit_assignment_chain_max_width");
-        const chain_enabled = chain != null and width != null;
-        if (chain_enabled and (chain == null or width == null)) return error.MissingCircuitAssignmentChainKernel;
-        const plan: ?Runs.Plan = if (chain_enabled) try Runs.Plan.initChain(a, level_ends, task_count, width.?()) else if (narrow_enabled) try Runs.Plan.init(a, level_ends, task_count) else null;
-        const wide = if (chain_enabled) library.lookup(Launch, "stwo_circuit_assignment_wide_level_on") else null;
-        return .{ .plan = plan, .narrow = narrow, .chain = chain, .wide = wide, .narrow_enabled = narrow_enabled, .chain_enabled = chain_enabled };
-    }
-};
-pub fn requireProductionMask(mask: u32) !void {
-    if (mask & 0xffff != 0xffff) return error.UnsupportedCircuitAssignmentHint;
-}
-pub fn requireProductionCapabilities(library: *std.DynLib) !void {
-    _ = library.lookup(Launch, "stwo_circuit_assignment_seed_on") orelse return error.MissingCircuitAssignmentKernel;
-    _ = library.lookup(Launch, "stwo_circuit_assignment_level_on") orelse return error.MissingCircuitAssignmentKernel;
-    const query = library.lookup(*const fn () callconv(.c) u32, "stwo_circuit_assignment_capabilities") orelse return error.MissingCircuitAssignmentKernel;
-    try requireProductionMask(query());
-}
+pub const Job = Runs.Job;
+pub const Launch = Runs.Launch;
+pub const LaunchRun = Runs.LaunchRun;
+pub const LaunchChain = Runs.LaunchChain;
+pub const requireProductionMask = Runs.requireProductionMask;
+pub const requireProductionCapabilities = Runs.requireProductionCapabilities;
 /// Producer-only, in-process fold-class assignment templates. A v2 fold's
 /// topology is a function of its class (om31_outer.classKey), so tasks,
 /// permutation indices, level ends and the seed-variable layout are reused;
@@ -654,7 +616,7 @@ pub const Prepared = struct {
         var timer = try std.time.Timer.start();
         const view = try t.taskView(a);
         errdefer view.deinit(a);
-        var grouping = try Grouping.init(a, library, t.level_ends, view.values.len);
+        var grouping = try Runs.Grouping.init(a, library, t.level_ends, view.values.len);
         errdefer if (grouping.plan) |*value| value.deinit();
         ClassCache.mutex.lock();
         ClassCache.hits += 1;
@@ -677,7 +639,7 @@ pub const Prepared = struct {
             std.debug.print("BLAKE_SAMPLE_PLAN removed_tasks={} old_levels={} new_levels={} original_air=true\n", .{ before_tasks - plan.tasks.len, before_levels, plan.level_ends.len });
         };
         const plan_ns = timer.lap();
-        var grouping = try Grouping.init(a, library, plan.level_ends, plan.tasks.len);
+        var grouping = try Runs.Grouping.init(a, library, plan.level_ends, plan.tasks.len);
         errdefer if (grouping.plan) |*value| value.deinit();
         const narrow_plan = grouping.plan;
         const enabled = grouping.narrow_enabled or grouping.chain_enabled;

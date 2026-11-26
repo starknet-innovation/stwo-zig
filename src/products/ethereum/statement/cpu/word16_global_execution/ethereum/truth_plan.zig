@@ -459,3 +459,174 @@ pub fn coalesceTruthFamilies(a: std.mem.Allocator, total: [@import("stwo_riscv_c
     try out.appendSlice(a, rest);
     return out.toOwnedSlice(a);
 }
+
+test "keccak truth plan sizes prefixes below the log18 bound without u15 wrap" {
+    const calls: u32 = 3934;
+    const narrowed = @min(@as(u32, ((1 << 18) / 29) * 2), calls);
+    _ = narrowed;
+    try std.testing.expectEqual(@as(u32, 16), try A.crypto.keccak.layout.logSize(calls));
+}
+test "v3 keccak truth takes the throughput tables exactly where they commit fewer cells" {
+    try std.testing.expectEqual(KeccakPolicy.triple_v2, keccakTruthPolicy(false, 18));
+    try std.testing.expectEqual(KeccakPolicy.triple_v2, keccakTruthPolicy(true, 12));
+    try std.testing.expectEqual(KeccakPolicy.throughput_v1, keccakTruthPolicyFor(.{ .v3 = true, .quartet = false }, 13));
+    try std.testing.expectEqual(KeccakPolicy.throughput_v1, keccakTruthPolicyFor(.{ .v3 = true, .quartet = false }, 18));
+    // v3 default: the quartet batching of the same tables on the 27-row slot.
+    try std.testing.expectEqual(KeccakPolicy.throughput_r27_v1, keccakTruthPolicy(true, 13));
+    try std.testing.expectEqual(KeccakPolicy.throughput_r27_v1, keccakTruthPolicy(true, 18));
+    try std.testing.expectEqual(KeccakPolicy.throughput_quartet_v1, keccakTruthPolicyFor(.{ .v3 = true, .r27 = false }, 18));
+    // log18: 2^18 x (1923 + 2596) + 5 x (2^13 + 2^10) vs 2^18 x 2531 + 5 x (2^21 + 2^16).
+    try std.testing.expectEqual(@as(u64, 1_184_674_816), keccakTruthCells(.triple_v2, 18));
+    try std.testing.expectEqual(@as(u64, 674_299_904), keccakTruthCells(.throughput_v1, 18));
+}
+test "r27 keccak truth plan cuts shards in 27-row slots and keeps the compact truth for small spans" {
+    const r27 = KeccakTruthOptions{ .v3 = true, .r27 = true };
+    try std.testing.expectEqual(KeccakPolicy.throughput_r27_v1, keccakTruthPolicyFor(r27, 18));
+    try std.testing.expectEqual(KeccakPolicy.triple_v2, keccakTruthPolicyFor(r27, 12));
+    // r27 requires the quartet batching.
+    try std.testing.expectEqual(KeccakPolicy.throughput_v1, keccakTruthPolicyFor(.{ .v3 = true, .quartet = false, .r27 = true }, 18));
+    // log18: 2^18 x (1923 + 480) + 5 x (2^21 + 2^16).
+    try std.testing.expectEqual(@as(u64, 640_745_472), keccakTruthCells(.throughput_r27_v1, 18));
+    // The prefix of block 24,628,607: 22,385 IDs -> 19,418 (log18), then the
+    // 2,967-call remainder split as 606 (full log13) + 2,361 (log15):
+    // 760,799,232 cells instead of 809,041,920 for one log16 remainder.
+    var out: std.ArrayList(W.TruthDeclaration) = .{};
+    defer out.deinit(std.testing.allocator);
+    try appendKeccakSecp(std.testing.allocator, &out, .{ 22_385, 0, 0 }, 18, r27);
+    try std.testing.expectEqual(@as(usize, 3), out.items.len);
+    try std.testing.expectEqual(@as(u32, 19_418), out.items[0].calls);
+    try std.testing.expectEqualDeep([2]u32{ 18, W.KECCAK_THROUGHPUT_R27_WORD }, out.items[0].logs);
+    try std.testing.expectEqual(@as(u32, 19_419), out.items[1].first_id);
+    try std.testing.expectEqual(@as(u32, 606), out.items[1].calls);
+    try std.testing.expectEqualDeep([2]u32{ 13, W.KECCAK_THROUGHPUT_R27_WORD }, out.items[1].logs);
+    try std.testing.expectEqual(@as(u32, 20_025), out.items[2].first_id);
+    try std.testing.expectEqual(@as(u32, 2_361), out.items[2].calls);
+    try std.testing.expectEqualDeep([2]u32{ 15, W.KECCAK_THROUGHPUT_R27_WORD }, out.items[2].logs);
+    var total_cells: u64 = 0;
+    for (out.items) |d| {
+        try A.crypto.keccak.layout.validateGeometryFor(.pair27, d.calls, d.first_id, d.logs[0]);
+        total_cells += keccakTruthCells(.throughput_r27_v1, d.logs[0]);
+    }
+    try std.testing.expectEqual(@as(u64, 760_799_232), total_cells);
+    try std.testing.expect(total_cells < keccakTruthCells(.throughput_r27_v1, 18) + keccakTruthCells(.throughput_r27_v1, 16));
+    // A small span takes the compact truth sized in its own (29-row) slots.
+    out.clearRetainingCapacity();
+    try appendKeccakSecp(std.testing.allocator, &out, .{ 140, 0, 0 }, 18, r27);
+    try std.testing.expectEqualDeep([2]u32{ 11, 0 }, out.items[0].logs);
+    try A.crypto.keccak.layout.validateGeometry(140, 1, 11);
+    // 292 calls: 146 x 27 = 3,942 rows fit log12, 146 x 29 = 4,234 do not;
+    // r27 at log12 (20.6 M cells) beats compact at log13 (37.1 M).
+    out.clearRetainingCapacity();
+    try appendKeccakSecp(std.testing.allocator, &out, .{ 292, 0, 0 }, 18, r27);
+    try std.testing.expectEqualDeep([2]u32{ 12, W.KECCAK_THROUGHPUT_R27_WORD }, out.items[0].logs);
+    try std.testing.expectError(error.InvalidKeccakComponentGeometry, A.crypto.keccak.layout.validateGeometry(292, 1, 12));
+    try A.crypto.keccak.layout.validateGeometryFor(.pair27, 292, 1, 12);
+    // The pair29 quartet plan of this prefix is unchanged by the split search
+    // (one log16 remainder is cheapest there: 801,177,600 cells).
+    out.clearRetainingCapacity();
+    try appendKeccakSecp(std.testing.allocator, &out, .{ 22_385, 0, 0 }, 18, .{ .v3 = true, .r27 = false });
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqual(@as(u32, 18_078), out.items[0].calls);
+    try std.testing.expectEqualDeep([2]u32{ 18, W.KECCAK_THROUGHPUT_QUARTET_WORD }, out.items[0].logs);
+    try std.testing.expectEqualDeep([2]u32{ 16, W.KECCAK_THROUGHPUT_QUARTET_WORD }, out.items[1].logs);
+    // v2 keeps the historical compact plan (byte identity of v2 bundles).
+    out.clearRetainingCapacity();
+    try appendKeccakSecp(std.testing.allocator, &out, .{ 22_385, 0, 0 }, 18, .{});
+    try std.testing.expectEqual(@as(usize, 2), out.items.len);
+    try std.testing.expectEqualDeep([2]u32{ 18, 0 }, out.items[0].logs);
+    try std.testing.expectEqualDeep([2]u32{ 16, 0 }, out.items[1].logs);
+    // Exhaustive small rosters: spans are contiguous, admitted and cover all IDs.
+    for ([_]KeccakTruthOptions{ .{ .v3 = true, .r27 = false }, r27, .{ .v3 = true, .quartet = false } }) |options| {
+        var calls: u32 = 1;
+        while (calls < 60_000) : (calls += 997) {
+            out.clearRetainingCapacity();
+            try appendKeccakSecp(std.testing.allocator, &out, .{ calls, 0, 0 }, 18, options);
+            var next: u32 = 1;
+            for (out.items) |d| {
+                try std.testing.expectEqual(next, d.first_id);
+                const policy = try W.keccakPolicy(d.logs[1]);
+                try A.crypto.keccak.layout.validateGeometryFor(policy.geometry(), d.calls, d.first_id, d.logs[0]);
+                try std.testing.expect(d.logs[0] <= 18);
+                next += d.calls;
+            }
+            try std.testing.expectEqual(calls + 1, next);
+        }
+    }
+}
+test "quartet keccak truth option keeps the throughput tables and cuts 152 interaction columns per row" {
+    try std.testing.expectEqual(KeccakPolicy.triple_v2, keccakTruthPolicyFor(.{ .quartet = true }, 18));
+    try std.testing.expectEqual(KeccakPolicy.triple_v2, keccakTruthPolicy(false, 18));
+    try std.testing.expectEqual(KeccakPolicy.triple_v2, keccakTruthPolicyFor(.{ .v3 = true, .quartet = true, .r27 = false }, 12));
+    try std.testing.expectEqual(KeccakPolicy.throughput_quartet_v1, keccakTruthPolicyFor(.{ .v3 = true, .quartet = true, .r27 = false }, 13));
+    try std.testing.expectEqual(KeccakPolicy.throughput_quartet_v1, keccakTruthPolicyFor(.{ .v3 = true, .quartet = true, .r27 = false }, 18));
+    // log18: 2^18 x (1923 + 456) + 5 x (2^21 + 2^16).
+    try std.testing.expectEqual(@as(u64, 634_454_016), keccakTruthCells(.throughput_quartet_v1, 18));
+    try std.testing.expectEqual(@as(u64, 152) << 18, keccakTruthCells(.throughput_v1, 18) - keccakTruthCells(.throughput_quartet_v1, 18));
+    try std.testing.expectEqual(KeccakPolicy.throughput_quartet_v1, try W.keccakPolicy(W.keccakProfileWord(.throughput_quartet_v1)));
+    try std.testing.expectError(error.InvalidServicesTruthGeometry, W.keccakPolicy(22));
+    try std.testing.expectError(error.InvalidServicesTruthGeometry, W.keccakPolicy(4 << 8));
+}
+test "v3 secp row spans split only where padding wastes at least 1/8 of the cells" {
+    // 4-packet prefix of block 24,628,607: 1,080 ADD -> 1,023 (log 10) + 57 (log 8).
+    try std.testing.expectEqual(@as(u32, 1023), try secpRowSpan(.add, 1080));
+    try std.testing.expectEqual(@as(u32, 57), try secpRowSpan(.add, 57));
+    // 1,001 DOUBLE fits log 10 unsplit.
+    try std.testing.expectEqual(@as(u32, 1001), try secpRowSpan(.double, 1001));
+    // Complete block scale: 11,496 -> 8,191 (log 13) + 3,305 (log 12, unsplit).
+    try std.testing.expectEqual(@as(u32, 8191), try secpRowSpan(.add, 11496));
+    try std.testing.expectEqual(@as(u32, 3305), try secpRowSpan(.add, 3305));
+}
+test "v3 secp truths take the row profile wherever it commits fewer cells" {
+    // Real-prefix scale: fewer cells even with worst-case padding (1,200
+    // calls in 2^11 rows), under half at a full power of two (1,023 calls).
+    for ([_]A.crypto.secp256k1.program.Kind{ .add, .double }) |kind| {
+        try std.testing.expect(SecpRow.cells(kind, try SecpRow.logSize(kind, 1200)) < try secpRcbCells(kind, 1200));
+        try std.testing.expect(2 * SecpRow.cells(kind, try SecpRow.logSize(kind, 1023)) < try secpRcbCells(kind, 1023));
+    }
+}
+
+test "uniform resident Keccak keeps the small tail on admitted r27 geometry" {
+    const options = KeccakTruthOptions{ .v3 = true, .uniform_throughput = true };
+    const tail = keccakSingle(options, 266, 18) orelse return error.ExpectedKeccakTail;
+    try std.testing.expectEqual(KeccakPolicy.throughput_r27_v1, tail.policy);
+    try std.testing.expectEqual(@as(u32, 12), tail.log);
+    try std.testing.expectEqual(@as(u32, 266), tail.calls);
+    try A.crypto.keccak.layout.validateGeometryFor(.pair27, tail.calls, 29_733, tail.log);
+    const original = keccakSingle(.{ .v3 = true }, 266, 18) orelse return error.ExpectedKeccakTail;
+    try std.testing.expectEqual(KeccakPolicy.triple_v2, original.policy);
+    try std.testing.expectEqual(@as(u32, 12), original.log);
+}
+
+test "uniform resident Keccak covers the real block without changing the default mixed roster" {
+    const a = std.testing.allocator;
+    var original: std.ArrayList(W.TruthDeclaration) = .empty;
+    defer original.deinit(a);
+    try appendKeccakSecp(a, &original, .{ 29_998, 0, 0 }, 18, .{ .v3 = true });
+    try std.testing.expectEqual(@as(usize, 4), original.items.len);
+    const original_calls = [_]u32{ 19_418, 606, 9_708, 266 };
+    const original_logs = [_]u32{ 18, 13, 17, 12 };
+    for (original.items, original_calls, original_logs, 0..) |piece, calls, log, i| {
+        try std.testing.expectEqual(calls, piece.calls);
+        try std.testing.expectEqual(log, piece.logs[0]);
+        try std.testing.expectEqual(if (i == 3) KeccakPolicy.triple_v2 else KeccakPolicy.throughput_r27_v1, try W.keccakPolicy(piece.logs[1]));
+    }
+    var resident: std.ArrayList(W.TruthDeclaration) = .empty;
+    defer resident.deinit(a);
+    try appendKeccakSecp(a, &resident, .{ 29_998, 0, 0 }, 18, .{ .v3 = true, .uniform_throughput = true });
+    try std.testing.expectEqual(@as(usize, 3), resident.items.len);
+    const uniform_calls = [_]u32{ 19_418, 1_212, 9_368 };
+    const uniform_logs = [_]u32{ 18, 14, 17 };
+    for (resident.items, uniform_calls, uniform_logs) |piece, calls, log| {
+        try std.testing.expectEqual(calls, piece.calls);
+        try std.testing.expectEqual(log, piece.logs[0]);
+    }
+    var next: u32 = 1;
+    for (resident.items) |piece| {
+        try std.testing.expectEqual(next, piece.first_id);
+        try std.testing.expect(piece.calls != 0 and piece.logs[0] <= 18);
+        try std.testing.expectEqual(KeccakPolicy.throughput_r27_v1, try W.keccakPolicy(piece.logs[1]));
+        try A.crypto.keccak.layout.validateGeometryFor(.pair27, piece.calls, piece.first_id, piece.logs[0]);
+        next += piece.calls;
+    }
+    try std.testing.expectEqual(@as(u32, 29_999), next);
+}
