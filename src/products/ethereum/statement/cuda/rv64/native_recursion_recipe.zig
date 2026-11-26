@@ -9,6 +9,11 @@ const Outer = CUDA.runtime.outer_job_factory;
 const RootCache = @import("jobs/recursion_fixed_roots.zig").RootCache;
 const Seed = CUDA.jobs.outer_seed_device;
 const Core = @import("stwo_core");
+const G = CUDA.jobs.gpu_native;
+const LB = CUDA.jobs.native_leaf_build;
+const TF = CUDA.jobs.truth_factory;
+const S2 = CUDA.jobs.native_device_stage2;
+const NP = CUDA.jobs.native_pcs;
 const Authority = @typeInfo(@FieldType(Outer.PrestageInput, "key")).pointer.child;
 const Q = std.meta.Child(@FieldType(Outer.PrestageInput, "expected"));
 const Context = @typeInfo(@FieldType(Outer.PrestageInput, "graph")).pointer.child;
@@ -584,4 +589,48 @@ pub const Builder = struct {
 pub fn regionWordsForBytes(bytes: usize) !u32 {
     const words = 1 + try std.math.divCeil(usize, bytes, 4);
     return std.math.cast(u32, words) orelse error.GnNodeChildRegion;
+}
+
+pub const LeafSource = struct {
+    pcs: *const NP.PcsJob,
+    image_words: usize,
+    wire_bytes: usize,
+    tail: ?u32 = null,
+
+    pub fn cpu(framing: *const S2.ClassFraming) LeafSource {
+        return .{ .pcs = framing.pcs, .image_words = framing.program.pcs_words, .wire_bytes = framing.program.max_encoded_bytes };
+    }
+
+    pub fn get(stage2: *S2.Factory, truths: *TF.Factory, key: G.ClassKey, is_cpu: bool) !LeafSource {
+        if (is_cpu) {
+            const pool = stage2.classes.get(S2.framingKey(key)) orelse return error.GpuNativeClassNotWarmed;
+            return cpu(pool.instances.items[0]);
+        }
+        const family = truths.classes.get(key) orelse return error.GpuNativeClassNotWarmed;
+        const class = family.class;
+        return .{ .pcs = &class.pcs, .image_words = class.encode.pcs_words, .wire_bytes = class.encode.max_encoded_bytes, .tail = try LB.truthTailSeeds(class.claim_count) };
+    }
+
+    pub fn shape(self: LeafSource, storage: *Seed.Shape.TreeStorage) !Seed.Shape {
+        const admitted = try Seed.Shape.fromPcs(self.pcs.prepared.metadata.shape, storage);
+        const words = (try Seed.Layout.of(admitted)).words;
+        if (words != self.image_words or words != self.pcs.outputWords()) return error.GpuNativeLeafImageShape;
+        return admitted;
+    }
+};
+
+pub fn requireRecordedLeafShape(a: std.mem.Allocator, recorded_words: []const u32, admitted: Seed.Shape) !void {
+    var cursor: usize = 0;
+    const recorded = try Seed.Shape.parse(a, recorded_words, &cursor);
+    defer a.free(recorded.trees);
+    if (cursor != recorded_words.len or !admitted.eql(recorded)) return error.GpuNativeLeafImageShape;
+}
+
+pub fn leafFor(entry: *const Outer.NodeClasses.Entry, shape: Seed.Shape, wire_bytes: usize) !CUDA.jobs.recursion_classes.Leaf {
+    return .{
+        .wire_words = try regionWordsForBytes(wire_bytes),
+        .image_words = std.math.cast(u32, (try Seed.Layout.of(shape)).words) orelse return error.GnNodeChildRegion,
+        .tail_seeds = entry.tail,
+        .output_words = std.math.cast(u32, entry.staged.expected.len) orelse return error.GnNodeChildRegion,
+    };
 }

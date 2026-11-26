@@ -12,7 +12,7 @@ const NO = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_enc
 const NP = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_pcs;
 const O = core.fields.om31.OM31;
 const Oracle = @import("stwo_riscv_cuda_integration").rv64.execution.composition.sources;
-const Peer = @import("gn_s2_common.zig").Peer;
+const Peer = @import("native_common.zig").Peer;
 const Point = core.circle.CirclePoint(O);
 const ProductCPU = @import("ethereum_cpu_component");
 const RC = @import("stwo_riscv_cuda_integration").rv64.resident_composition;
@@ -23,11 +23,11 @@ const WP = CPU.rv64_gkr_worker_protocol;
 const Worker = CPU.rv64_gkr_cpu_worker;
 const api = jobs.api;
 const core = @import("stwo_core");
-const feltOf = @import("gn_s2_common.zig").feltOf;
+const feltOf = @import("native_common.zig").feltOf;
 const jobs = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.runtime;
-const run = @import("gn_s2_common.zig").run;
+const run = @import("native_common.zig").run;
 const std = @import("std");
-const words8 = @import("gn_s2_common.zig").words8;
+const words8 = @import("native_common.zig").words8;
 
 pub const Seg = struct {
     ordinal: u32,

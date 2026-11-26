@@ -14,14 +14,14 @@ const St = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.outer_stag
 const Job = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.outer_job;
 const TF = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.truth_factory;
 const LB = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_leaf_build;
-const NP = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_pcs;
 const S2 = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_device_stage2;
 const api = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.api;
-const Fixed = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.outer_fixed_job;
+const Warm = @import("jobs/recursion_fixed_roots.zig").Warm;
 const W = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.worker;
 const RC = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.recursion_classes;
 const Recipe = CPU.rv64_om31_execution_wrap.ClassSetup;
 const RootCache = @import("jobs/recursion_fixed_roots.zig").RootCache;
+const Preparation = @import("recursion_preparation.zig");
 const Setup = @import("native_recursion_recipe.zig");
 
 extern "c" fn setenv([*:0]const u8, [*:0]const u8, c_int) c_int;
@@ -31,10 +31,11 @@ const Env = struct {
     a: std.mem.Allocator,
     saved: std.ArrayListUnmanaged(struct { name: [:0]const u8, value: ?[:0]u8 }) = .empty,
     fn put(self: *Env, name: [:0]const u8, value: [:0]const u8) !void {
+        try self.saved.ensureUnusedCapacity(self.a, 1);
         const old = if (std.posix.getenv(name)) |v| try self.a.dupeZ(u8, v) else null;
         errdefer if (old) |v| self.a.free(v);
-        try self.saved.append(self.a, .{ .name = name, .value = old });
         if (setenv(name, value, 1) != 0) return error.GpuNativeInstallEnvironment;
+        self.saved.appendAssumeCapacity(.{ .name = name, .value = old });
     }
     fn deinit(self: *Env) void {
         var i = self.saved.items.len;
@@ -49,6 +50,13 @@ const Env = struct {
         self.saved.deinit(self.a);
     }
 };
+
+test "leaf install rolls back only successfully applied environment overrides" {
+    var env = Env{ .a = std.testing.allocator };
+    defer env.deinit();
+    try std.testing.expectError(error.GpuNativeInstallEnvironment, env.put("invalid=key", "1"));
+    try std.testing.expectEqual(@as(usize, 0), env.saved.items.len);
+}
 
 pub const Leaf = RC.Leaf;
 
@@ -69,7 +77,7 @@ pub const Owner = struct {
         leaves: []Leaf = &.{},
         coefficient_counts: [][]u32 = &.{},
         leaf_keys: []G.ClassKey = &.{},
-        leaf_sources: []LeafSource = &.{},
+        leaf_sources: []Setup.LeafSource = &.{},
         native_count: u32 = 0,
         grouped_recursion: bool = false,
     };
@@ -314,7 +322,7 @@ pub const Owner = struct {
                 var n: usize = 0;
                 if (node.children.len == 0) {
                     n = node.segments.len + node.truths.len;
-                    for (regions[0..n], 0..) |*region, member| region.* = try b.leaves[leafOrdinal(node, b.native_count, member)].regionWords();
+                    for (regions[0..n], 0..) |*region, member| region.* = try b.leaves[Preparation.leafOrdinal(node, b.native_count, member)].regionWords();
                 } else for (node.children) |child| {
                     const info = try cache.get(b.nodes[child].class_key);
                     regions[n] = try Setup.regionWordsForBytes(info.max_encoded_bytes);
@@ -330,7 +338,7 @@ pub const Owner = struct {
                 if (entry.seedRegionsMatch(regions[0..n])) continue;
                 const old_words = entry.program.len;
                 if (node.children.len == 0 and n == 1) {
-                    const index = leafOrdinal(node, b.native_count, 0);
+                    const index = Preparation.leafOrdinal(node, b.native_count, 0);
                     var storage: Seed.Shape.TreeStorage = undefined;
                     const shape = try b.leaf_sources[index].shape(&storage);
                     try entry.programForLeaf(regions[0], shape);
@@ -389,7 +397,7 @@ pub const Owner = struct {
                 const validation: Outer.NodeClasses.Entry.FixedValidation = if (packed_key) |key|
                     if (checked[device].contains(key)) .resident else .commit
                 else if (self.setup_only and entry.compressed != null) .request else .commit;
-                var warm_job = try Warm.init(self, entry, validation);
+                var warm_job = try Warm.init(self.a, &self.shared.kernels, entry, validation);
                 defer warm_job.deinit(self.a);
                 var done = struct {
                     event: std.Thread.ResetEvent = .{},
@@ -433,7 +441,7 @@ pub const Owner = struct {
         if (topo.nodes.len != b.nodes.len or b.grouped_recursion != grouped) return error.GpuNativeRecursionInstallTopology;
         const leaves = try self.a.alloc(Leaf, native.len + truths.len);
         errdefer self.a.free(leaves);
-        const leaf_sources = try self.a.alloc(LeafSource, leaves.len);
+        const leaf_sources = try self.a.alloc(Setup.LeafSource, leaves.len);
         errdefer self.a.free(leaf_sources);
         const keys = try self.a.alloc(G.ClassKey, b.nodes.len);
         defer self.a.free(keys);
@@ -452,15 +460,15 @@ pub const Owner = struct {
                 if (n != entry.shapes.len or (n != 1 and (!grouped or n != Seed.service_group_members or node.segments.len != 0)) or ((entry.statement.kind == 3) != (n == Seed.service_group_members)))
                     return error.GpuNativeRecursionInstallTopology;
                 for (child_keys[0..n], regions[0..n], entry.shapes, 0..) |*key, *region, recorded, member| {
-                    const index = leafOrdinal(node, native.len, member);
+                    const index = Preparation.leafOrdinal(node, native.len, member);
                     key.* = leaf_keys[index];
-                    const source = try LeafSource.get(stage2, truth_factory, key.*, index < native.len);
+                    const source = try Setup.LeafSource.get(stage2, truth_factory, key.*, index < native.len);
                     if (source.tail) |tail| if (entry.tail != tail) return error.GpuNativeRecursionInstallTopology;
                     const shape = try source.shape(&storage);
-                    try requireRecordedLeafShape(self.a, recorded, shape);
+                    try Setup.requireRecordedLeafShape(self.a, recorded, shape);
                     leaf_sources[index] = source;
                     if (n == 1) leaf_shape = shape;
-                    leaves[index] = try leafFor(entry, shape, source.wire_bytes);
+                    leaves[index] = try Setup.leafFor(entry, shape, source.wire_bytes);
                     region.* = try leaves[index].regionWords();
                 }
             } else {
@@ -559,12 +567,12 @@ pub const Owner = struct {
             consumed[child] = true;
         };
         for (consumed, 0..) |has_parent, i| if (has_parent == (i == topo.root)) return error.GpuNativeRecursionInstallTopology;
-        const construction_order = try layerOrder(self.a, topo.nodes);
+        const construction_order = try Preparation.layerOrder(self.a, topo.nodes);
         defer self.a.free(construction_order);
         // Budget host memory independently of the pool (each circuit carries
         // its trace and FIXED columns). No worker touches the class registry.
         const complete = CompleteLeaves{ .builder = builder, .stage2 = stage2, .truth_factory = truth_factory, .leaf_keys = leaf_keys, .native_count = native_count, .input = input, .topo = topo };
-        const budget = @import("recursion_preparation_budget.zig").current(Setup.NodePreparation.workerCount());
+        const budget = Preparation.current(Setup.NodePreparation.workerCount());
         const queue = try self.a.alloc(Setup.NodePreparation, @min(budget.slots, topo.nodes.len));
         defer self.a.free(queue);
         var epoch: std.atomic.Value(u32) = .init(0);
@@ -575,8 +583,8 @@ pub const Owner = struct {
         defer std.debug.print("GPU_RECURSION_WAVES max_ready={d} sibling_folds={d} slots={d} quota={?d} headroom_bytes={?d} pool={d} reordered={d} ready_wait_ns={d}\n", .{ timing.max_ready, timing.overlapped_folds, budget.slots, budget.cpu_quota, budget.memory_headroom, budget.pool_workers, reordered, ready_wait_ns });
         for (0..construction_order.len) |position| {
             const remaining = construction_order[position..];
-            try startIndependent(queue, topo, remaining, input, native_count, authorities, &timing);
-            const current = firstCompleted(queue, &epoch, &ready_wait_ns);
+            try Preparation.startIndependent(queue, topo, remaining, input, native_count, authorities, &timing);
+            const current = Preparation.firstCompleted(queue, &epoch, &ready_wait_ns);
             // Jobs may complete out of order. Publish internally by original
             // ordinal; only the final, canonical registration pass is ordered.
             const selected = if (current) |item|
@@ -601,7 +609,7 @@ pub const Owner = struct {
             const node = topo.nodes[ordinal];
             const next = remaining[1..];
             const installed = if (node.children.len == 0) blk: {
-                const recipe = try leafInput(topo, node, input, native_count);
+                const recipe = try Preparation.leafInput(topo, node, input, native_count);
                 var queued = if (current) |item| try item.take(ordinal) else null;
                 defer if (queued) |*owned| owned.deinit();
                 var pending = if (current) |item| item.takePreparation() else null;
@@ -609,10 +617,10 @@ pub const Owner = struct {
                 if (current) |item| if (item.takeCompleted()) |result| {
                     var owned = result;
                     errdefer owned.deinit(self.a);
-                    try startIndependent(queue, topo, next, input, native_count, authorities, &timing);
+                    try Preparation.startIndependent(queue, topo, next, input, native_count, authorities, &timing);
                     break :blk owned;
                 };
-                try startIndependent(queue, topo, next, input, native_count, authorities, &timing);
+                try Preparation.startIndependent(queue, topo, next, input, native_count, authorities, &timing);
                 if (queued == null) queued = try recipe.trace(self.a);
                 const graph = &queued.?;
                 break :blk try complete.compile(ordinal, recipe, graph, if (pending) |*work| work else null, &timing);
@@ -635,7 +643,7 @@ pub const Owner = struct {
                 fold_builder.pending_fold = queued;
                 var ready = if (current) |item| item.takeCompleted() else null;
                 errdefer if (ready) |*owned| owned.deinit(self.a);
-                try startIndependent(queue, topo, next, input, native_count, authorities, &timing);
+                try Preparation.startIndependent(queue, topo, next, input, native_count, authorities, &timing);
                 const fold = ready orelse try fold_builder.fold(children[0..node.children.len], @intCast(ordinal));
                 for (node.children) |child| {
                     authorities[child].?.deinit(self.a);
@@ -645,7 +653,7 @@ pub const Owner = struct {
             };
             authorities[ordinal] = installed;
             nodes[ordinal] = installed.entry;
-            try startIndependent(queue, topo, next, input, native_count, authorities, &timing);
+            try Preparation.startIndependent(queue, topo, next, input, native_count, authorities, &timing);
         }
         // Registrations, twiddle ownership, public slots, and proof topology
         // keep their original ordinal irrespective of worker completion order.
@@ -653,129 +661,6 @@ pub const Owner = struct {
         return nodes;
     }
 };
-
-/// Build sibling folds while other siblings are committing. Stored ordinal
-/// and coverage stay canonical; depth only chooses a host compilation order.
-fn layerOrder(a: std.mem.Allocator, nodes: []const D.RecursionNode) ![]usize {
-    const order = try a.alloc(usize, nodes.len);
-    errdefer a.free(order);
-    const depth = try a.alloc(usize, nodes.len);
-    defer a.free(depth);
-    for (nodes, 0..) |node, ordinal| {
-        order[ordinal] = ordinal;
-        var level: usize = 0;
-        for (node.children) |child| {
-            if (child >= ordinal) return error.GpuNativeRecursionInstallTopology;
-            level = @max(level, depth[child] + 1);
-        }
-        depth[ordinal] = level;
-    }
-    std.mem.sort(usize, order, depth, struct {
-        fn before(levels: []const usize, a_index: usize, b_index: usize) bool {
-            return levels[a_index] < levels[b_index] or (levels[a_index] == levels[b_index] and a_index < b_index);
-        }
-    }.before);
-    return order;
-}
-
-test "leaf install scheduling groups independent parents while preserving canonical node identities" {
-    const a = std.testing.allocator;
-    const nodes = [_]D.RecursionNode{ .{}, .{}, .{ .children = &.{ 0, 1 } }, .{}, .{}, .{ .children = &.{ 3, 4 } }, .{ .children = &.{ 2, 5 } } };
-    const order = try layerOrder(a, &nodes);
-    defer a.free(order);
-    try std.testing.expectEqualSlices(usize, &.{ 0, 1, 3, 4, 2, 5, 6 }, order);
-    try std.testing.expectError(error.GpuNativeRecursionInstallTopology, layerOrder(a, &.{ .{ .children = &.{1} }, .{} }));
-}
-
-/// A physical request may have a slow leaf at the front. Complete whichever
-/// ready worker can free its host budget first. The generation check covers
-/// a notification arriving after the scan and before entering the futex.
-fn firstCompleted(queue: []Setup.NodePreparation, epoch: *std.atomic.Value(u32), wait_ns: *u64) ?*Setup.NodePreparation {
-    var timer = std.time.Timer.start() catch unreachable;
-    defer wait_ns.* += timer.read();
-    while (true) {
-        const observed = epoch.load(.acquire);
-        var active = false;
-        for (queue) |*worker| {
-            if (worker.lease != null) {
-                if (worker.done.load(.acquire)) return worker;
-                active = true;
-            }
-        }
-        if (!active) return null;
-        std.Thread.Futex.wait(epoch, observed);
-    }
-}
-
-/// Start future ordinals only after all their input authorities exist. Independent
-/// leaves can always overlap. Folds share a wave only once their children have
-/// been adopted; each topology child has exactly one consuming parent.
-fn startIndependent(queue: []Setup.NodePreparation, topo: *const D.Topology, next: []const usize, input: RC.RecipeInputs, native_count: usize, authorities: []?Setup.Installed, timing: *Setup.InstallTiming) !void {
-    for (next) |i| {
-        const node = topo.nodes[i];
-        var free: ?*Setup.NodePreparation = null;
-        var exists = false;
-        for (queue) |*slot| {
-            if (slot.lease != null) {
-                if (slot.ordinal == i) exists = true;
-            } else if (free == null) free = slot;
-        }
-        if (exists) continue;
-        const slot = free orelse break;
-        if (node.children.len == 0) {
-            try slot.start(i, try leafInput(topo, node, input, native_count));
-        } else {
-            var fold = Setup.FoldInput{};
-            if (node.children.len > fold.keys.len) return error.GpuNativeRecursionInstallTopology;
-            for (node.children) |child| {
-                if (child >= i) return error.GpuNativeRecursionInstallTopology;
-                if (authorities[child]) |*authority| {
-                    fold.nodes[fold.count] = authority;
-                    fold.keys[fold.count] = &authority.authority;
-                    fold.count += 1;
-                } else break;
-            }
-            if (fold.count != node.children.len) continue;
-            try slot.startFold(i, fold);
-        }
-        if (slot.lease == null) break;
-    }
-    var used: usize = 0;
-    for (queue) |*slot| used += @intFromBool(slot.lease != null);
-    timing.max_ready = @max(timing.max_ready, used);
-}
-
-fn leafInput(topo: *const D.Topology, node: D.RecursionNode, input: RC.RecipeInputs, native_count: usize) !Setup.LeafInput {
-    const truth_keys = input.fixed.device_truths orelse return error.GpuNativeRecursionSetupMissing;
-    const n = node.segments.len + node.truths.len;
-    if (n == Seed.service_group_members and topo.grouped_recursion and node.segments.len == 0) {
-        const span = try Recipe.ServiceGroupSpan.init(@intCast(native_count + node.truths[0]), input.inventory.workers.len);
-        var group = Recipe.ServiceGroup{ .span = span, .members = undefined };
-        for (node.truths, &group.members) |truth, *member| {
-            if (truth >= input.truths.len) return error.GpuNativeRecursionInstallTopology;
-            member.* = .{ .truth = input.truths[truth], .expected = input.inventory.workers[native_count + truth], .config = input.config, .producer_fixed = truth_keys[truth] };
-        }
-        return .{ .services = group };
-    }
-    if (n != 1) return error.GpuNativeRecursionInstallTopology;
-    const index = leafOrdinal(node, native_count, 0);
-    if (index >= input.inventory.workers.len) return error.GpuNativeRecursionInstallTopology;
-    const expected = input.inventory.workers[index];
-    if (index < native_count) return .{ .cpu = .{
-        .setup = input.cpus[index],
-        .request = input.requests[index],
-        .expected = expected,
-        .first = input.inventory.first_ids[index],
-        .config = input.config,
-        .producer_fixed = input.fixed.cpu_keys[index],
-    } };
-    if (node.segments.len != 0) return error.GpuNativeRecursionInstallTopology;
-    return .{ .truth = .{ .truth = input.truths[index - native_count], .expected = expected, .config = input.config, .producer_fixed = truth_keys[index - native_count] } };
-}
-
-fn leafOrdinal(node: D.RecursionNode, native_count: usize, member: usize) usize {
-    return if (member < node.segments.len) node.segments[member] else native_count + node.truths[member - node.segments.len];
-}
 
 /// Native stage-two and truth maps are immutable throughout class installation.
 // Read their admitted framing on the worker; only the coordinator adopts entries.
@@ -803,215 +688,18 @@ const CompleteLeaves = struct {
             for (self.topo.nodes[ordinal].truths, &children, &storage) |truth, *child, *shape_storage| {
                 const index = self.native_count + truth;
                 const expected = self.input.inventory.workers[index];
-                const source = try LeafSource.get(self.stage2, self.truth_factory, self.leaf_keys[index], false);
+                const source = try Setup.LeafSource.get(self.stage2, self.truth_factory, self.leaf_keys[index], false);
                 if (source.tail != Seed.service_group_tail_seeds) return error.GpuNativeRecursionInstallTopology;
                 child.* = .{ .shape = try source.shape(shape_storage), .wire_words = try Setup.regionWordsForBytes(source.wire_bytes), .n_outputs = 0, .identity = @splat(0), .fixed_root = Outer.Recorder.words8(expected.fixed) };
             }
             return leaf_builder.serviceGroup(graph, children, recipe.services.span, @intCast(ordinal));
         }
-        const index = leafOrdinal(self.topo.nodes[ordinal], self.native_count, 0);
+        const index = Preparation.leafOrdinal(self.topo.nodes[ordinal], self.native_count, 0);
         var storage: Seed.Shape.TreeStorage = undefined;
-        const source = try LeafSource.get(self.stage2, self.truth_factory, self.leaf_keys[index], recipe == .cpu);
+        const source = try Setup.LeafSource.get(self.stage2, self.truth_factory, self.leaf_keys[index], recipe == .cpu);
         return leaf_builder.leaf(graph, try source.shape(&storage), source.wire_bytes, @intCast(ordinal), source.tail);
     }
 };
-
-const LeafSource = struct {
-    pcs: *const NP.PcsJob,
-    image_words: usize,
-    wire_bytes: usize,
-    tail: ?u32 = null,
-
-    fn cpu(framing: *const S2.ClassFraming) LeafSource {
-        return .{ .pcs = framing.pcs, .image_words = framing.program.pcs_words, .wire_bytes = framing.program.max_encoded_bytes };
-    }
-
-    fn get(stage2: *S2.Factory, truths: *TF.Factory, key: G.ClassKey, is_cpu: bool) !LeafSource {
-        if (is_cpu) {
-            const pool = stage2.classes.get(S2.framingKey(key)) orelse return error.GpuNativeClassNotWarmed;
-            return cpu(pool.instances.items[0]);
-        }
-        const family = truths.classes.get(key) orelse return error.GpuNativeClassNotWarmed;
-        const class = family.class;
-        return .{ .pcs = &class.pcs, .image_words = class.encode.pcs_words, .wire_bytes = class.encode.max_encoded_bytes, .tail = try LB.truthTailSeeds(class.claim_count) };
-    }
-
-    fn shape(self: LeafSource, storage: *Seed.Shape.TreeStorage) !Seed.Shape {
-        const admitted = try Seed.Shape.fromPcs(self.pcs.prepared.metadata.shape, storage);
-        const words = (try Seed.Layout.of(admitted)).words;
-        if (words != self.image_words or words != self.pcs.outputWords()) return error.GpuNativeLeafImageShape;
-        return admitted;
-    }
-};
-
-fn requireRecordedLeafShape(a: std.mem.Allocator, recorded_words: []const u32, admitted: Seed.Shape) !void {
-    var cursor: usize = 0;
-    const recorded = try Seed.Shape.parse(a, recorded_words, &cursor);
-    defer a.free(recorded.trees);
-    if (cursor != recorded_words.len or !admitted.eql(recorded)) return error.GpuNativeLeafImageShape;
-}
-
-fn leafFor(entry: *const Outer.NodeClasses.Entry, shape: Seed.Shape, wire_bytes: usize) !Leaf {
-    return .{
-        .wire_words = try Setup.regionWordsForBytes(wire_bytes),
-        .image_words = std.math.cast(u32, (try Seed.Layout.of(shape)).words) orelse return error.GnNodeChildRegion,
-        .tail_seeds = entry.tail,
-        .output_words = std.math.cast(u32, entry.staged.expected.len) orelse return error.GnNodeChildRegion,
-    };
-}
-
-const Warm = struct {
-    entry: *Outer.NodeClasses.Entry,
-    fixed: ?Fixed.FixedJob,
-    validation: Outer.NodeClasses.Entry.FixedValidation = .commit,
-    ingress: api.Footprint,
-
-    fn validationKey(entry: *const Outer.NodeClasses.Entry, epoch: u64) !?[32]u8 {
-        const compressed = entry.compressed orelse return null;
-        const plan = if (entry.staged.statics.fixed_plan) |*p| p else return error.OuterJobWholeStagingMissing;
-        if (compressed.fixed_words != plan.coefficient_words) return error.PackedClassShape;
-        return packedFixedKey(compressed.key, entry.staged.fixed_root, plan.logs, plan.beta, epoch);
-    }
-
-    fn packedFixedKey(image: [32]u8, root: [32]u8, logs: []const u32, beta: u32, epoch: u64) [32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("rv64/outer/packed-fixed-validation/v1\x00");
-        hash.update(&image);
-        hash.update(&root);
-        var header: [12]u8 = undefined;
-        std.mem.writeInt(u32, header[0..4], beta, .little);
-        std.mem.writeInt(u64, header[4..12], epoch, .little);
-        hash.update(&header);
-        hash.update(std.mem.sliceAsBytes(logs));
-        return hash.finalResult();
-    }
-
-    pub fn init(owner: *Owner, entry: *Outer.NodeClasses.Entry, validation: Outer.NodeClasses.Entry.FixedValidation) !Warm {
-        const plan = if (entry.staged.statics.fixed_plan) |*p| p else return error.OuterJobWholeStagingMissing;
-        if (validation != .commit) {
-            const compressed = entry.compressed orelse return error.PackedClassShape;
-            if (compressed.fixed_words != plan.coefficient_words) return error.PackedClassShape;
-        }
-        var fixed: ?Fixed.FixedJob = if (validation != .commit) null else blk: {
-            var inputs: Fixed.Inputs = .{ .plan = plan, .raw = if (entry.compressed != null) null else entry.staged.fixed_raw, .sorted_logs = entry.staged.statics.fixed_sorted_logs, .device_twiddles = entry.staged.statics.device_twiddles };
-            if (!inputs.device_twiddles) {
-                const tw = try entry.staged.statics.table(plan.eval_log);
-                inputs.twiddles = tw.twiddles;
-                inputs.itwiddles = tw.itwiddles;
-            }
-            var commit = try Fixed.FixedJob.init(inputs, &owner.shared.kernels);
-            if (entry.compressed == null) commit.handoff = .{ .key = entry.staged.fixedRegionKey(), .words = @intCast(plan.coefficient_words) };
-            break :blk commit;
-        };
-        errdefer if (fixed) |*commit| commit.deinit(owner.a);
-        if (fixed) |*commit| if (entry.staged.statics.device_twiddles) try commit.boundScratch(owner.a);
-        return .{ .entry = entry, .fixed = fixed, .validation = validation, .ingress = try entry.installFootprint(validation) };
-    }
-    pub fn deinit(self: *Warm, a: std.mem.Allocator) void {
-        if (self.fixed) |*commit| commit.deinit(a);
-    }
-    pub fn classKey(self: *Warm) [32]u8 {
-        var hash = std.crypto.hash.sha2.Sha256.init(.{});
-        hash.update("rv64/m8/native-recursion/install/v1");
-        hash.update(&self.entry.class_key);
-        return hash.finalResult();
-    }
-    pub fn footprint(self: *Warm) api.Footprint {
-        var fp = if (self.fixed) |*commit| commit.footprint() else api.Footprint{ .device_words = 0 };
-        fp.device_words += self.ingress.device_words;
-        fp.staged_words += self.ingress.staged_words;
-        fp.pinned_words += self.ingress.pinned_words;
-        return fp;
-    }
-    pub fn stage(self: *Warm, s: *api.Stager) !void {
-        if (self.fixed) |*commit| try commit.stage(s);
-        const decoded = try self.entry.stageInstall(s, self.validation);
-        if (self.fixed) |*commit| commit.packed_input = decoded;
-    }
-    pub fn enqueue(self: *Warm, e: *api.Enqueue) !void {
-        if (self.fixed) |*commit| return commit.enqueue(e);
-        try e.waitStaged();
-    }
-    pub fn finish(self: *Warm, view: api.SlabView) !void {
-        // For generated packed classes every request decodes the staged
-        // image, rebuilds the FIXED opening tree and requires its root to
-        // equal the independent setup root in the device encoder. Both the
-        // decoder and PCS verdict are mandatory at publication.
-        const commit = if (self.fixed) |*job| job else return;
-        try commit.finish(view);
-        const root = commit.root orelse return error.GpuNativeRecursionFixedCold;
-        if (!std.mem.eql(u8, &root, &self.entry.staged.fixed_root)) return error.GpuNativeRecursionFixedRootMismatch;
-    }
-    pub fn abort(self: *Warm) void {
-        if (self.fixed) |*commit| commit.abort();
-    }
-};
-
-test "cold FIXED installation checks the decoder verdict and independently pinned root" {
-    const Tree = @typeInfo(@FieldType(Fixed.Inputs, "plan")).pointer.child;
-    var plan = try Tree.init(std.testing.allocator, &.{5}, 1);
-    defer plan.deinit(std.testing.allocator);
-    var installed: St.Staged = undefined;
-    installed.fixed_root = @splat(0x5a);
-    var entry: Outer.NodeClasses.Entry = undefined;
-    entry.staged = &installed;
-    var worker = Warm{
-        .entry = &entry,
-        .fixed = try Fixed.FixedJob.init(.{ .plan = &plan, .raw = null, .sorted_logs = &.{5}, .twiddles = &.{}, .itwiddles = &.{} }, undefined),
-        .ingress = .{ .device_words = 0 },
-    };
-    var words: [9]u32 = @splat(0x5a5a5a5a);
-    words[8] = G.Verdict.accepted;
-    const view = api.SlabView{ .layout = &worker.fixed.?.layout, .words = &words };
-    try worker.finish(view);
-    words[3] ^= 1;
-    try std.testing.expectError(error.GpuNativeRecursionFixedRootMismatch, worker.finish(view));
-    words[3] ^= 1;
-    words[8] = G.Verdict.reject(.class_unpack, 1);
-    try std.testing.expectError(error.PackedClassDecodeFailed, worker.finish(view));
-}
-
-test "packed FIXED validation binds the image, authority, layout, and worker epoch" {
-    const image: [32]u8 = @splat(0x12);
-    const root: [32]u8 = @splat(0x43);
-    const key = Warm.packedFixedKey(image, root, &.{ 5, 6 }, 1, 7);
-    try std.testing.expectEqual(key, Warm.packedFixedKey(image, root, &.{ 5, 6 }, 1, 7));
-    try std.testing.expect(!std.mem.eql(u8, &key, &Warm.packedFixedKey(@splat(0x13), root, &.{ 5, 6 }, 1, 7)));
-    try std.testing.expect(!std.mem.eql(u8, &key, &Warm.packedFixedKey(image, @splat(0x44), &.{ 5, 6 }, 1, 7)));
-    try std.testing.expect(!std.mem.eql(u8, &key, &Warm.packedFixedKey(image, root, &.{ 6, 5 }, 1, 7)));
-    try std.testing.expect(!std.mem.eql(u8, &key, &Warm.packedFixedKey(image, root, &.{ 5, 6 }, 2, 7)));
-    try std.testing.expect(!std.mem.eql(u8, &key, &Warm.packedFixedKey(image, root, &.{ 5, 6 }, 1, 8)));
-}
-
-test "leaf install stages persistent programs without a dummy request workspace" {
-    var sts: @typeInfo(@FieldType(St.Staged, "statics")).pointer.child = undefined;
-    sts.device_twiddles = true;
-    var staged: St.Staged = undefined;
-    staged.statics = &sts;
-    staged.image = .{};
-    staged.image.words[@intFromEnum(St.Region.node)] = 4096;
-    staged.image.words[@intFromEnum(St.Region.twiddles)] = 8192;
-    var entry: Outer.NodeClasses.Entry = undefined;
-    entry.staged = &staged;
-    var descriptor = [_]u32{ 1, 2 };
-    var program = [_]u32{3};
-    var packed_words = [_]u32{ 4, 5, 6 };
-    entry.desc = &descriptor;
-    entry.program = &program;
-    entry.oods_program = &.{};
-    entry.runtime_symbols.oods = null;
-    entry.compressed = .{ .words = &packed_words, .key = @splat(0), .class_words = 4096, .fixed_words = 8192, .channel_count = 1 };
-    const request = try entry.installFootprint(.request);
-    try std.testing.expectEqual(@as(usize, 0), request.device_words);
-    try std.testing.expectEqual(@as(usize, 0), request.staged_words);
-    try std.testing.expectEqual(@as(usize, 6), request.pinned_words);
-    const imported = try entry.installFootprint(.commit);
-    try std.testing.expectEqual(@as(usize, 4096 + 8192 + 64), imported.staged_words);
-    try std.testing.expectEqual(request.pinned_words, imported.pinned_words);
-    const reused = try entry.installFootprint(.resident);
-    try std.testing.expectEqual(@as(usize, 0), reused.device_words);
-    try std.testing.expectEqual(@as(usize, 3), reused.pinned_words);
-}
 
 test "CPU leaf install binds Stage 2 geometry and recreates the recorded seed program" {
     const a = std.testing.allocator;
@@ -1033,8 +721,8 @@ test "CPU leaf install binds Stage 2 geometry and recreates the recorded seed pr
     var framing: S2.ClassFraming = undefined;
     framing.pcs = &pcs;
     framing.program.pcs_words = layout.words;
-    const admitted = try LeafSource.cpu(&framing).shape(&storage);
-    try requireRecordedLeafShape(a, &recorded, admitted);
+    const admitted = try Setup.LeafSource.cpu(&framing).shape(&storage);
+    try Setup.requireRecordedLeafShape(a, &recorded, admitted);
     const cap_log = @import("stwo_circuit_frontend").native_verifier.merkle.sparse_cap_log;
     const proof_seeds = try Seed.leafTapeLength(a, .{ .shape = admitted, .wire_words = 128, .n_outputs = 0, .identity = @splat(0), .fixed_root = @splat(0) }, cap_log);
     const tail = 6;
@@ -1069,7 +757,7 @@ test "CPU leaf install binds Stage 2 geometry and recreates the recorded seed pr
         .profile = @splat(0),
     };
     defer std.heap.c_allocator.free(entry.program);
-    const leaf = try leafFor(&entry, admitted, 127 * 4);
+    const leaf = try Setup.leafFor(&entry, admitted, 127 * 4);
     const region = try leaf.regionWords();
     try entry.programFor(&.{region});
     try std.testing.expect(entry.seedRegionsMatch(&.{region}));
@@ -1084,9 +772,9 @@ test "CPU leaf install binds Stage 2 geometry and recreates the recorded seed pr
     try std.testing.expectEqual(key, entry.node.prog_key);
 
     recorded[3] += 1;
-    try std.testing.expectError(error.GpuNativeLeafImageShape, requireRecordedLeafShape(a, &recorded, admitted));
+    try std.testing.expectError(error.GpuNativeLeafImageShape, Setup.requireRecordedLeafShape(a, &recorded, admitted));
     pcs.plan.output_words += 1;
-    try std.testing.expectError(error.GpuNativeLeafImageShape, LeafSource.cpu(&framing).shape(&storage));
+    try std.testing.expectError(error.GpuNativeLeafImageShape, Setup.LeafSource.cpu(&framing).shape(&storage));
 }
 
 test "truth leaf install binds the declared claim count to the statement suffix" {
@@ -1108,6 +796,7 @@ test "truth leaf install binds the declared claim count to the statement suffix"
 
 test {
     _ = @import("jobs/recursion_fixed_roots.zig");
+    _ = Preparation;
 }
 
 test "leaf install current ticket capacity keeps boundaries and rejects impossible dword counts" {

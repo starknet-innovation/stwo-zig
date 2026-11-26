@@ -4068,7 +4068,7 @@
         "src/products/ethereum/statement/cpu/tests/native_artifact_root.zig",
         "src/products/ethereum/statement/cpu/tests/native_artifact_root_test.zig",
         "src/products/ethereum/statement/cuda/rv64/capture_execution_consumer_test.zig",
-        "src/products/ethereum/statement/cuda/rv64/jobs/driver_ge.zig"
+        "src/products/ethereum/statement/cuda/rv64/jobs/guest_capture_source.zig"
       ],
       "default_evidence": {
         "path": "src/integrations/riscv_cpu/tests/native_artifact_root.zig",
@@ -4101,16 +4101,16 @@
       "expires": "2026-12-09"
     },
     "STWO_RV64_M8_GN_INSTALL": {
-      "owner": "src/integrations/riscv_cuda/rv64/outer_node_prover.zig",
+      "owner": "src/integrations/riscv_cuda/rv64/outer_job_factory.zig",
       "default": "false",
       "status": "retire-after-native-default",
       "date": "2026-11-08",
       "references": [
-        "src/integrations/riscv_cuda/rv64/outer_node_prover.zig",
+        "src/integrations/riscv_cuda/rv64/outer_job_factory.zig",
         "src/products/ethereum/statement/cuda/rv64/native_recursion_install.zig"
       ],
       "default_evidence": {
-        "path": "src/integrations/riscv_cuda/rv64/outer_node_prover.zig",
+        "path": "src/integrations/riscv_cuda/rv64/outer_job_factory.zig",
         "text": "        const v = std.posix.getenv(\"STWO_RV64_M8_GN_INSTALL\") orelse return false;\n        return std.mem.eql(u8, v, \"1\");\n    }\n    fn installNode(ordinal: u32, e: *Entry) !void {\n        mutex.lock();\n        defer mutex.unlock();\n        if (install_nodes.get(ordinal)) |old| {\n            if (old != e) return error.GnNodeInstallOrdinal;"
       },
       "expires": "2026-12-09"

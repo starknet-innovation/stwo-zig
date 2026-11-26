@@ -79,14 +79,14 @@ const Manifest = struct {
     immutable_device_bytes: u64 = 512 << 20,
 };
 
-const env = @import("rv64/parity/gn_s2_common.zig").env;
-const envBytes = @import("rv64/parity/gn_s2_common.zig").envBytes;
-const words8 = @import("rv64/parity/gn_s2_common.zig").words8;
-const feltOf = @import("rv64/parity/gn_s2_common.zig").feltOf;
-const PeerCopy = @import("rv64/parity/gn_s2_common.zig").PeerCopy;
-const Peer = @import("rv64/parity/gn_s2_common.zig").Peer;
-const Done = @import("rv64/parity/gn_s2_common.zig").Done;
-const run = @import("rv64/parity/gn_s2_common.zig").run;
+const env = @import("rv64/parity/native_common.zig").env;
+const envBytes = @import("rv64/parity/native_common.zig").envBytes;
+const words8 = @import("rv64/parity/native_common.zig").words8;
+const feltOf = @import("rv64/parity/native_common.zig").feltOf;
+const PeerCopy = @import("rv64/parity/native_common.zig").PeerCopy;
+const Peer = @import("rv64/parity/native_common.zig").Peer;
+const Done = @import("rv64/parity/native_common.zig").Done;
+const run = @import("rv64/parity/native_common.zig").run;
 const Seg = @import("rv64/parity/gn_s2_capture.zig").Seg;
 const Recorder = @import("rv64/parity/gn_s2_capture.zig").Recorder;
 const CompositionDecorator = @import("rv64/parity/gn_s2_capture.zig").CompositionDecorator;
