@@ -319,3 +319,28 @@ a directory and persists its entries through an independently opened readable
 handle. It preserves the caller’s handle and propagates open/sync failures;
 callers must not report durable publication after failure. This supports Linux
 non-iterable (`O_PATH`) handles as well as macOS directory handles.
+
+### Grouped service proof qualification
+
+The candidate builder verifies consecutive secp256k1 row ADD, SHA-256 and
+ARITH256 native proofs inside one OM31 circuit. Each member retains its own
+FIXED authority, transcript and FRI check. The outer proof exposes a
+BLAKE2s digest over the ordered span and three public frames. The receiver
+derives that digest from its admitted worker roster, manifest and MAIN
+roots. The full-tree qualification receiver authenticates one graph for
+the three workers and checks each original frame in execution-wide Wire35
+closure. Run `recurse-service-group-candidate` and then
+`verify-service-group-candidate` with the Ethereum CPU recursion binary,
+the matching security profile, and `CONFIG OUT FIXED_SETUP_BYTES [RECEIVER_BYTES]`.
+Supply the existing native proof bundle and its `OUT/recursion-om31`
+tree. The producer independently verifies the existing prefix against source
+before copying its proofs to `OUT/recursion-service-group`. It generates
+the grouped leaf and affected parent folds. The independent receiver requires every
+physical node and compares the root and schema-4 tree against reconstructed
+bytes. The arity-four candidate admits an ADD/SHA/ARITH tail. The canonical
+proof modes continue to use their singleton plan.
+
+The membership and framing tests run under
+`zig build test-riscv64-om31-native-pcs -Doptimize=ReleaseFast` from the
+checkout root. The three-service candidate is owned by the existing OM31
+native recursion package. [Candidate implementation](rv64_recursion/om31_native/truth_group.zig)

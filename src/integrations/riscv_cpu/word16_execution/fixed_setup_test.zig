@@ -268,3 +268,49 @@ test "different immutable layouts share exact coefficient payloads and retain cu
     try sharedLayoutCase(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, sharedLayoutCase, .{});
 }
+
+test "fixed extensions reuse identical columns across reordered keys without reusing the root" {
+    const a = std.testing.allocator;
+    var fixture = Fixture.init();
+    var disjoint = try Fixed.Cache.init(a, 4 << 20);
+    defer disjoint.deinit();
+    const unique = [_]engine.poly.circle.CircleCoefficients{ try .initOwned(&fixture.first), try .initOwned(&fixture.second) };
+    var ordinary = try disjoint.acquireCoefficients(&unique, descriptor(2));
+    defer ordinary.deinit();
+    try std.testing.expectEqual(@as(usize, 2), disjoint.snapshot().ordinary_extension_columns);
+    try std.testing.expectEqual(@as(usize, 0), disjoint.snapshot().extension_cache_bytes);
+    var same_contents = fixture.first;
+    const polys = [_]engine.poly.circle.CircleCoefficients{
+        try .initOwned(&fixture.first), try .initOwned(&fixture.second), try .initOwned(&same_contents),
+    };
+    var cache = try Fixed.Cache.init(a, 4 << 20);
+    defer cache.deinit();
+    var first = try cache.acquireCoefficients(&polys, descriptor(2));
+    defer first.deinit();
+    const stats = cache.snapshot();
+    try std.testing.expectEqual(@as(usize, 2), stats.extension_transforms);
+    const reordered = [_]engine.poly.circle.CircleCoefficients{ polys[1], polys[0], polys[1] };
+    var second = try cache.acquireCoefficients(&reordered, descriptor(2));
+    defer second.deinit();
+    try std.testing.expectEqual(stats.extension_transforms, cache.snapshot().extension_transforms);
+    try std.testing.expect(!std.mem.eql(u8, &first.key.root, &second.key.root));
+    var reference = try QScheme.init(a, cfg(2));
+    defer reference.deinit(a);
+    var channel: core.channel.blake2s.Blake2sChannel = .{};
+    try reference.commitPolys(a, &reordered, &channel);
+    try std.testing.expectEqual(reference.trees.items[0].root(), second.key.root);
+    const positions = [_]usize{ 0, 1, 19, 147, 251 };
+    var actual = try second.key.tree.decommit(a, &positions);
+    defer actual.deinit(a);
+    var expected = try reference.trees.items[0].decommit(a, &positions);
+    defer expected.deinit(a);
+    try std.testing.expectEqualDeep(expected, actual);
+    var other_rate = try cache.acquireCoefficients(&reordered, descriptor(1));
+    defer other_rate.deinit();
+    try std.testing.expectEqual(stats.extension_transforms + 2, cache.snapshot().extension_transforms);
+    fixture.first[0] = fixture.first[0].add(M.one());
+    var changed = try cache.acquireCoefficients(&reordered, descriptor(2));
+    defer changed.deinit();
+    try std.testing.expectEqual(stats.extension_transforms + 3, cache.snapshot().extension_transforms);
+    try std.testing.expect(!std.mem.eql(u8, &second.key.root, &changed.key.root));
+}

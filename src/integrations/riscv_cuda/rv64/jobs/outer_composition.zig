@@ -2,10 +2,10 @@
 //! order, same words as resident_composition.zig Job.run on the deployed
 //! outer configuration (STWO_RV64_COMPOSITION_ENQUEUE=1, direct extension,
 //! no role workspace, no selected columns, no auxiliary columns, no sparse
-//! role): for each catalogue role in order,
+//! role): for each component in catalogue order,
 //!   LDE of every source column straight from its coefficient buffer
 //!   (n2b_columns, eval_log = trace_log + 1 for every outer component),
-//!   the AOT role kernel accumulating into the per-height quotient bucket,
+//!   each of its AOT role kernels accumulating into the per-height quotient bucket,
 //! then the finish kernel (bucket fold + interpolation + split), the commit
 //! LDE and the Merkle tree. Differences are custody only: parameters and
 //! powers come from device memory (z, alpha, claims, coefficient never reach
@@ -42,6 +42,7 @@ pub const Source = struct { tree: u8, index: u32 };
 /// Class-static description of one catalogue role.
 pub const RoleStatic = struct {
     id: u32,
+    component: u32,
     trace_log: u32,
     eval_log: u32,
     widths: [3]u32,
@@ -135,6 +136,7 @@ pub const Inputs = struct {
     /// null, and `commit` names the schedule.
     tree: ?K.Buffer = null,
     commit: ?*const CommitStream = null,
+    opening: ?TC.OpeningImage = null,
     /// 8 device words receiving the composition root.
     root_out: [*]u32,
     status: [*]u32,
@@ -152,7 +154,7 @@ pub fn enqueue(device: *K.Device, kernels: *const Kernels, st: *const Static, in
     const n2b = device.kernels.n2b_columns;
     if (st.beta != 1) return error.UnsupportedOuterJobBlowup;
     if (in.output.words < st.coefficientWords()) return error.OuterCompositionBufferTooSmall;
-    if ((in.tree == null) == (in.commit == null)) return error.OuterJobTreeCustodyMismatch;
+    if ((in.tree == null) == (in.commit == null) or (in.opening != null and in.commit == null)) return error.OuterJobTreeCustodyMismatch;
     if (in.tree) |t| if (t.words < st.treeWords()) return error.OuterCompositionBufferTooSmall;
     // Parameters of every role from the device challenges and claims.
     try device.check(kernels.params(device.ctx, K.lane, in.bases.at(st.param_table), st.param_total, in.lookup, in.claims, in.parameters, in.status));
@@ -171,7 +173,12 @@ pub fn enqueue(device: *K.Device, kernels: *const Kernels, st: *const Static, in
         try device.clear(buckets[role.eval_log].?.ptr, 8 * n);
     };
     var next: u32 = st.total;
-    for (st.roles) |role| {
+    // Roles partition the constraints, but their coefficient spans and
+    // evaluation domain belong to the component. Keep its LDE until the
+    // last consecutive role consumes it on this stream.
+    var remaining = st.roles;
+    while (remaining.len != 0) {
+        const role = remaining[0];
         const el = role.eval_log;
         const n = @as(u64, 1) << @intCast(el);
         const columns: u64 = role.widths[0] + role.widths[1] + role.widths[2];
@@ -192,29 +199,33 @@ pub fn enqueue(device: *K.Device, kernels: *const Kernels, st: *const Static, in
             device.counters.internal += launches -| 1;
             c = end;
         }
-        if (role.roots > next) return error.NotEnoughCoefficients;
-        next -= role.roots;
-        const w = role.widths;
-        const packet = Abi.CompositionRole{
-            .role = role.id,
-            .trace_log = role.trace_log,
-            .eval_log = el,
-            .first_row = 0,
-            .row_count = @intCast(n),
-            .trees = .{ arena.ptr, arena.ptr + w[0] * n, arena.ptr + (w[0] + w[1]) * n },
-            .tree_words = .{ @max(1, w[0] * n), @max(1, w[1] * n), @max(1, w[2] * n) },
-            .column_offsets = @ptrCast(@alignCast(in.bases.at(role.masks))),
-            .mask_count = role.mask_count,
-            .parameters = in.parameters + 8 * @as(usize, role.param_first),
-            .parameter_count = role.param_count,
-            .powers = in.powers + 8 * @as(usize, next),
-            .constraint_count = role.roots,
-            .denominator_inverses = in.bases.at(role.denominators),
-            .output = buckets[el].?.ptr,
-        };
-        var launches: u32 = 0;
-        try device.check(kernels.role(device.ctx, K.lane, &packet, &launches));
-        device.counters.internal += launches -| 1;
+        while (remaining.len != 0 and remaining[0].component == role.component) {
+            const part = remaining[0];
+            remaining = remaining[1..];
+            if (part.roots > next) return error.NotEnoughCoefficients;
+            next -= part.roots;
+            const w = part.widths;
+            const packet = Abi.CompositionRole{
+                .role = part.id,
+                .trace_log = part.trace_log,
+                .eval_log = el,
+                .first_row = 0,
+                .row_count = @intCast(n),
+                .trees = .{ arena.ptr, arena.ptr + w[0] * n, arena.ptr + (w[0] + w[1]) * n },
+                .tree_words = .{ @max(1, w[0] * n), @max(1, w[1] * n), @max(1, w[2] * n) },
+                .column_offsets = @ptrCast(@alignCast(in.bases.at(part.masks))),
+                .mask_count = part.mask_count,
+                .parameters = in.parameters + 8 * @as(usize, part.param_first),
+                .parameter_count = part.param_count,
+                .powers = in.powers + 8 * @as(usize, next),
+                .constraint_count = part.roots,
+                .denominator_inverses = in.bases.at(part.denominators),
+                .output = buckets[el].?.ptr,
+            };
+            var launches: u32 = 0;
+            try device.check(kernels.role(device.ctx, K.lane, &packet, &launches));
+            device.counters.internal += launches -| 1;
+        }
     }
     if (next != 0) return error.UnusedCompositionCoefficients;
     // Finish: fold buckets, interpolate, split into coefficient chunks.
@@ -239,7 +250,7 @@ pub fn enqueue(device: *K.Device, kernels: *const Kernels, st: *const Static, in
         // twiddle arguments as the full call below (the commit-height tree as
         // staged, domain size rows/2); logs are the per-column chunk logs.
         if (c.tree.order.len != count) return error.OuterCompositionStreamMismatch;
-        return TC.enqueueStreamed(device, &c.tree, &c.stream, .{ .evaluations = in.output.ptr, .coefficients = in.output.ptr, .root_out = in.root_out, .interpolate = false, .twiddle_mode = .whole, .statics = .{
+        return TC.enqueueStreamed(device, &c.tree, &c.stream, .{ .opening = in.opening, .evaluations = in.output.ptr, .coefficients = in.output.ptr, .root_out = in.root_out, .interpolate = false, .twiddle_mode = .whole, .statics = .{
             .sorted_logs = in.bases.at(st.commit_logs),
             .twiddles = in.bases.at(in.twiddles[commit_log]),
             .twiddle_words = @intCast(in.twiddles[commit_log].words),

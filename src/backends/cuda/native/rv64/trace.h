@@ -17,6 +17,10 @@ extern "C" int
 stwo_rv64_trace_tree_on(void *, uint32_t,
                         const stwo::cuda::blake2s::MixedSegment *, uint32_t,
                         uint32_t, uint32_t *, uint64_t);
+// Like trace_tree_on with independently owned, non-overlapping prefix scratch.
+extern "C" int stwo_rv64_trace_tree_separate_prefix_on(
+    void *, uint32_t, const stwo::cuda::blake2s::MixedSegment *, uint32_t,
+    uint32_t, uint32_t *, uint64_t, uint32_t *, uint64_t);
 extern "C" int
 stwo_rv64_trace_open_on(void *, uint32_t,
                         const stwo::cuda::blake2s::MixedSegment *, uint32_t,

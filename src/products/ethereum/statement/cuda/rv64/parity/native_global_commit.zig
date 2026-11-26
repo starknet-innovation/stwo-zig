@@ -230,7 +230,7 @@ pub const CommitParityJob = struct {
     }
     pub fn footprint(self: *CommitParityJob) api.Footprint {
         const staged = self.plan.stagedWords(self.host_words) + 4 * 64;
-        return .{ .device_words = staged + self.plan.deviceWords() + Peer.deviceWords(NC.Input, self.inputs, self.logs) + 4 * 64, .staged_words = staged, .slab_words = self.layout.words, .pinned_words = 8 * self.plan.logs.len + self.host_words + 2 * (self.plan.tw.twiddles.len + self.plan.tw.itwiddles.len) + 64 };
+        return .{ .device_words = staged + self.plan.deviceWords() + Peer.deviceWords(NC.Input, self.inputs, self.logs) + 4 * 64, .staged_words = staged, .slab_words = self.layout.words, .pinned_words = 8 * self.plan.logs.len + self.host_words + 2 * self.plan.twiddleWords() + 64 };
     }
     pub fn stage(self: *CommitParityJob, s: *api.Stager) !void {
         try self.plan.stage(s, self.inputs);

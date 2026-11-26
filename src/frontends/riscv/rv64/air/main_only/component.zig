@@ -34,12 +34,14 @@ pub const Component = struct {
         return A.shape(self.role()).max_degree;
     }
     pub fn validate(self: *const @This()) !void {
-        if (self.log_size < 5 or self.log_size > 22) return error.InvalidMainOnlyGeometry;
+        const cpu = self.public == .cpu or self.public == .cpu_compact;
+        const max_log: u32 = if (cpu) @import("../word16_execution/layout.zig").MAX_LOG else 22;
+        if (self.log_size < 5 or self.log_size > max_log) return error.InvalidMainOnlyGeometry;
         switch (self.public) {
-            .cpu => |p| try @import("../word16_execution/types.zig").validateInputs(.{ .steps = p.steps, .initial_pc = p.initial_pc, .final_pc = p.final_pc, .epoch = p.epoch }, self.log_size),
+            .cpu => |p| try @import("../word16_execution/types.zig").validateInputs(.{ .steps = p.steps, .initial_pc = p.initial_pc, .final_pc = p.final_pc, .epoch = p.epoch, .wide_clock = p.wide_clock }, self.log_size),
             // Compact PCs are felt(next) = next0 + 65536*next1 values: both
             // public endpoints must be canonical 31-bit-safe compact PCs.
-            .cpu_compact => |p| try @import("../word16_execution/types.zig").validateCompactInputs(.{ .steps = p.steps, .initial_pc = p.initial_pc, .final_pc = p.final_pc, .epoch = p.epoch }, self.log_size),
+            .cpu_compact => |p| try @import("../word16_execution/types.zig").validateCompactInputs(.{ .steps = p.steps, .initial_pc = p.initial_pc, .final_pc = p.final_pc, .epoch = p.epoch, .wide_clock = p.wide_clock }, self.log_size),
             .ls, .mul, .div => |p| {
                 if (p.count >= @as(u32, 1) << @intCast(self.log_size)) return error.InvalidMainOnlyCount;
             },

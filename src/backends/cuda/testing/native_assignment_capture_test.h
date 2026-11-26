@@ -13,21 +13,32 @@ bool test_assignment_capture(DeviceArena &arena) {
             if (assignment) stwo_assignment_graph_destroy_v1(context, assignment);
         }
     } owned{arena.context};
-    auto *first = arena.allocate(12), *second = arena.allocate(12);
-    auto *records = arena.allocate(8), *ends = arena.allocate(1), *status = arena.allocate(1);
+    constexpr uint32_t levels = 100, rows = levels + 64, vars = rows + 2;
+    auto *first = arena.allocate(4 * vars), *second = arena.allocate(4 * vars);
+    auto *records = arena.allocate(8 * rows), *ends = arena.allocate(levels), *status = arena.allocate(1);
     if (!first || !second || !records || !ends || !status) return false;
-    const StwoCircuitAssignmentTask task{0, 2, {0, 1, 0, 0, 0, 0}};
-    const StwoAssignmentGraphStep step{0, 1, 0, 1, 0};
-    const uint32_t end = 1, zero = 0;
-    uint32_t inputs[12] = {3, 0, 0, 0, 2};
+    // Follow the final writer through two 33-wide levels, separated by
+    // more than two complete warp ballots of single-lane dependencies.
+    StwoCircuitAssignmentTask tasks[rows];
+    uint32_t offsets[levels], count = 0, previous = 0;
+    for (uint32_t i = 0; i < levels; ++i) {
+        const uint32_t width = (i == 2 || i == 82) ? 33 : 1;
+        for (uint32_t lane = 0; lane < width; ++lane, ++count)
+            tasks[count] = {0, count + 2, {previous, lane + 1 == width ? 1u : 0u}};
+        previous = count + 1;
+        offsets[i] = count;
+    }
+    const StwoAssignmentGraphStep steps[] = {{0, 1, 0, 1, 0}, {1, rows - 1, 1, levels - 1, 1}};
+    const uint32_t zero = 0;
+    uint32_t inputs[4 * vars] = {3, 0, 0, 0, 2};
     if (!arena.upload(first, inputs, sizeof(inputs)) ||
-        !arena.upload(records, &task, sizeof(task)) ||
-        !arena.upload(ends, &end, sizeof(end)) ||
+        !arena.upload(records, tasks, sizeof(tasks)) ||
+        !arena.upload(ends, offsets, sizeof(offsets)) ||
         !arena.upload(status, &zero, sizeof(zero)) ||
         !check(stwo_exec_context_sync(arena.context), "assignment setup")) return false;
-    StwoCircuitAssignmentJob job{first, records, nullptr, status, 3, 1, 0, 0, 1, 0};
-    if (!check(stwo_assignment_graph_create_v1(arena.context, 0, &job, &step, 1, ends, 1, &owned.assignment), "assignment graph create") ||
-        !check(stwo_assignment_graph_launch_v1(arena.context, 0, owned.assignment, &job, ends, 1), "assignment direct replay") ||
+    StwoCircuitAssignmentJob job{first, records, nullptr, status, vars, rows, 0, 0, rows, 0};
+    if (!check(stwo_assignment_graph_create_v1(arena.context, 0, &job, steps, 2, ends, levels, &owned.assignment), "assignment graph create") ||
+        !check(stwo_assignment_graph_launch_v1(arena.context, 0, owned.assignment, &job, ends, levels), "assignment direct replay") ||
         !check(stwo_exec_context_sync(arena.context), "assignment direct wait")) return false;
     uint64_t charge = UINT64_MAX;
     if (!check(stwo_assignment_graph_charged_bytes_v1(arena.context, owned.assignment, &charge), "assignment graph charge") || charge == UINT64_MAX) return false;
@@ -38,7 +49,7 @@ bool test_assignment_capture(DeviceArena &arena) {
     const auto stream = static_cast<cudaStream_t>(arena.stream);
     if (!check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "assignment begin enclosing capture")) return false;
     void *uncached = nullptr;
-    const int refused = stwo_assignment_graph_create_v1(arena.context, 0, &job, &step, 1, ends, 1, &uncached);
+    const int refused = stwo_assignment_graph_create_v1(arena.context, 0, &job, steps, 2, ends, levels, &uncached);
     cudaStreamCaptureStatus capture;
     const auto capture_query = cudaStreamIsCapturing(stream, &capture);
     if (refused != cudaErrorStreamCaptureUnsupported || uncached != nullptr ||
@@ -48,7 +59,7 @@ bool test_assignment_capture(DeviceArena &arena) {
         std::fprintf(stderr, "assignment creation must refuse before disturbing enclosing capture\n");
         return false;
     }
-    const int launch = stwo_assignment_graph_launch_v1(arena.context, 0, owned.assignment, &job, ends, 1);
+    const int launch = stwo_assignment_graph_launch_v1(arena.context, 0, owned.assignment, &job, ends, levels);
     const auto end_capture = cudaStreamEndCapture(stream, &owned.graph);
     if (!check(launch, "assignment inside enclosing capture") ||
         !check(end_capture, "assignment end enclosing capture") ||
@@ -59,13 +70,14 @@ bool test_assignment_capture(DeviceArena &arena) {
             if (!arena.upload(second, inputs, sizeof(inputs)) ||
                 !check(stwo_exec_context_sync(arena.context), "assignment fresh input wait")) return false;
         }
-        uint32_t actual[12], original[12], verdict = 1;
+        uint32_t actual[4 * vars], original[4 * vars], verdict = 1;
         if (!check(cudaGraphLaunch(owned.exec, stream), "assignment enclosing replay") ||
             !arena.read(actual, second, sizeof(actual)) ||
             !arena.read(original, first, sizeof(original)) ||
             !arena.read(&verdict, status, sizeof(verdict)) ||
             !check(stwo_exec_context_sync(arena.context), "assignment result wait")) return false;
-        if (actual[8] != expected || original[8] != 5 || verdict != 0) return false;
+        if (actual[8] != expected || original[8] != 5 || actual[4 * (vars - 1)] != inputs[0] + levels * inputs[4] ||
+            original[4 * (vars - 1)] != 3 + levels * 2 || verdict != 0) return false;
     }
     return true;
 }

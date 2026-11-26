@@ -93,6 +93,8 @@ pub fn build(b: *std.Build) void {
     var retained_vm_run: ?*std.Build.Step.Run = null;
     var ethereum_runner: ?*std.Build.Step.Run = null;
     inline for (.{
+        .{ .component = cuda_component, .step = "test-recursion-leaf-install", .description = "Check recursion seed binding and FIXED installation custody", .root = "cuda/rv64/native_recursion_install.zig", .filters = &[_][]const u8{ "leaf install", "packed FIXED validation", "cold FIXED installation" }, .minimum = 4 },
+        .{ .component = cuda_component, .step = "test-device-guest-framing", .description = "Check pinned CUDA guest image, exact permissions and terminal framing", .root = "cuda/rv64/guest_framing.zig", .filters = &[_][]const u8{"device guest framing"}, .minimum = 2 },
         .{ .component = frontend_component, .step = "test-fast-execution", .description = "Run all existing reference-versus-fast RV64 state, tape and service differential cases", .root = "frontend/rv64_fast_execution_test_root.zig", .filters = &[_][]const u8{}, .minimum = 7 },
         .{ .component = cpu_component, .step = "test-receiver-boundaries", .description = "Test real receipt, image and independently configured receiver rejection boundaries", .root = "cpu/rv64_ethereum_receiver_boundary_test_root.zig", .filters = &[_][]const u8{ "serialized Ethereum receipt", "Ethereum cursor rejects", "serialized physical receipt", "merged RAM BYTE mass rejects" }, .minimum = 5 },
         .{ .component = cpu_component, .step = "test-authenticated-component-profile", .description = "Check all-provider recorder and scoped-pool proof parity", .root = "cpu/rv64_authenticated_execution_test_root.zig", .filters = &[_][]const u8{"all27 private component recording"}, .minimum = 2 },

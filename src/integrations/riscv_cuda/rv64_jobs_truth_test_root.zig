@@ -8,6 +8,7 @@ test {
     _ = @import("rv64/jobs/truth_class.zig");
     _ = @import("rv64/jobs/truth_job.zig");
     _ = @import("rv64/jobs/truth_factory.zig");
+    _ = @import("rv64/jobs/truth_warm.zig");
     // gn-bind: the service binding composes the native and truth factories.
     _ = @import("rv64/jobs/driver_bind.zig");
     _ = @import("rv64/jobs/truth_oods.zig");

@@ -179,17 +179,19 @@ pub fn installPlanArena(self: *Worker, phase_a_words: usize, phase_b_words: usiz
     if (phase_a_words == 0 or phase_a_words % Records.Arena.granule != 0 or phase_b_words < phase_a_words or phase_b_words % Records.Arena.granule != 0) return error.InvalidArena;
     if (self.arena_buffer) |p| try O.check(self.ops.exec.free_u32(self.context, p));
     self.arena_buffer = null;
+    self.arena = .{ .reuse = self.config.reuse_frees };
+    self.last_enqueued = null;
     var block: ?[*]u32 = null;
-    try O.check(self.ops.exec.alloc_u32_long(self.context, phase_b_words, &block));
+    try O.checkDeviceAllocation(self.ops.exec.alloc_u32_long(self.context, phase_b_words, &block));
     self.arena_buffer = block orelse return error.CudaArenaFailed;
     self.arena = .{ .base = @intFromPtr(block.?), .words = phase_a_words, .reuse = self.config.reuse_frees };
     self.config.arena_words = phase_b_words;
     self.plan_phase_words = .{ phase_a_words, phase_b_words };
     self.plan_phase_b = false;
-    self.last_enqueued = null;
     self.mutex.lock();
     self.plan_phase_epochs = .{ self.arena_epoch + 1, self.arena_epoch + 2 };
     self.arena_epoch = self.plan_phase_epochs[0];
+    self.parked = false;
     self.mutex.unlock();
     return .{ .ptr = block.? + phase_a_words, .words = phase_b_words - phase_a_words };
 }

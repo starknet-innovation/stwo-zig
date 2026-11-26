@@ -120,7 +120,7 @@ pub const Fingerprint = struct {
         try fp.value("s1.request.prefix", false, g.prefix);
         try fp.value("s1.instances", true, cl.instances);
         try fp.value("s1.fixed_shapes", true, cl.fixed_shapes);
-        try fp.words("s1.fixed_host", true, cl.fixed_storage);
+        if (cl.fixed_region_key) |region_key| try fp.value("s1.fixed_region", true, region_key) else try fp.words("s1.fixed_host", true, cl.fixed_storage);
         try fp.value("s1.fixed_root", true, cl.fixed_root);
         try fp.value("s1.main_shapes", true, cl.main_shapes);
         try fp.value("s1.beta", true, cl.beta);
@@ -129,6 +129,7 @@ pub const Fingerprint = struct {
         try fp.value("s1.binding.lane_logs", true, cl.bind_plan.lane_logs);
         try fp.value("s1.binding.offsets", true, cl.bind_plan.offsets);
         try fp.value("s1.binding.output_words", true, cl.bind_plan.output_words);
+        try fp.value("s1.binding.retained_words", true, cl.bind_plan.retainedWords());
     }
     fn addStage2(fp: *Fingerprint, cl: *const Class) !void {
         const a = fp.a;

@@ -80,7 +80,7 @@ pub fn record(a: std.mem.Allocator, descriptor: Source.Descriptor, mode: Mode) !
         prior.* = if (Authority.previousMain(descriptor, i)) F.input(1, i, -1) else F.zero();
     }
     var public: Authority.PublicFor(F) = undefined;
-    public.cpu = .{ .steps = F.parameter(P.cpu_steps), .epoch = F.parameter(P.epoch), .initial_pc = undefined, .final_pc = undefined, .wide_clock = false };
+    public.cpu = .{ .steps = F.parameter(P.cpu_steps), .epoch = F.parameter(P.epoch), .initial_pc = undefined, .final_pc = undefined, .wide_clock = descriptor.cpu_wide_clock };
     for (&public.cpu.initial_pc, &public.cpu.final_pc, 0..) |*initial, *final, i| {
         initial.* = F.parameter(P.initial_pc + @as(u32, @intCast(i)));
         final.* = F.parameter(P.final_pc + @as(u32, @intCast(i)));
@@ -157,7 +157,10 @@ pub fn record(a: std.mem.Allocator, descriptor: Source.Descriptor, mode: Mode) !
 
 test "native CPU raw source and reduced AIR retain all source-derived groups" {
     const a = std.testing.allocator;
-    for (@import("joined_fixture_support.zig").descriptors()) |descriptor| {
+    const wide = Source.Descriptor{ .origin = .{ .core = .cpu }, .cpu_wide_clock = true };
+    var compact_wide = wide;
+    compact_wide.cpu_compact_decode = true;
+    for (@import("joined_fixture_support.zig").descriptors() ++ [_]Source.Descriptor{ wide, compact_wide }) |descriptor| {
         var raw = try record(a, descriptor, .fractions);
         defer raw.deinit();
         var total: u32 = 0;
@@ -200,11 +203,17 @@ pub fn emitSource(a: std.mem.Allocator, w: anytype, artifact: *const Artifact, n
     defer a.free(sorts);
     const shape = try Authority.shape(artifact.descriptor);
     try w.writeAll("#include \"rv64/native_gkr_source.h\"\n#include \"rv64/projected_gkr.cuh\"\n#include \"rv64/composition.cuh\"\nusing namespace stwo::cuda::rv64;\n");
-    try w.print("struct {s}_Source:StwoRv64NativeGkrSource{{\nbool validate(Custody&c,uint32_t count)const{{\nif(reserved0||reserved1||row_log<5||row_log>23||kind>3||count>max_count)return false;const uint64_t rows=1ull<<row_log;uint32_t terms=0,lanes=0;switch(kind){{\n", .{name});
+    const cpu = artifact.descriptor.origin == .core and artifact.descriptor.origin.core == .cpu;
+    const log_guard = if (!cpu) "row_log<5||row_log>23" else if (artifact.descriptor.cpu_wide_clock) "row_log!=23" else "row_log<5||row_log>22";
+    try w.print("struct {s}_Source:StwoRv64NativeGkrSource{{\nbool validate(Custody&c,uint32_t count)const{{\nif(reserved0||reserved1||{s}||kind>3||count>max_count)return false;const uint64_t rows=1ull<<row_log;uint32_t terms=0,lanes=0;switch(kind){{\n", .{ name, log_guard });
     for (artifact.terms, 0..) |terms, k| try w.print("case {}:terms={};lanes={};break;\n", .{ k, terms, if (terms == 0) @as(usize, 0) else @as(usize, 1) << @intCast(std.math.log2_int_ceil(u32, terms)) });
     try w.print("}}if(!terms||rows*lanes!=count||fixed_words!=rows*{}ull||main_words!=rows*{}ull)return false;\nreturn c.range(fixed,fixed_words,false)&&c.range(main,main_words,false)&&c.range(parameters,{}ull,false)&&c.range(status,1,true);}}\n__device__ Fraction get(uint32_t index)const{{\nconst uint32_t rows=1u<<row_log,row=index&(rows-1),lane=index>>row_log;uint32_t query=0;switch(kind){{\n", .{ shape.fixed, shape.main, artifact.parameter_slots.len * 8 });
     var first: u32 = 0;
     for (artifact.terms, 0..) |terms, k| {
+        if (terms == 0) {
+            try w.print("case {}:return {{zero(),one()}};\n", .{k});
+            continue;
+        }
         try w.print("case {}:if(lane>={}u)return {{zero(),one()}};query={}u+lane;break;\n", .{ k, terms, first });
         first += terms;
     }

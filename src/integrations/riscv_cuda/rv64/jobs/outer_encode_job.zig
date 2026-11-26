@@ -91,6 +91,33 @@ pub fn extraPinnedWords(descriptor: usize, expected: usize, oods: usize) error{R
     return std.math.add(usize, std.math.add(usize, descriptor, expected) catch return error.ResourceSizeOverflow, oods) catch error.ResourceSizeOverflow;
 }
 
+const descriptor_domain = "rv64/m8/outer-encode/descriptor/v1\x00";
+const oods_domain = "rv64/m8/outer-oods/program/v1\x00";
+
+fn programKey(domain: []const u8, words: []const u32) [32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update(domain);
+    h.update(std.mem.sliceAsBytes(words));
+    return h.finalResult();
+}
+
+fn stageProgram(s: *api.Stager, key: [32]u8, words: []const u32, persistent: bool, require_warm: bool) !api.DeviceBuffer {
+    const region: api.Persistent = if (persistent)
+        try s.persistent(key, words.len)
+    else
+        .{ .buffer = try s.alloc(words.len), .fresh = true };
+    if (region.fresh) {
+        if (require_warm) return error.GpuNativeRecursionEncoderCold;
+        try s.upload(region.buffer, words);
+    }
+    return region.buffer;
+}
+
+pub fn warmPrograms(s: *api.Stager, desc: []const u32, oods: ?[]const u32) !void {
+    _ = try stageProgram(s, programKey(descriptor_domain, desc), desc, true, false);
+    if (oods) |program| _ = try stageProgram(s, programKey(oods_domain, program), program, true, false);
+}
+
 pub const EncodedNode = struct {
     inner: *Job.OuterNodeJob,
     symbols: E.Symbols,
@@ -160,12 +187,7 @@ pub const EncodedNode = struct {
     }
     pub fn initTarget(a: std.mem.Allocator, inner: *Job.OuterNodeJob, symbols: E.Symbols, desc: []const u32, target: ?Target) !EncodedNode {
         if (inner.whole == null) return error.OuterEncodeNeedsWholeNode;
-        var key: [32]u8 = undefined;
-        var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("rv64/m8/outer-encode/descriptor/v1\x00");
-        h.update(std.mem.sliceAsBytes(desc));
-        key = h.finalResult();
-        var self = EncodedNode{ .inner = inner, .symbols = symbols, .desc = desc, .desc_key = key, .allocator = a, .target = target };
+        var self = EncodedNode{ .inner = inner, .symbols = symbols, .desc = desc, .desc_key = programKey(descriptor_domain, desc), .allocator = a, .target = target };
         if (target) |t| {
             // The slab entry's capacity must hold the class bound.
             if (t.region.words < 1 + @as(usize, desc[E.D.max_payload_words]) or t.pcs_status.words < 1 or t.encode_status.words < 1) return error.OuterEncodeRegionTooSmall;
@@ -178,11 +200,7 @@ pub const EncodedNode = struct {
     /// Adds the device OODS check (before submission).
     pub fn withOods(self: *EncodedNode, symbols: OO.Symbols, program: []const u32) !void {
         try OO.validate(program);
-        var o = Oods{ .symbols = symbols, .program = program };
-        var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("rv64/m8/outer-oods/program/v1\x00");
-        h.update(std.mem.sliceAsBytes(program));
-        o.key = h.finalResult();
+        var o = Oods{ .symbols = symbols, .program = program, .key = programKey(oods_domain, program) };
         if (self.target) |t| {
             o.status = t.layout_status_oods orelse return error.OuterOodsTargetMissing;
         } else _ = try self.inner.layout.add(.opaque_words, oods_field_index, oods_field_words);
@@ -221,24 +239,9 @@ pub const EncodedNode = struct {
         fp.pinned_words = std.math.add(usize, fp.pinned_words, extra_pinned) catch std.math.maxInt(usize);
         return fp;
     }
-    // Only request-slab jobs can reuse the installed class. Discovery jobs
-    // stage their inputs in the two-sided arena so class count cannot retain them.
-    fn stageProgram(self: *const EncodedNode, s: *api.Stager, key: [32]u8, words: []const u32) !api.DeviceBuffer {
-        const region: api.Persistent = if (self.target != null)
-            try s.persistent(key, words.len)
-        else
-            .{ .buffer = try s.alloc(words.len), .fresh = true };
-        if (self.inner.require_warm and region.fresh) return error.GpuNativeRecursionEncoderCold;
-        if (region.fresh) {
-            const pinned = try s.pinned(words.len);
-            @memcpy(pinned, words);
-            try s.upload(region.buffer, pinned);
-        }
-        return region.buffer;
-    }
     pub fn stage(self: *EncodedNode, s: *api.Stager) !void {
         try self.inner.stage(s);
-        self.desc_buf = try self.stageProgram(s, self.desc_key, self.desc);
+        self.desc_buf = try stageProgram(s, self.desc_key, self.desc, self.target != null, self.inner.require_warm);
         const outputs = self.inner.staged.expected;
         if (self.outputs_device != null or self.outputs_on_device) {} else if (outputs.len != 0) {
             const b = try s.alloc(outputs.len);
@@ -249,7 +252,7 @@ pub const EncodedNode = struct {
         }
         self.scratch = try s.alloc(self.desc[E.D.scratch_words]);
         if (self.oods) |*o| {
-            o.buf = try self.stageProgram(s, o.key, o.program);
+            o.buf = try stageProgram(s, o.key, o.program, self.target != null, self.inner.require_warm);
             o.scratch = try s.alloc(o.scratchWords());
         }
     }

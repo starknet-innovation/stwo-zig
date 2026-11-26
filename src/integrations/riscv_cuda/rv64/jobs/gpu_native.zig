@@ -1,33 +1,11 @@
-//! M8 GPU-native request contract (design/riscv/rv64-m8-gpu-native.md).
-//!
-//! Under STWO_RV64_M8_GPU_NATIVE=1 the end-state request is: capture streams trace
-//! chunks (the only CPU compute on the request path, overlapping proving) ->
-//! everything else is enqueued device work on the two GPUs -> ONE host wait
-//! per request -> one readback of the finished request slab per GPU -> the
-//! host checks status words and publishes. This file is the shared contract
-//! the three streams (driver, native, recursion) build against without
-//! touching each other's files:
-//!
-//!   Check / Verdict      status-word ids and the accept/reject encoding
-//!   ProofKind / ProofId  every proof a request publishes
-//!   RequestLayout        the request slab: header, directory, status words,
-//!                        peer-exchange region, encoded proof regions
-//!   Exchange / PeerExchange  roots/claims/chi partials swapped between GPUs
-//!   ClassCache           per-class setup built at install/warm time only
-//!   DeviceCheck          an acceptance check as an enqueued kernel
-//!   ProofEncoder         device proof encoding into a slab region
-//!   MemoryPlan           one static plan per GPU (no request-path cudaMalloc)
-//!   CaptureSink          streaming capture -> device witness hand-off
-//!   NativeFactory / RecursionFactory  what the driver asks the other streams
-//!   Publication          the host's only job: check the words, slice bytes
-//!
-//! Ownership: the contract steward is the driver stream. Changes are additive
-//! and announced in /workspace/m3/M8-INTERFACES.md; streams never edit it to
-//! suit themselves. No proof byte depends on this file (layout only).
+//! GPU-native request contracts for trace ingress, job placement, cross-device
+//! claims, recursion and checked publication. The service submits device work
+//! from a fixed memory plan and reads the completed proof slab once per device.
 const std = @import("std");
 const api = @import("api.zig");
 const Protocol = @import("gpu_native_protocol.zig");
 const Classes = @import("gpu_native_classes.zig");
+const CompactLoan = @import("../guest_ingress.zig").CompactLoan;
 
 pub const contract_version = Protocol.contract_version;
 // Contract additions (driver, M8-INTERFACES "m8-gpu-driver"), all defaulted so
@@ -501,6 +479,8 @@ pub const TraceChunk = struct {
     rows: u32,
     last: bool,
     words: []const u32,
+    /// Process-owned live capture metadata. Never present in kitted chunks.
+    compact_loan: ?CompactLoan = null,
 };
 
 pub const CaptureSink = struct {
@@ -523,13 +503,38 @@ pub const CaptureSink = struct {
 /// The pointers themselves are valid during `pack` only (GE hands the shard by
 /// value); the data they reference (Prepared, the event array) stays owned by
 /// the capture and immutable until the request detaches.
+pub const GuestWindow = struct {
+    initial: @import("../guest_ingress.zig").State,
+    terminal: @import("../guest_ingress.zig").State,
+};
+
+pub const GuestTerminal = struct {
+    state: @import("../guest_ingress.zig").State,
+    output: []const u8,
+};
+
+const Guest = @import("../guest_ingress.zig");
+pub const GuestDiscovery = struct {
+    segments: []const Segment,
+    initial: []const Guest.BoundaryCell,
+    terminal: []const Guest.BoundaryCell,
+
+    pub const Segment = struct {
+        window: GuestWindow,
+        memory: Guest.MemoryCensus,
+        families: Guest.FamilyCensus.Receipt,
+    };
+};
+
 pub const CapturedSegment = struct {
     segment: u32,
-    native: *const anyopaque,
-    events: *const anyopaque,
+    native: ?*const anyopaque = null,
+    events: ?*const anyopaque = null,
     shard: ?*const anyopaque = null,
+    guest_window: ?GuestWindow = null,
     /// Capture clock (ns since the ordered owner started); report only.
     at_ns: u64 = 0,
+    compact_loan: ?CompactLoan = null,
 };
 
 /// The finished capture (after the last segment, before `done`). Types:
@@ -540,10 +545,46 @@ pub const CapturedSegment = struct {
 /// Valid until the request detaches its capture stream (after publication).
 pub const CaptureEnd = struct {
     segments: u32,
-    owner: *const anyopaque,
+    owner: ?*const anyopaque = null,
     image: *const anyopaque,
     program: *const anyopaque,
     config: *const anyopaque,
+    guest: ?GuestCaptureEvidence = null,
+    guest_terminal: ?GuestTerminal = null,
+    guest_truth: ?@import("../guest_ingress.zig").Service.TruthInputs = null,
+    guest_discovery: ?GuestDiscovery = null,
+};
+
+/// Device capture counters belong to the producer. The independent recursive
+/// receiver still authenticates the execution and its global closure.
+pub const GuestCaptureEvidence = struct {
+    mode: enum { cuda_staged, cuda_resident } = .cuda_staged,
+    executor: enum { cuda, host_witness } = .cuda,
+    retirements: u64,
+    launches: u32,
+    trace_readback_bytes: u64,
+    state_readback_bytes: u64,
+    device_allocated_bytes: u64,
+    device_us: u64 = 0,
+    discovery_retry_launches: u32 = 0,
+    replayed_windows: u32 = 0,
+    retained_capture_bytes: u64 = 0,
+    compact_d2d_bytes: u64 = 0,
+    precomputed_unpack_windows: u32 = 0,
+    precomputed_unpack_borrowed_bytes: u64 = 0,
+    discovery_unpack_d2d_bytes: u64 = 0,
+    ram_d2d_bytes: u64 = 0,
+    bulk_d2d_bytes: u64 = 0,
+    service_d2d_bytes: u64 = 0,
+    device_projection_ns: u64 = 0,
+    boot_ns: u64 = 0,
+    trace_readback_ns: u64 = 0,
+    projection_ns: u64 = 0,
+    publication_ns: u64 = 0,
+    slot_wait_ns: u64 = 0,
+    retired_host_metadata_bytes: u64 = 0,
+    avoided_host_metadata_bytes: u64 = 0,
+    retired_host_ls_bytes: u64 = 0,
 };
 
 /// What `NativeFactory.pack` writes a captured segment through: pinned ring
@@ -583,7 +624,7 @@ pub const BlockShape = struct {
 };
 
 /// Recursion's answer for one block (`RecursionFactory.shape`).
-pub const RecursionShape = struct { truths: u32, fold_arity: u32 };
+pub const RecursionShape = struct { truths: u32, fold_arity: u32, grouped_recursion: bool = false };
 
 /// After the single wait: what each factory's `publish` hook writes from.
 /// `proofs` are the request's published views INCLUDING the request

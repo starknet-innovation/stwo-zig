@@ -72,7 +72,7 @@ pub const Context = struct {
     arith: ?ArithFn,
     secp: ?SecpFn,
     curve: ?SecpFn,
-    entries: [15]?Entry = @splat(null),
+    entries: [T.role_count]?Entry = @splat(null),
     mutex: std.Thread.Mutex = .{},
     pub fn init(a: std.mem.Allocator, service: *Native.Context, trace: *Trace.Context, rational: *Rational.Context) !Context {
         return .{ .allocator = a, .service = service, .trace = trace, .rational = rational, .api = .{ .allocate = service.lease_allocate, .release = service.lease_release, .validate_range = service.lease_validate_range, .upload = try symbol(N.Upload, &service.library, "stwo_exec_context_memcpy_h2d_async"), .download = try symbol(N.Download, &service.library, "stwo_exec_context_memcpy_d2h_async"), .sync = try symbol(N.Sync, &service.library, "stwo_exec_context_sync"), .lane_stream = try symbol(N.LaneStream, &service.library, "stwo_exec_context_lane_stream") }, .rebind = try symbol(N.LeaseRebind, &service.library, "stwo_rv64_gpu_lease_rebind"), .keccak = try symbol(KeccakFn, &service.library, "stwo_rv64_keccak_witness_on"), .arith = service.library.lookup(ArithFn, "stwo_rv64_arith256_witness_on"), .secp = service.library.lookup(SecpFn, "stwo_rv64_secp_witness_on"), .curve = service.library.lookup(SecpFn, "stwo_rv64_curve_witness_on"), .sha = service.library.lookup(ShaFn, "stwo_rv64_sha256_witness_on") };
@@ -483,8 +483,7 @@ test "device truth source factory exposes a typed owner without a CPU witness fa
 
 test "truth replay retention is compact and nonreplay still charges native MAIN" {
     const Setup = @typeInfo(@FieldType(@FieldType(Truth, "curve"), "setup")).pointer.child;
-    const ops = [_]A.crypto.curves.spec.Op{ .bn254_g1_add, .bn254_g1_double, .bn254_fp2_mul, .bls12_381_fp2_mul, .arith384_mont };
-    inline for (ops) |op| {
+    inline for (T.curve_ops) |op| {
         var setup = Setup{ .allocator = std.testing.allocator, .op = op, .log = 8, .fixed = &.{}, .key = undefined };
         const truth = Truth{ .curve = .{ .setup = &setup, .first_id = 1, .calls = 9 } };
         const replay = try retainedForTruth(std.testing.allocator, truth, true);

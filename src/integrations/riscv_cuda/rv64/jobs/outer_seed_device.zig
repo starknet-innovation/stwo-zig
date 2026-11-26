@@ -139,8 +139,56 @@ pub const Shape = struct {
         cursor.* = r.at;
         return .{ .pow_bits = h[0], .log_blowup = h[1], .log_last = h[2], .n_queries = h[3], .fold_step = h[4], .lifting = if (h[5] == 0xffff_ffff) null else h[5], .degree_log = h[6], .trees = trees };
     }
+    pub const TreeStorage = [Enc.max_trees]Tree;
+
+    /// Wrap the admitted Stage 2 geometry directly. The caller owns storage
+    /// and holds the native class alive for the lifetime of the shape.
+    pub fn fromPcs(source: @import("../pcs_assembly.zig").Shape, storage: *TreeStorage) !Shape {
+        if (source.trees.len == 0 or source.trees.len > storage.len) return error.GnSeedShapeInvalid;
+        const trees = storage[0..source.trees.len];
+        for (trees, source.trees) |*out, tree| {
+            const columns = tree.coefficient_logs.len;
+            if (columns == 0 or columns > Enc.max_columns or
+                tree.sorted_to_original.len != columns or tree.sample_counts.len != columns)
+                return error.GnSeedShapeInvalid;
+            out.* = .{ .logs = tree.coefficient_logs, .sorted_to_original = tree.sorted_to_original, .sample_counts = tree.sample_counts };
+        }
+        const c = source.config;
+        return .{
+            .pow_bits = c.pow_bits,
+            .log_blowup = c.fri_config.log_blowup_factor,
+            .log_last = c.fri_config.log_last_layer_degree_bound,
+            .n_queries = std.math.cast(u32, c.fri_config.n_queries) orelse return error.GnSeedShapeInvalid,
+            .fold_step = c.fri_config.fold_step,
+            .lifting = c.lifting_log_size,
+            .degree_log = source.degree_log,
+            .trees = trees,
+        };
+    }
+
+    pub fn eql(self: Shape, other: Shape) bool {
+        if (!std.meta.eql(self.config(), other.config()) or self.degree_log != other.degree_log or
+            self.trees.len != other.trees.len) return false;
+        for (self.trees, other.trees) |left, right| {
+            if (!std.mem.eql(u32, left.logs, right.logs) or
+                !std.mem.eql(u32, left.sorted_to_original, right.sorted_to_original) or
+                !std.mem.eql(u32, left.sample_counts, right.sample_counts)) return false;
+        }
+        return true;
+    }
+
     pub fn config(self: Shape) Enc.Config {
         return .{ .pow_bits = self.pow_bits, .log_blowup = self.log_blowup, .log_last_layer = self.log_last, .n_queries = self.n_queries, .fold_step = self.fold_step, .lifting = self.lifting };
+    }
+
+    pub fn append(self: Shape, a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u32)) !void {
+        try out.appendSlice(a, &.{ self.pow_bits, self.log_blowup, self.log_last, self.n_queries, self.fold_step, self.lifting orelse 0xffff_ffff, self.degree_log, @intCast(self.trees.len) });
+        for (self.trees) |tree| {
+            try out.append(a, @intCast(tree.logs.len));
+            try out.appendSlice(a, tree.logs);
+            try out.appendSlice(a, tree.sorted_to_original);
+            try out.appendSlice(a, tree.sample_counts);
+        }
     }
 };
 
@@ -244,8 +292,8 @@ pub const P = struct {
     pub const self_key = 21; // offset of 16 words: own identity, own FIXED root
     pub const profile = 22; // offset of 8 words: om31 wire profile (wire bytes 8..40)
     pub const output_map = 23; // 0 = digest word w -> Q(w & 0xffff, w >> 16, 0, 0)
-    /// statement 2 (leaf): child 0's region word offset of the node's
-    /// outputs (QM31, 4 words each), written by the native producer.
+    /// Statement 2 uses the region offset of the native producer's outputs.
+    /// Statement 3 uses the group's first native ordinal.
     pub const outputs_at = 24;
     pub const header_words = 32;
 };
@@ -448,7 +496,7 @@ const Builder = struct {
 
 pub const Statement = struct {
     /// 1 = fold (outputs = Blake2s(messageWords)), 2 = outputs read from
-    /// child 0's region at `outputs_at` (leaf: the native producer's words).
+    /// child 0's region at `outputs_at`, 3 = grouped truth frame digest.
     kind: u32 = 1,
     outputs_at: u32 = 0,
     domain: u32,
@@ -488,10 +536,40 @@ pub fn buildLeaf(a: std.mem.Allocator, child: ChildClass, cap_log: u32, tail: u3
     var b = Builder{ .a = a };
     defer b.ops.deinit(a);
     defer b.caps.deinit(a);
-    try b.proof(0, child.shape, cap_log);
-    const L = try Layout.of(child.shape);
-    try b.op(.q, 0, .region, child.wire_words + L.words, tail, 4, 1, 0);
+    try appendLeaf(&b, 0, child, cap_log, tail);
     return finish(a, &b, &.{child}, cap_log, vars, constants, statement);
+}
+
+fn appendLeaf(b: *Builder, k: u32, child: ChildClass, cap_log: u32, tail: u32) !void {
+    try b.proof(k, child.shape, cap_log);
+    const L = try Layout.of(child.shape);
+    try b.op(.q, k, .region, child.wire_words + L.words, tail, 4, 1, 0);
+}
+
+pub const service_group_members = 3;
+pub const service_group_domain = 0x47565253;
+pub const service_group_version = 1;
+pub const service_group_public_words = 19;
+pub const service_group_claim_words = 8;
+pub const service_group_tail_seeds = 2 * service_group_public_words + service_group_claim_words / 4;
+
+/// The group reads each native proof and its unchanged statement suffix in
+/// circuit order. Singleton outer proofs and their parent are unnecessary.
+pub fn buildServiceGroup(a: std.mem.Allocator, children: [service_group_members]ChildClass, first: u32, cap_log: u32, vars: []const u32, constants: []const [4]u32, statement: Statement) !Program {
+    if (first > std.math.maxInt(u32) - service_group_members or statement.n_outputs != 8) return error.GnSeedProgramInvalid;
+    var b = Builder{ .a = a };
+    defer b.ops.deinit(a);
+    defer b.caps.deinit(a);
+    for (children, 0..) |child, k| {
+        if (child.n_outputs != 0) return error.GnSeedProgramInvalid;
+        try appendLeaf(&b, @intCast(k), child, cap_log, service_group_tail_seeds);
+    }
+    var group = statement;
+    group.kind = 3;
+    group.outputs_at = first;
+    group.domain = service_group_domain;
+    group.version_word = service_group_version;
+    return finish(a, &b, &children, cap_log, vars, constants, group);
 }
 pub fn leafTapeLength(a: std.mem.Allocator, child: ChildClass, cap_log: u32) !u32 {
     var b = Builder{ .a = a };
@@ -734,111 +812,7 @@ pub const Symbols = struct {
     }
 };
 
-// ---------------------------------------------------------------------------
-// Tests (host only; the real-data harness is outer_seed_harness_test.zig)
-// ---------------------------------------------------------------------------
-
-/// Synthetic child (tests): a PCS image whose trace trees are real Merkle
-/// trees over pseudo-random rows, with `queries` raw queries.
-pub const Synthetic = struct {
-    shape: Shape,
-    image: []u32,
-    region: []u32,
-    trees_store: [2]Tree,
-    logs: [2][3]u32,
-    s2o: [2][3]u32,
-    sc: [2][3]u32,
-    pub fn init(self: *Synthetic, a: std.mem.Allocator, seed: u64, wire_words: u32) !void {
-        return self.initQueries(a, seed, wire_words, null);
-    }
-    pub fn initQueries(self: *Synthetic, a: std.mem.Allocator, seed: u64, wire_words: u32, draws: ?[]const u32) !void {
-        return self.initAtDegree(a, seed, wire_words, draws, 3);
-    }
-    pub fn initAtDegree(self: *Synthetic, a: std.mem.Allocator, seed: u64, wire_words: u32, draws: ?[]const u32, degree: u32) !void {
-        if (degree < 3 or degree > 8) return error.InvalidSeedProgram;
-        var rng = std.Random.DefaultPrng.init(seed);
-        const r = rng.random();
-        self.logs = .{ .{ degree, 2, degree }, .{ degree, degree, 1 } };
-        self.s2o = .{ .{ 1, 0, 2 }, .{ 2, 0, 1 } };
-        self.sc = .{ .{ 1, 0, 2 }, .{ 1, 1, 0 } };
-        for (&self.trees_store, 0..) |*t, i| t.* = .{ .logs = &self.logs[i], .sorted_to_original = &self.s2o[i], .sample_counts = &self.sc[i] };
-        self.shape = .{ .pow_bits = 1, .log_blowup = 1, .log_last = 0, .n_queries = if (draws) |v| @intCast(v.len) else 6, .fold_step = 1, .lifting = null, .degree_log = degree, .trees = &self.trees_store };
-        const L = try Layout.of(self.shape);
-        self.image = try a.alloc(u32, L.words);
-        for (self.image) |*w| w.* = r.int(u32) & 0x3fff_ffff;
-        self.image[0] = image_magic;
-        self.image[1] = 2;
-        const queries = self.image[L.queries..][0..L.nq];
-        if (draws) |v| @memcpy(queries, v) else {
-            for (queries) |*q| q.* = r.uintLessThan(u32, @as(u32, 1) << @intCast(L.initial_log));
-        }
-        for (0..2) |t| {
-            const tl = L.trees[t];
-            const h = tl.height;
-            const n = @as(usize, 1) << @intCast(h);
-            // rows (sorted column order) per tree position
-            const rows = try a.alloc(u32, n * tl.columns);
-            defer a.free(rows);
-            for (rows) |*v| v.* = r.uintLessThan(u32, modulus);
-            var levels = try a.alloc([]Hash, h + 1);
-            defer {
-                for (levels) |l| a.free(l);
-                a.free(levels);
-            }
-            levels[0] = try a.alloc(Hash, n);
-            for (0..n) |p| levels[0][p] = leafHash(rows[p * tl.columns ..][0..tl.columns]);
-            for (1..h + 1) |l| {
-                levels[l] = try a.alloc(Hash, n >> @intCast(l));
-                for (levels[l], 0..) |*x, i| x.* = nodeHash(levels[l - 1][2 * i], levels[l - 1][2 * i + 1]);
-            }
-            @memcpy(self.image[L.roots + 8 * t ..][0..8], &levels[h][0]);
-            for (queries, 0..) |q, qi| {
-                const p = position(q, L.initial_log, h);
-                for (0..tl.columns) |ci| self.image[tl.values + ci * L.nq + qi] = rows[p * tl.columns + ci];
-                for (0..h) |l| @memcpy(self.image[tl.paths + (qi * h + l) * 8 ..][0..8], &levels[l][(p >> @intCast(l)) ^ 1]);
-            }
-        }
-        // FRI layers: real Merkle trees over (packed) leaves of canonical values.
-        for (L.layers[0..L.n_layers]) |l| {
-            const width: usize = if (l.leaf_log == 2) 4 else 1;
-            const n_leaves = @as(usize, 1) << @intCast(l.height);
-            const vals = try a.alloc(u32, n_leaves * width * 8);
-            defer a.free(vals);
-            for (vals) |*v| v.* = r.uintLessThan(u32, modulus);
-            var levels = try a.alloc([]Hash, l.height + 1);
-            defer {
-                for (levels) |x| a.free(x);
-                a.free(levels);
-            }
-            levels[0] = try a.alloc(Hash, n_leaves);
-            for (0..n_leaves) |i| levels[0][i] = leafHash(vals[i * width * 8 ..][0 .. width * 8]);
-            for (1..l.height + 1) |lv| {
-                levels[lv] = try a.alloc(Hash, n_leaves >> @intCast(lv));
-                for (levels[lv], 0..) |*x, i| x.* = nodeHash(levels[lv - 1][2 * i], levels[lv - 1][2 * i + 1]);
-            }
-            @memcpy(self.image[l.root..][0..8], &levels[l.height][0]);
-            const subset = @as(usize, 1) << @intCast(l.step);
-            for (queries, 0..) |q, qi| {
-                const start = ((@as(usize, q) >> @intCast(l.shift)) >> @intCast(l.step)) << @intCast(l.step);
-                const first_leaf = start >> @intCast(l.leaf_log);
-                @memcpy(self.image[l.values + qi * subset * 8 ..][0 .. subset * 8], vals[first_leaf * width * 8 ..][0 .. subset * 8]);
-                for (0..l.slots) |slot| for (0..l.height) |lv| {
-                    @memcpy(self.image[l.paths + ((qi * l.slots + slot) * l.height + lv) * 8 ..][0..8], &levels[lv][((first_leaf + slot) >> @intCast(lv)) ^ 1]);
-                };
-            }
-        }
-        // canonical samples / terminal
-        for (self.image[L.samples..L.queries]) |*w| w.* &= 0x3fff_ffff;
-        self.region = try a.alloc(u32, wire_words + L.words);
-        @memset(self.region, 0);
-        self.region[0] = 4 * (wire_words - 1);
-        @memcpy(self.region[wire_words..], self.image);
-    }
-    pub fn deinit(self: *Synthetic, a: std.mem.Allocator) void {
-        a.free(self.image);
-        a.free(self.region);
-    }
-};
+pub const Synthetic = @import("outer_seed_device_test.zig").Synthetic;
 
 test {
     _ = @import("outer_seed_device_test.zig");

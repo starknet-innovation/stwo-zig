@@ -63,8 +63,10 @@ test "twiddle tower shares real canonical suffixes across different height subse
     };
     var statics_a: Statics = undefined;
     statics_a.tables = tables_a;
+    statics_a.device_twiddles = false;
     var statics_b: Statics = undefined;
     statics_b.tables = tables_b;
+    statics_b.device_twiddles = false;
     var staged_a: Staged = undefined;
     staged_a.statics = &statics_a;
     staged_a.image = image_a;

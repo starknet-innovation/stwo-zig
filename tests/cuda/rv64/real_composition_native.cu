@@ -4,5 +4,5 @@
 extern "C" int stwo_rv64_composition_role_on(void *ctx, uint32_t lane,
     const StwoRv64CompositionRole *job, uint32_t *launches) {
   return stwo::cuda::rv64::composition_dispatch(ctx,lane,job,launches,
-      real_kernels,real_root_group_sizes,49);
+      real_kernels,real_root_group_sizes,sizeof(real_kernels)/sizeof(real_kernels[0]));
 }

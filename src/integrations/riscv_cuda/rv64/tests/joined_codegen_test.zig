@@ -44,7 +44,10 @@ test "INIT and TEARDOWN retain global RAM constraints without synthetic local GK
 test "complete joined constraints match native OM31 for domain and OODS masks with aliased metadata" {
     const Oracle = @import("../joined_fixture_support.zig");
     var rng = std.Random.DefaultPrng.init(0x1938de43);
-    for (Oracle.descriptors()) |descriptor| {
+    const wide = G.Source.Descriptor{ .origin = .{ .core = .cpu }, .cpu_wide_clock = true };
+    var compact_wide = wide;
+    compact_wide.cpu_compact_decode = true;
+    for (Oracle.descriptors() ++ [_]G.Source.Descriptor{ wide, compact_wide }) |descriptor| {
         var artifact = try G.record(a, descriptor);
         defer artifact.deinit();
         const identity = try artifact.identity();
@@ -84,4 +87,24 @@ test "joined semantic slots partition into independently retained device reservo
         seen[index] = true;
     }
     try std.testing.expectError(error.InvalidJoinedParameterSlot, P.address(P.count));
+}
+
+test "wide GPU source catalogue appends a class and retains the installed narrow ordinals" {
+    const joined = @import("../joined_fixture_support.zig").descriptors();
+    const projection = Fixtures.descriptors();
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    for (projection[0..47], joined[0..47]) |descriptor, composition| {
+        try std.testing.expectEqualDeep(descriptor, composition);
+        for (G.Source.Frame.originWords(descriptor.origin)) |word| {
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, word, .little);
+            hash.update(&bytes);
+        }
+        hash.update(&.{ @intFromBool(descriptor.cpu_u8_pairs), @intFromBool(descriptor.cpu_compact_decode), @intFromBool(descriptor.cpu_wide_clock) });
+    }
+    try std.testing.expectEqualStrings("e9db5d8f7197b655552a7b3087d8ef8ec3eb863ea989717077dca4f86a8a0a60", &std.fmt.bytesToHex(hash.finalResult(), .lower));
+    try std.testing.expectEqual(G.Source.RoleId.initial, joined[47].origin.core);
+    try std.testing.expectEqual(G.Source.RoleId.terminal, joined[48].origin.core);
+    try std.testing.expectEqualDeep(Fixtures.wide_cpu, projection[47]);
+    try std.testing.expectEqualDeep(Fixtures.wide_cpu, joined[49]);
 }

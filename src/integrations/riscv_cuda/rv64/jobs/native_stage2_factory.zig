@@ -133,6 +133,16 @@ pub const Factory = struct {
             _ = try cache.warm(f.key, .{ .ctx = f, .build = Builder.build });
         }
     }
+    pub fn resourcePeak(self: *const Factory) !usize {
+        var peak: usize = 0;
+        var it = self.classes.valueIterator();
+        while (it.next()) |pool| {
+            var job = WarmClass{ .a = self.a, .class = pool.*.instances.items[0], .sym = self.sym };
+            peak = @max(peak, try job.footprint().peakWords());
+        }
+        return peak;
+    }
+
     pub fn warmDevices(self: *Factory, workers: []const *Worker) !void {
         var it = self.classes.valueIterator();
         while (it.next()) |pool| {

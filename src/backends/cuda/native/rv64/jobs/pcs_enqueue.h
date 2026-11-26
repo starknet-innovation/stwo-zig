@@ -21,7 +21,7 @@ typedef struct StwoRv64PcsJobPlan {
   uint64_t output_words;  // exact: legacy Result.words length
   uint64_t ingress_words; // exact upper bound of pinned staging words
   uint32_t trees, layers, queries, steps;
-  uint32_t samples, rolling, reserved[2];
+  uint32_t samples, rolling, source_node_images, reserved;
 } StwoRv64PcsJobPlan;
 typedef struct StwoRv64PcsJobMemory {
   void *user;
@@ -47,6 +47,33 @@ int stwo_rv64_pcs_job_enqueue_v1(void *ctx, uint32_t lane,
                                  const StwoRv64PcsNativeRequest *,
                                  const StwoRv64PcsJobMemory *,
                                  const StwoRv64PcsJobIo *);
+// Private same-stream prover extension. Each nonempty entry is the original
+// commitment's sorted LDE followed by all Merkle layers, with no prefix scratch.
+// Lengths are rederived from the four-tree request. Output and transcript are v1.
+typedef struct StwoRv64PcsSourceImage {
+  const uint32_t *words;
+  uint64_t count;
+} StwoRv64PcsSourceImage;
+int stwo_rv64_pcs_job_open_images(void *, uint32_t, const StwoRv64PcsNativeRequest *,
+                                 const StwoRv64PcsJobMemory *, const StwoRv64PcsJobIo *,
+                                 const StwoRv64PcsSourceImage images[4]);
+// Mask bits 1, 2 and 3 mark MAIN, INTER and composition nodes-only entries.
+// Each marked span must be exactly the validated tree size; the queried values
+// are reconstructed from the committed coefficients on the same stream.
+int stwo_rv64_pcs_job_open_node_images(void *, uint32_t, const StwoRv64PcsNativeRequest *,
+                                      const StwoRv64PcsJobMemory *, const StwoRv64PcsJobIo *,
+                                      const StwoRv64PcsSourceImage images[4], uint32_t node_image_mask);
+// Canonical forward and inverse towers at the lifting height, borrowed from the worker.
+// Request sections 12 and 14 carry their legacy lengths with null pointers.
+typedef struct StwoRv64PcsJobTables {
+  const uint32_t *forward;
+  uint64_t forward_words;
+  const uint32_t *inverse;
+  uint64_t inverse_words;
+} StwoRv64PcsJobTables;
+int stwo_rv64_pcs_job_open_device_tables_v1(void *, uint32_t, const StwoRv64PcsNativeRequest *,
+    const StwoRv64PcsJobMemory *, const StwoRv64PcsJobIo *, const StwoRv64PcsSourceImage images[4],
+    uint32_t node_image_mask, const StwoRv64PcsJobTables *);
 // Calling thread's last failure message ("" after success).
 const char *stwo_rv64_pcs_job_error_v1(void);
 #ifdef __cplusplus
@@ -54,5 +81,6 @@ const char *stwo_rv64_pcs_job_error_v1(void);
 static_assert(sizeof(StwoRv64PcsJobPlan) == 48, "PCS job plan ABI");
 static_assert(sizeof(StwoRv64PcsJobMemory) == 40, "PCS job memory ABI");
 static_assert(sizeof(StwoRv64PcsJobIo) == 40, "PCS job io ABI");
+static_assert(sizeof(StwoRv64PcsJobTables) == 32, "PCS job tables ABI");
 #endif
 #endif

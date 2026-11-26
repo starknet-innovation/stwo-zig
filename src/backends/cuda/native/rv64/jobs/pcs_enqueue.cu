@@ -24,6 +24,12 @@ extern "C" int stwo_blake2s_mixed_seeded_eager_compact_on(
     uint32_t, uint32_t, const stwo::cuda::blake2s::MixedSegment *, uint32_t, uint32_t,
     const uint32_t *, uint64_t, uint32_t *, uint64_t, uint32_t *, uint64_t, void *)
     __attribute__((weak));
+extern "C" int stwo_rv64_deep_combine_canonical_on(
+    void *, uint32_t, const StwoRv64DeepCombine *) __attribute__((weak));
+extern "C" int stwo_lde_n2b_query_columns_on(
+    const uint32_t *, uint32_t, const uint32_t *, uint32_t *, uint32_t,
+    uint32_t, const uint32_t *, const uint32_t *, uint32_t, uint32_t,
+    uint32_t *, uint32_t *, void *) __attribute__((weak));
 namespace {
 using namespace rv64_pcs_pipeline;
 namespace q = stwo::cuda::rv64::q;
@@ -54,13 +60,15 @@ __global__ void job_make_domain(uint32_t *out, uint32_t log, DomainPoint initial
   out[uint64_t(row) * 2] = value.x;
   out[uint64_t(row) * 2 + 1] = conjugate ? q::sub(0, value.y) : value.y;
 }
-Input inputFrom(const StwoRv64PcsNativeRequest *request) {
+bool deviceTableSection(size_t i) { return i == 12 || i == 14; }
+
+Input inputFrom(const StwoRv64PcsNativeRequest *request, bool device_tables) {
   if (!request || request->version != 1 || request->section_count != 17)
     throw std::runtime_error("native PCS ABI mismatch");
   Input input;
   for (size_t i = 0; i < 17; ++i) {
     const auto s = request->sections[i];
-    if (s.count > SIZE_MAX || (s.count && !s.words))
+    if (s.count > SIZE_MAX || (device_tables && deviceTableSection(i) ? s.words != nullptr : s.count && !s.words))
       throw std::runtime_error("invalid native metadata span");
     input.sections[i] = {s.words, size_t(s.count)};
   }
@@ -78,7 +86,7 @@ Input inputFrom(const StwoRv64PcsNativeRequest *request) {
 }
 // Shape validation shared by plan and enqueue (the same checks as run()'s
 // prologue), plus the exact output layout and the ingress upper bound.
-StwoRv64PcsJobPlan planOf(const Input &input) {
+StwoRv64PcsJobPlan planOf(const Input &input, bool device_tables) {
   const auto h = input.sections[0];
   stwo::cuda::rv64::PcsAggregateCounts aggregate{};
   if (!stwo::cuda::rv64::decodePcsCounts(h.data(), h.size(), &aggregate))
@@ -95,8 +103,10 @@ StwoRv64PcsJobPlan planOf(const Input &input) {
                           size_t(nt) * 6, size_t(gc) * 4, size_t(gc) * 2,
                           sample_count, sc, h[19], size_t(layers) * 8, h[20],
                           size_t(nt) * 8};
-  for (size_t i = 0; i < 16; ++i)
-    sizeIs(input.sections[i], sizes[i]);
+  for (size_t i = 0; i < 16; ++i) {
+    if (!device_tables || !deviceTableSection(i)) sizeIs(input.sections[i], sizes[i]);
+    else if (input.sections[i].size() != sizes[i]) throw std::runtime_error("device PCS table shape");
+  }
   if (!input.domain.size())
     sizeIs(input.sections[16], 4);
   const auto tree_info = input.sections[7], descriptions = input.sections[13];
@@ -104,10 +114,14 @@ StwoRv64PcsJobPlan planOf(const Input &input) {
     throw std::runtime_error("base image lacks compact eager Blake2s");
   StwoRv64PcsJobPlan plan{};
   uint64_t out = 14 + 1 + 16 + uint64_t(nt) * 8 + uint64_t(sample_count) * 8 + 2 + 8 + queries;
+  uint32_t layer_count = 1u << log;
   for (uint32_t i = 0; i < layers; ++i) {
     const auto *d = descriptions.data() + i * 8;
-    if (!d[0] || (d[0] & (d[0] - 1)) || d[1] < 1 || d[1] > 4 || d[2] > d[1])
+    if (!d[0] || (d[0] & (d[0] - 1)) || d[1] < 1 || d[1] > 4 || d[2] > d[1] ||
+        d[1] > uint32_t(__builtin_ctz(d[0])))
       throw std::runtime_error("FRI layer geometry");
+    if (device_tables && d[0] != layer_count) throw std::runtime_error("FRI tower geometry");
+    layer_count >>= d[1];
     out += 8 + (uint64_t(queries) << d[1]) * 8 +
            (uint64_t(queries) << (d[1] - d[2])) * (uint32_t(__builtin_ctz(d[0])) - d[2]) * 8;
   }
@@ -124,7 +138,7 @@ StwoRv64PcsJobPlan planOf(const Input &input) {
   const bool rolling_beta2 = beta2_flag && std::strcmp(beta2_flag, "1") == 0;
   plan.output_words = out;
   plan.ingress_words = 14 + 9 + 16 + 3 + uint64_t(sample_count) + 5ull * sc +
-                       4ull * tc + 12ull * gc + h[19] + h[20] + 6ull * sc +
+                       4ull * tc + 12ull * gc + (device_tables ? 0 : uint64_t(h[19]) + h[20]) + 6ull * sc +
                        48ull * gc + host_words + input.domain.size() +
                        16ull * 24; // per-upload 16-word alignment slack
   plan.ingress_words += 16ull * (uint64_t(sc) + 2ull * gc + sgc + nt);
@@ -134,6 +148,13 @@ StwoRv64PcsJobPlan planOf(const Input &input) {
   plan.steps = (h[21] ? 0 : nt + 1) + 5 + 2 * layers;
   plan.samples = sample_count;
   plan.rolling = h[21] && (h[5] == 1 || (h[5] == 2 && rolling_beta2));
+  plan.source_node_images = plan.rolling && nt == 4;
+  if (device_tables) {
+    if (!plan.rolling || log < 3 || !h[19] || h[19] > (1u << (log - 1)))
+      throw std::runtime_error("device PCS tables require rolling circle geometry");
+    if (!&stwo_rv64_deep_combine_canonical_on)
+      throw std::runtime_error("base image lacks canonical DEEP domain support");
+  }
   return plan;
 }
 struct JobOwner {
@@ -230,22 +251,21 @@ struct JobOwner {
   void upload(StwoRv64Plane destination, const std::vector<uint32_t> &values) {
     uploadBorrowed(destination, values.data(), values.size());
   }
-  uint32_t validateCoefficient(Coefficient source, const uint32_t *) const {
+  void validateCoefficient(Coefficient source) const {
     if (!source.kind) {
       if (source.size() && !source.data()) throw std::runtime_error("missing host coefficients");
-      return 0;
+      return;
     }
     if (source.kind != 1) throw std::runtime_error("unsupported device column encoding");
     if (stwo_exec_context_validate_allocation(ctx, source.data(), source.size() * 4))
       throw std::runtime_error("device column is not job storage");
-    return 2;
   }
-  void uploadCoefficient(StwoRv64Plane destination, Coefficient source, const uint32_t *scope) {
+  void uploadCoefficient(StwoRv64Plane destination, Coefficient source) {
     if (!source.kind) {
       uploadBorrowed(destination, source.data(), source.size());
       return;
     }
-    (void)validateCoefficient(source, scope);
+    validateCoefficient(source);
     CHECK(cudaMemcpyAsync(destination.words, source.data(), source.size() * 4,
                           cudaMemcpyDeviceToDevice, stream));
   }
@@ -268,7 +288,9 @@ struct JobOwner {
     return p;
   }
 };
-void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_plan) {
+void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_plan,
+                 const StwoRv64PcsSourceImage *images, uint32_t node_image_mask,
+                 const StwoRv64PcsJobTables *tables) {
   const auto h = input.sections[0];
   stwo::cuda::rv64::PcsAggregateCounts aggregate{};
   if (!stwo::cuda::rv64::decodePcsCounts(h.data(), h.size(), &aggregate))
@@ -309,7 +331,7 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
                           h[20],
                           size_t(nt) * 8};
   for (size_t i = 0; i < 16; ++i)
-    sizeIs(input.sections[i], sizes[i]);
+    if (!tables || !deviceTableSection(i)) sizeIs(input.sections[i], sizes[i]);
   if (!input.domain.size())
     sizeIs(input.sections[16], 4);
   auto upload = [&](Words v) {
@@ -326,11 +348,29 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
   // Keep only one source tree's LDE live, and borrow admitted device coefficients.
   // Beta2 is an explicit allocation-policy experiment. Its source stride is
   // one quarter of the LDE, so every compact extension must bound its reads.
-  const char *beta2_flag = std::getenv("STWO_RV64_PCS_ROLLING_BETA2");
-  const bool rolling_beta2 = beta2_flag && std::strcmp(beta2_flag, "1") == 0;
-  const bool rolling_sources = h[21] && (h[5] == 1 || (h[5] == 2 && rolling_beta2));
+  const bool rolling_sources = job_plan.rolling;
+  if (images && (!job_plan.source_node_images || images[0].words || images[0].count))
+    throw std::runtime_error("opening images require a rolling four-tree proof");
+  if ((node_image_mask & ~14u) || (node_image_mask && !images))
+    throw std::runtime_error("invalid committed node image mask");
+  std::array<const uint32_t *,4> committed_nodes{}, committed_evaluations{};
   std::array<StwoRv64Plane,4> coefficient_trees{};
   std::vector<uint32_t> source_words(sources.begin(), sources.end());
+  auto coefficient = [&](uint32_t c, uint64_t &offset) {
+    const uint32_t column_log = sources[4 * c + 3];
+    offset = uint64_t(sources[4 * c]) | (uint64_t(sources[4 * c + 1]) << 32);
+    const auto source = input.coefficients[c];
+    if (column_log > 28 || source.size() != (uint64_t(1) << column_log) ||
+        offset > aggregate.coefficients || source.size() > aggregate.coefficients - offset)
+      throw std::runtime_error("coefficient span geometry");
+    return source;
+  };
+  // Device inputs all use this job's allocation ledger. Validate the merged
+  // span before borrowing or copying it. A larger validated span covers each
+  // constituent column without a separate allocation scan per column.
+  auto append = [&](std::vector<CoefficientTransfer> &transfers, Coefficient source, uint64_t destination) {
+    appendCoefficientTransfer(transfers, source, destination, source.kind == 1 ? 2 : 0, input.scope);
+  };
   uint64_t max_tree_evaluations=0, max_tree_nodes=0;
   if (rolling_sources) {
     uint32_t next_source=0, next_group=0;
@@ -344,20 +384,19 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
       std::vector<CoefficientTransfer> transfers;
       for(uint32_t j=0;j<d[1];++j) {
         const uint32_t c=d[0]+j;
-        auto v=input.coefficients[c];
-        if(sources[4*c+3]>28 || v.size()!=(uint64_t(1)<<sources[4*c+3]))
-          throw std::runtime_error("rolling coefficient shape");
-        const auto kind=o.validateCoefficient(v,input.scope.data());
-        appendCoefficientTransfer(transfers,v,count,kind,input.scope);
+        uint64_t offset;
+        const auto v = coefficient(c, offset);
+        append(transfers, v, count);
         source_words[4*c]=uint32_t(count); source_words[4*c+1]=uint32_t(count>>32); source_words[4*c+2]=t;
         count+=v.size();
       }
       if(transfers.size()==1 && transfers[0].source.kind==1) {
-        (void)o.validateCoefficient(transfers[0].source,input.scope.data());
+        o.validateCoefficient(transfers[0].source);
         coefficient_trees[t]={const_cast<uint32_t*>(transfers[0].source.data()),count,1,0};
       } else {
         coefficient_trees[t]=o.sourcePlane(count,1);
-        for(const auto &v:transfers) o.uploadCoefficient({coefficient_trees[t].words+v.destination,v.source.size(),1,0},v.source,input.scope.data());
+        for (const auto &v : transfers)
+          o.uploadCoefficient({coefficient_trees[t].words + v.destination, v.source.size(), 1, 0}, v.source);
       }
       for(uint32_t g=d[2];g<d[2]+d[3];++g) {
         const auto *v=source_groups.data()+g*8;
@@ -366,8 +405,18 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
         if (g + 1 < d[2] + d[3] && v[3] != source_groups[(g + 1) * 8 + 3])
           if (!prefix.addHeight(uint32_t(1) << v[3])) throw std::runtime_error("rolling prefix geometry");
       }
-      max_tree_evaluations=std::max(max_tree_evaluations,eval_count);
-      max_tree_nodes=std::max(max_tree_nodes,((uint64_t(2)<<d[4])-1)*8 + prefix.words());
+      const bool nodes_only = (node_image_mask >> t) & 1u;
+      if (images && (images[t].words || images[t].count || nodes_only)) {
+        const uint64_t nodes = ((uint64_t(2) << d[4]) - 1) * 8;
+        const uint64_t retained_lde = nodes_only ? 0 : eval_count;
+        if (!images[t].words || images[t].count != retained_lde + nodes ||
+            stwo_exec_context_validate_allocation(o.ctx, images[t].words, images[t].count * sizeof(uint32_t)))
+          throw std::runtime_error("invalid committed source image");
+        committed_nodes[t] = images[t].words + retained_lde;
+        if (!nodes_only) committed_evaluations[t] = images[t].words;
+      }
+      if (!committed_evaluations[t]) max_tree_evaluations=std::max(max_tree_evaluations,eval_count);
+      if (!committed_nodes[t]) max_tree_nodes=std::max(max_tree_nodes,((uint64_t(2)<<d[4])-1)*8 + prefix.words());
     }
     if(next_source!=sc || next_group!=sgc) throw std::runtime_error("rolling tree coverage");
   }
@@ -378,33 +427,25 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
                  descriptor_base = twiddle_base + (rolling_sources ? 0 : h[19]);
   const uint64_t arena_words = descriptor_base + uint64_t(sc + 8 * gc) * 6;
   const auto arena = o.plane(arena_words, 1);
-  std::vector<CoefficientTransfer> coefficient_transfers;
-  coefficient_transfers.reserve(sc);
-  uint32_t device_columns=0;
-  for (uint32_t c = 0; c < sc; ++c) {
-    const uint64_t offset =
-        uint64_t(sources[4 * c]) | (uint64_t(sources[4 * c + 1]) << 32);
-    const auto coefficients = input.coefficients[c];
-    if (sources[4*c+3]>28 ||
-        coefficients.size() != (uint64_t(1) << sources[4 * c + 3]) ||
-        offset > aggregate.coefficients || coefficients.size() > aggregate.coefficients - offset)
-      throw std::runtime_error("coefficient span geometry");
-    const uint32_t lease_kind=o.validateCoefficient(coefficients,input.scope.data());
-    device_columns += coefficients.kind==1;
-    appendCoefficientTransfer(coefficient_transfers,coefficients,offset,lease_kind,input.scope);
+  if (!rolling_sources) {
+    std::vector<CoefficientTransfer> transfers;
+    transfers.reserve(sc);
+    for (uint32_t c = 0; c < sc; ++c) {
+      uint64_t offset;
+      const auto source = coefficient(c, offset);
+      append(transfers, source, offset);
+    }
+    for (const auto &transfer : transfers)
+      o.uploadCoefficient({arena.words + transfer.destination, transfer.source.size(), 1, 0}, transfer.source);
+    o.uploadBorrowed({arena.words + twiddle_base, h[19], 1, 0}, twiddles.data(), twiddles.size());
   }
-  // uploadCoefficient revalidates the COMPLETE merged range against the same
-  // live lease; adjacency alone never establishes ownership of the gap/span.
-  if (!rolling_sources) for (const auto &transfer:coefficient_transfers)
-    o.uploadCoefficient({arena.words+transfer.destination,transfer.source.size(),1,0},
-                        transfer.source,transfer.scope.data());
-  if (!rolling_sources) o.uploadBorrowed({arena.words + twiddle_base, h[19], 1, 0}, twiddles.data(),
-                                        twiddles.size());
   StwoRv64Plane rolling_evaluations{}, rolling_tree{}, stream_scratch{};
   const uint64_t stream_budget = rolling_sources ? pcsStreamBudget() : 0;
   uint64_t stream_scratch_words = 0;
   std::vector<stwo::cuda::rv64::stream::Plan> stream_plans;
-  const auto source_tw = rolling_sources ? upload(twiddles) : StwoRv64Plane{};
+  const auto tower = tables ? o.borrow(tables->forward, rows / 2) : StwoRv64Plane{};
+  const auto source_tw = tables ? StwoRv64Plane{tower.words + tower.stride - h[19], h[19], 1, 0} :
+      rolling_sources ? upload(twiddles) : StwoRv64Plane{};
   const auto trace_roots = rolling_sources ? o.plane(nt*8,1) : StwoRv64Plane{};
   std::vector<StwoRv64Plane> source_descriptors, combined_descriptors, combined_logs;
   std::vector<uint32_t> group_trees(sgc), group_logs;
@@ -493,8 +534,8 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
   const auto seed = o.io.seed ? o.borrow(o.io.seed, 9) : upload(initial_seed), src = rolling_sources ? uploadOwned(source_words) : upload(sources),
              term = upload(terms), grp = upload(groups),
              recipe = upload(recipes),
-             xy = o.domain(log, input.domain, input.sections[16]),
-             fri_tw = upload(fri_twiddles);
+             xy = tables ? tower : o.domain(log, input.domain, input.sections[16]),
+             fri_tw = tables ? o.borrow(tables->inverse, rows / 2) : upload(fri_twiddles);
   const auto state = o.plane(16, 1), boundary = o.plane(16, 1),
              parameter = h[21] ? (o.io.point ? o.borrow(o.io.point, 16) : upload(imported_point)) : o.plane(8, 1),
              point_arena = o.plane((gc + 1) * 16, 1),
@@ -712,7 +753,8 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
   combine.evaluation_words = aggregate.combined_evaluations;
   combine.group_count = gc;
   combine.output_log = log;
-  CHECK(stwo_rv64_deep_combine_on(o.ctx, o.lane, &combine));
+  if (tables) CHECK(stwo_rv64_deep_combine_canonical_on(o.ctx, o.lane, &combine));
+  else CHECK(stwo_rv64_deep_combine_on(o.ctx, o.lane, &combine));
   phase_mark(4);
   if (rolling_sources) {
     // Source opening uses only original coefficients, compact logs and fresh
@@ -733,10 +775,17 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
     fold.input = s.column;
     fold.output = i + 1 < layers ? storage[i + 1].column : last;
     fold.twiddles = fri_tw.words;
-    fold.twiddle_words = fri_twiddles.size();
+    fold.twiddle_words = fri_tw.stride;
     fold.alpha = s.alpha.words;
-    for (uint32_t k = 0; k < 4; ++k)
-      fold.offsets[k] = descriptions[i * 8 + 4 + k];
+    for (uint32_t k = 0; k < s.steps; ++k) {
+      const uint32_t count = s.count >> k;
+      if (tables && (i != 0 || k != 0) && count > fri_tw.stride)
+        throw std::runtime_error("invalid canonical FRI tower offset");
+      // The packed inverse y-coordinates of the circle fold are the first
+      // line layer in the inverse tower, in the same pair order.
+      fold.offsets[k] = tables ? ((i == 0 && k == 0) ? 0 : fri_tw.stride - count)
+                               : descriptions[i * 8 + 4 + k];
+    }
     fold.count = s.count;
     fold.steps = s.steps;
     fold.first_is_circle = i == 0;
@@ -780,13 +829,18 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
     o.retirePlanes(finished);
     if (stream_budget) {
       for (const auto &t : traces) {
+        const size_t ti = size_t(&t - traces.data());
+        if (committed_evaluations[ti]) {
+          stream_plans.emplace_back();
+          continue;
+        }
         std::vector<uint32_t> rows;
         for (uint32_t g = t.group; g < t.group + t.groups; ++g)
           rows.insert(rows.end(), source_groups[g * 8 + 5], 1u << source_groups[g * 8 + 3]);
         stwo::cuda::rv64::stream::Plan p;
         if (!stwo::cuda::rv64::stream::plan(rows, stream_budget, &p, 1u << t.log, pcsCompactEager()))
           throw std::runtime_error("streamed source geometry");
-        stream_scratch_words = std::max(stream_scratch_words, p.scratchWords());
+        stream_scratch_words = std::max(stream_scratch_words, committed_nodes[ti] ? p.chunk_words : p.scratchWords());
         stream_plans.push_back(std::move(p));
       }
       stream_scratch = o.plane(stream_scratch_words, 1);
@@ -794,21 +848,33 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
       rolling_evaluations = o.plane(max_tree_evaluations,1);
       rolling_tree = o.plane(max_tree_nodes,1);
       for (uint32_t g=0;g<sgc;++g)
-        trace_segments[g].columns = rolling_evaluations.words+trace_evaluation_offsets[g];
+        if (!committed_evaluations[group_trees[g]]) trace_segments[g].columns = rolling_evaluations.words+trace_evaluation_offsets[g];
       for (auto &t : traces) t.tree = {rolling_tree.words,t.tree_capacity,1,0};
     }
     // run() joined here; job arena allocations are stream-ordered.
   }
   for (auto &t : traces) {
+    const size_t tree_index = size_t(&t - traces.data());
+    const auto *nodes = committed_nodes[tree_index];
+    if (const auto *evaluations = committed_evaluations[tree_index]) {
+      for (uint32_t g = t.group; g < t.group + t.groups; ++g)
+        trace_segments[g].columns = evaluations + trace_evaluation_offsets[g];
+      CHECK(cudaMemcpyAsync(trace_roots.words + tree_index * 8, nodes + t.tree_words - 8,
+                            8 * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
+      StwoRv64TraceOpen open{nodes, raw.words, t.values.words, t.paths.words, status.words,
+                             t.tree_words, uint64_t(t.columns) * queries,
+                             uint64_t(queries) * t.log * 8, t.log, log, queries, 0};
+      CHECK(stwo_rv64_trace_open_on(o.ctx, o.lane, trace_segments.data() + t.group, t.groups, &open));
+      continue;
+    }
     if (rolling_sources && stream_budget) {
       // Chunked rebuild: LDE a bounded column chunk, read its queried values,
       // absorb it into the progressive leaf state, then reuse the chunk. The
       // tree is built in the bank that is dead after the final absorption.
       const size_t ti = size_t(&t - traces.data());
       const auto &p = stream_plans[ti];
-      uint32_t *base = stream_scratch.words, *chunk = base;
-      uint32_t *banks[2] = {base + p.bankOffset(0), base + p.bankOffset(1)};
-      uint32_t *hashes = banks[0];
+      uint32_t *chunk = stream_scratch.words;
+      uint32_t *hashes = nullptr;
       for (const auto &c : p.calls) {
         b::MixedSegment segments[stwo::cuda::rv64::stream::kMaxSegments];
         uint32_t count = 0, column = 0, g = t.group;
@@ -822,6 +888,14 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
           const uint64_t offset = (uint64_t(source[0]) | (uint64_t(source[1]) << 32)) + uint64_t(j) * n;
           if (count == stwo::cuda::rv64::stream::kMaxSegments)
             throw std::runtime_error("streamed segment overflow");
+          if (tables && nodes && run == c.end - c.first && &stwo_lde_n2b_query_columns_on) {
+            const int opened = stwo_lde_n2b_query_columns_on(
+                coefficient_trees[ti].words + offset, d[2], coefficient_logs.words + d[4] + j,
+                chunk, d[3], run, source_tw.words + d[6], raw.words, queries, log,
+                t.values.words + uint64_t(c.first) * queries, status.words, stream_raw);
+            if (!opened) break;
+            if (opened != int(cudaErrorNotSupported)) CHECK(opened);
+          }
           uint32_t launches = 0;
           CHECK(extend_columns(coefficient_trees[ti].words + offset, n,
             coefficient_logs.words + d[4] + j, chunk + cursor, m, d[3], run,
@@ -830,14 +904,19 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
           cursor += m * run;
           k += run;
         }
+        // A selected FFT wrote the final values without materializing the LDE.
+        if (!count) continue;
         StwoRv64TraceOpen values{nullptr, raw.words,
                                  t.values.words + uint64_t(c.first) * queries,
                                  nullptr, status.words, 0,
                                  uint64_t(c.end - c.first) * queries, 0,
                                  t.log, log, queries, 0};
         CHECK(stwo_rv64_trace_open_values_on(o.ctx, o.lane, segments, count, &values));
-        const void *seed = c.seed_bank < 0 ? nullptr : banks[c.seed_bank];
-        auto *out = banks[c.out_bank];
+        // The original committed tree already authenticates these values.
+        // A nodes-only opening needs neither prefix banks nor a second hash.
+        if (nodes) continue;
+        const void *seed = c.seed_bank < 0 ? nullptr : chunk + p.bankOffset(c.seed_bank);
+        auto *out = chunk + p.bankOffset(c.out_bank);
         if (pcsCompactEager()) {
           if (!&stwo_blake2s_mixed_seeded_eager_compact_on)
             throw std::runtime_error("base image lacks compact eager Blake2s");
@@ -852,10 +931,13 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
         }
         if (c.final) hashes = out;
       }
-      if (p.leaves > 1) CHECK(stwo_blake2s_merkle_layers_on(hashes, p.leaves, p.tree_words / 8, stream_raw));
-      CHECK(cudaMemcpyAsync(trace_roots.words + ti * 8, hashes + p.tree_words - 8,
+      if (!nodes) {
+        if (p.leaves > 1) CHECK(stwo_blake2s_merkle_layers_on(hashes, p.leaves, p.tree_words / 8, stream_raw));
+        nodes = hashes;
+      }
+      CHECK(cudaMemcpyAsync(trace_roots.words + ti * 8, nodes + p.tree_words - 8,
                             8 * sizeof(uint32_t), cudaMemcpyDeviceToDevice, stream));
-      StwoRv64TraceOpen paths{hashes, raw.words, nullptr, t.paths.words,
+      StwoRv64TraceOpen paths{nodes, raw.words, nullptr, t.paths.words,
                               status.words, p.tree_words, 0,
                               uint64_t(queries) * t.log * 8, t.log, log,
                               queries, 0};
@@ -864,10 +946,11 @@ void enqueueBody(JobOwner &o, const Input &input, const StwoRv64PcsJobPlan &job_
     }
     if(rolling_sources) {
       for(uint32_t g=t.group;g<t.group+t.groups;++g) extend_source(g);
-      CHECK(stwo_rv64_trace_tree_on(o.ctx, o.lane,trace_segments.data()+t.group,t.groups,t.log,t.tree.words,t.tree_capacity));
-      CHECK(cudaMemcpyAsync(trace_roots.words+(&t-traces.data())*8,t.tree.words+t.tree_words-8,8*sizeof(uint32_t),cudaMemcpyDeviceToDevice,stream));
-    }
-    StwoRv64TraceOpen open{t.tree.words,
+      if (!nodes) CHECK(stwo_rv64_trace_tree_on(o.ctx, o.lane,trace_segments.data()+t.group,t.groups,t.log,t.tree.words,t.tree_capacity));
+      if (!nodes) nodes = t.tree.words;
+      CHECK(cudaMemcpyAsync(trace_roots.words+tree_index*8,nodes+t.tree_words-8,8*sizeof(uint32_t),cudaMemcpyDeviceToDevice,stream));
+    } else nodes = t.tree.words;
+    StwoRv64TraceOpen open{nodes,
                            raw.words,
                            t.values.words,
                            t.paths.words,
@@ -925,7 +1008,8 @@ extern "C" int stwo_rv64_pcs_job_plan_v1(const StwoRv64PcsNativeRequest *request
                                          StwoRv64PcsJobPlan *out) {
   try {
     if (!out) throw std::runtime_error("missing PCS job plan output");
-    *out = planOf(inputFrom(request));
+    const bool device_tables = request && !request->sections[12].words && !request->sections[14].words;
+    *out = planOf(inputFrom(request, device_tables), device_tables);
     last_error.clear();
     return 0;
   } catch (const std::exception &e) {
@@ -934,15 +1018,20 @@ extern "C" int stwo_rv64_pcs_job_plan_v1(const StwoRv64PcsNativeRequest *request
   }
 }
 
-extern "C" int stwo_rv64_pcs_job_enqueue_v1(void *ctx, uint32_t lane,
-                                            const StwoRv64PcsNativeRequest *request,
-                                            const StwoRv64PcsJobMemory *memory,
-                                            const StwoRv64PcsJobIo *io) {
+static int open_job(void *ctx, uint32_t lane, const StwoRv64PcsNativeRequest *request,
+    const StwoRv64PcsJobMemory *memory, const StwoRv64PcsJobIo *io,
+    const StwoRv64PcsSourceImage images[4], uint32_t node_image_mask,
+    const StwoRv64PcsJobTables *tables) {
   try {
     if (!ctx || !memory || !io || !memory->alloc || !memory->release || !io->output)
       throw std::runtime_error("PCS job arguments");
-    const auto input = inputFrom(request);
-    const auto plan = planOf(input);
+    const auto input = inputFrom(request, tables != nullptr);
+    const auto plan = planOf(input, tables != nullptr);
+    if (tables) {
+      const uint64_t words = 1ull << (input.sections[0][4] - 1);
+      if (tables->forward_words != words || tables->inverse_words != words)
+        throw std::runtime_error("device PCS table span");
+    }
     if (io->output_words != plan.output_words)
       throw std::runtime_error("PCS job output span");
     if (memory->pinned_words < plan.ingress_words)
@@ -952,13 +1041,47 @@ extern "C" int stwo_rv64_pcs_job_enqueue_v1(void *ctx, uint32_t lane,
     if (stwo_exec_context_validate_allocation(ctx, io->output, io->output_words * 4))
       throw std::runtime_error("PCS job output is not context storage");
     JobOwner owner(ctx, lane, *memory, *io);
-    enqueueBody(owner, input, plan);
+    enqueueBody(owner, input, plan, images, node_image_mask, tables);
     last_error.clear();
     return 0;
   } catch (const std::exception &e) {
     last_error = e.what();
     return int(cudaErrorUnknown);
   }
+}
+
+extern "C" int stwo_rv64_pcs_job_open_node_images(void *ctx, uint32_t lane,
+    const StwoRv64PcsNativeRequest *request, const StwoRv64PcsJobMemory *memory,
+    const StwoRv64PcsJobIo *io, const StwoRv64PcsSourceImage images[4], uint32_t node_image_mask) {
+  return open_job(ctx, lane, request, memory, io, images, node_image_mask, nullptr);
+}
+
+extern "C" int stwo_rv64_pcs_job_open_device_tables_v1(void *ctx, uint32_t lane,
+    const StwoRv64PcsNativeRequest *request, const StwoRv64PcsJobMemory *memory,
+    const StwoRv64PcsJobIo *io, const StwoRv64PcsSourceImage images[4],
+    uint32_t node_image_mask, const StwoRv64PcsJobTables *tables) {
+  if (!tables) {
+    last_error = "missing device PCS tables";
+    return int(cudaErrorInvalidValue);
+  }
+  return open_job(ctx, lane, request, memory, io, images, node_image_mask, tables);
+}
+
+extern "C" int stwo_rv64_pcs_job_open_images(void *ctx, uint32_t lane,
+    const StwoRv64PcsNativeRequest *request, const StwoRv64PcsJobMemory *memory,
+    const StwoRv64PcsJobIo *io, const StwoRv64PcsSourceImage images[4]) {
+  // Preserve the old entry point's MAIN/INTER-only contract.
+  if (images && (images[3].words || images[3].count)) {
+    last_error = "composition image requires the explicit source-image entry point";
+    return int(cudaErrorInvalidValue);
+  }
+  return stwo_rv64_pcs_job_open_node_images(ctx, lane, request, memory, io, images, 0);
+}
+
+extern "C" int stwo_rv64_pcs_job_enqueue_v1(void *ctx, uint32_t lane,
+                                            const StwoRv64PcsNativeRequest *request,
+                                            const StwoRv64PcsJobMemory *memory, const StwoRv64PcsJobIo *io) {
+  return stwo_rv64_pcs_job_open_images(ctx, lane, request, memory, io, nullptr);
 }
 
 extern "C" const char *stwo_rv64_pcs_job_error_v1(void) { return last_error.c_str(); }

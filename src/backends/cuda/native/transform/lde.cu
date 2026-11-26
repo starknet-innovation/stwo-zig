@@ -2,6 +2,8 @@
 #include "n2b_smem.cuh"
 #include "transform_internal.cuh"
 
+extern "C" int stwo_exec_context_validate_allocation(void *, const void *, size_t);
+
 // Production schedules load and zero-extend coefficients in their first N2B
 // interval, avoiding a full evaluation-slab pass. Small and unsupported logs
 // retain the standalone staging kernel. The product ABI deliberately accepts
@@ -10,6 +12,78 @@
 namespace {
 
 using stwo::cuda::M31;
+
+struct CirclePoint {
+    M31 x, y;
+};
+
+struct CirclePowers {
+    CirclePoint digits[8][16];
+
+    constexpr CirclePowers() : digits{} {
+        constexpr uint64_t modulus = stwo::cuda::kM31Prime;
+        CirclePoint step{2, 1268011823};
+        for (auto &table : digits) {
+            CirclePoint p{1, 0};
+            for (auto &value : table) {
+                value = p;
+                p = {M31((uint64_t(p.x) * step.x + modulus * modulus - uint64_t(p.y) * step.y) % modulus),
+                     M31((uint64_t(p.y) * step.x + uint64_t(p.x) * step.y) % modulus)};
+            }
+            step = p;
+        }
+    }
+};
+
+__device__ __constant__ CirclePowers circle_powers{};
+
+template <uint32_t Squares>
+__device__ __forceinline__ M31 append_power(M31 x, M31 tail) {
+    using stwo::cuda::m31_mul;
+    for (uint32_t i = 0; i < Squares; ++i) x = m31_mul(x, x);
+    return m31_mul(x, tail);
+}
+
+template <bool Forward, bool Inverse>
+__global__ void build_circle_twiddle_tower(M31 *out, uint32_t size) {
+    using namespace stwo::cuda;
+    __shared__ CirclePoint digits[8][16];
+    digits[threadIdx.x / 16][threadIdx.x % 16] = circle_powers.digits[threadIdx.x / 16][threadIdx.x % 16];
+    __syncthreads();
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= size) return;
+    if (i == size - 1) {
+        if constexpr (Forward) out[i] = 1;
+        if constexpr (Inverse) out[(Forward ? size : 0) + i] = 1;
+        return;
+    }
+    // A tower stores bit-reversed layers largest first, then a trailing one.
+    // At a layer of length 2^log, the canonical point index is
+    // (4*j + 1) * 2^(28-log), where j is the natural position in that layer.
+    const uint32_t log = 31 - __clz(size - 1 - i);
+    const uint32_t in_layer = i - (size - (2u << log));
+    const uint32_t natural = log == 0 ? 0 : __brev(in_layer) >> (32 - log);
+    uint32_t exponent = (4 * natural + 1) << (28 - log);
+    CirclePoint p{1, 0};
+    #pragma unroll
+    for (uint32_t digit = 0; digit < 8; ++digit) {
+        const CirclePoint q = digits[digit][exponent & 15];
+        p = {m31_sub(m31_mul(p.x, q.x), m31_mul(p.y, q.y)),
+             m31_add(m31_mul(p.y, q.x), m31_mul(p.x, q.y))};
+        exponent >>= 4;
+    }
+    if constexpr (Forward) out[i] = p.x;
+    if constexpr (Inverse) {
+        // Fixed chain for x^(2^31 - 3), matching the scalar M31 inverse.
+        const auto x2 = append_power<1>(p.x, p.x);
+        const auto x4 = append_power<2>(x2, x2);
+        const auto x8 = append_power<4>(x4, x4);
+        const auto x16 = append_power<8>(x8, x8);
+        const auto x24 = append_power<8>(x16, x8);
+        const auto x28 = append_power<4>(x24, x4);
+        out[(Forward ? size : 0) + i] = append_power<2>(append_power<1>(x28, p.x), p.x);
+    }
+}
 
 struct alignas(8) AddressedLdeDescriptor {
     uint64_t coefficient_offset_words;
@@ -110,7 +184,8 @@ int lde_columns_on(
     void *stream_raw,
     bool include_circle,
     uint32_t *launches_out,
-    size_t coefficient_words_per_column = 0) {
+    size_t coefficient_words_per_column = 0,
+    const stwo::cuda::transform::WideQueries *queries = nullptr) {
     using namespace stwo::cuda::transform;
     // Every kernel reads at most min(2^log_size, domain) coefficients of a
     // column and zero-extends the rest, so a compact source (stride below the
@@ -155,6 +230,24 @@ int lde_columns_on(
         ranges_overlap(evaluation_range, twiddle_range)) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
+    if (queries) {
+        if (!n2b_wide_supported(log_n) || !n2b_wide_enabled() ||
+            queries->count > (1u << (log_n - kWideLowBits - 1u)))
+            return int(cudaErrorNotSupported);
+        DeviceRange rows{}, values{}, status{};
+        if (!queries->count || queries->lifting_log < log_n || queries->lifting_log > 28 ||
+            !word_range(queries->rows, queries->count, &rows) ||
+            !word_range(queries->values, uint64_t(queries->count) * polynomial_count, &values) ||
+            !word_range(queries->status, 1, &status))
+            return int(cudaErrorInvalidValue);
+        for (auto output : {evaluation_range, values, status})
+            if (ranges_overlap(output, rows) || ranges_overlap(output, coefficient_range) ||
+                ranges_overlap(output, size_range) || ranges_overlap(output, twiddle_range))
+                return int(cudaErrorInvalidValue);
+        if (ranges_overlap(evaluation_range, values) || ranges_overlap(evaluation_range, status) ||
+            ranges_overlap(values, status))
+            return int(cudaErrorInvalidValue);
+    }
     const cudaStream_t stream =
         reinterpret_cast<cudaStream_t>(stream_raw);
     const auto *domain_twiddles = reinterpret_cast<const M31 *>(
@@ -168,6 +261,11 @@ int lde_columns_on(
             const uint32_t chunk = remaining < kMaxColumnsPerLaunch
                 ? remaining
                 : kMaxColumnsPerLaunch;
+            WideQueries opening{};
+            if (queries) {
+                opening = *queries;
+                opening.values += uint64_t(base) * opening.count;
+            }
             const cudaError_t status = launch_n2b_wide<true>(
                 {reinterpret_cast<const M31 *>(coefficients) +
                      static_cast<size_t>(base) * coefficient_column_stride_words,
@@ -176,7 +274,8 @@ int lde_columns_on(
                 {reinterpret_cast<M31 *>(evaluations) +
                      static_cast<size_t>(base) * evaluation_column_stride_words,
                  evaluation_column_stride_words},
-                log_n, chunk, include_circle, domain_twiddles, stream);
+                log_n, chunk, include_circle, domain_twiddles, stream,
+                queries ? &opening : nullptr);
             if (status != cudaSuccess) return static_cast<int>(status);
             *launches_out += 2;
         }
@@ -263,6 +362,23 @@ int lde_columns_on(
 }
 
 }  // namespace
+
+extern "C" __attribute__((visibility("default"))) int stwo_circle_twiddles_on(
+    void *context, uint32_t *out, uint32_t domain_log, uint32_t direction, void *stream) {
+    if (domain_log < 2 || domain_log > 28 || direction < 1 || direction > 3 || !stream || !out)
+        return int(cudaErrorInvalidValue);
+    const uint32_t size = 1u << (domain_log - 1);
+    const size_t words = (direction == 3 ? 2 : 1) * size_t(size);
+    const int owned = stwo_exec_context_validate_allocation(context, out, words * sizeof(uint32_t));
+    if (owned != 0) return owned;
+    constexpr uint32_t threads = 128;
+    const auto blocks = (size + threads - 1) / threads;
+    const auto lane = static_cast<cudaStream_t>(stream);
+    if (direction == 3) build_circle_twiddle_tower<true, true><<<blocks, threads, 0, lane>>>(out, size);
+    else if (direction == 1) build_circle_twiddle_tower<true, false><<<blocks, threads, 0, lane>>>(out, size);
+    else build_circle_twiddle_tower<false, true><<<blocks, threads, 0, lane>>>(out, size);
+    return int(cudaPeekAtLastError());
+}
 
 // The canonical fixed artifact stores groups of sixteen coefficients in Rust
 // SIMD order. Swap the two vector-index halves in place after the raw bytes
@@ -508,4 +624,19 @@ extern "C" int stwo_lde_n2b_columns_compact_on(
         true,
         launches_out,
         coefficient_words_per_column);
+}
+
+// Internal resident opening. The caller supplies allocation-checked input,
+// scratch and output views. Unsupported heights leave the lane untouched.
+extern "C" int stwo_lde_n2b_query_columns_on(
+    const uint32_t *coefficients, uint32_t coefficient_log, const uint32_t *logs,
+    uint32_t *scratch, uint32_t log, uint32_t columns, const uint32_t *twiddles,
+    const uint32_t *rows, uint32_t queries, uint32_t lifting_log,
+    uint32_t *values, uint32_t *status, void *stream) {
+    if (log < 2 || log > 28 || coefficient_log >= log) return int(cudaErrorInvalidValue);
+    const stwo::cuda::transform::WideQueries opening{rows, values, status, queries, lifting_log};
+    const uint32_t n = 1u << coefficient_log, half = 1u << (log - 1u);
+    uint32_t launches = 0;
+    return lde_columns_on(coefficients, n, logs, scratch, 2u * half, log, columns,
+                          twiddles, half, half, stream, true, &launches, n, &opening);
 }

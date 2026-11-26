@@ -415,6 +415,53 @@ __global__ void seed_gather(StwoRv64OuterSeedIo io) {
   }
 }
 
+// Match the verifier's ordered header and all three 35-word truth frames.
+// A truth tail already has the statement as 19 split u32s and one OM31 claim.
+__device__ uint32_t service_group_digest(const StwoRv64OuterSeedIo &io, uint32_t (&digest)[8]) {
+  const uint32_t *p = io.program;
+  constexpr uint32_t members = 3, domain = 0x47565253u, version = 1;
+  constexpr uint32_t public_words = 19, claim_words = 8;
+  const uint32_t first = p[pOutputsAt];
+  if (io.n_children != members || p[pOutputs] != 8 || first > UINT32_MAX - members ||
+      p[pDomain] != domain || p[pVersionWord] != version) return bRegion;
+  Stream frame;
+  s_init(frame, 0);
+  s_word(frame, domain);
+  s_word(frame, version);
+  s_word(frame, first);
+  s_word(frame, members);
+  s_word(frame, first + members);
+  for (uint32_t k = 0; k < members; ++k) {
+    const uint32_t *e = p + p[pChildrenAt] + k * cWords;
+    const uint32_t *r = io.children[k];
+    const uint64_t tail_at = uint64_t(e[cImage]) + e[cImageWords];
+    if (!r || e[cImage] < 2 || e[cImageWords] < kRootsAt + 16 ||
+        io.children_words[k] < tail_at + 8 * public_words + claim_words ||
+        !r[0] || r[0] > uint64_t(e[cImage] - 1) * 4) return bRegion;
+    const uint32_t *img = r + e[cImage];
+    if (img[0] != kImageMagic || img[1] != 2) return bMagic;
+    for (uint32_t i = 0; i < 8; ++i)
+      if (img[kRootsAt + i] != e[cFixedRoot + i]) return bFixedRoot;
+    const uint32_t *tail = r + tail_at;
+    for (uint32_t i = 0; i < public_words; ++i) {
+      const uint32_t *seed = tail + 8 * i;
+      if (seed[0] > 0xffffu || seed[4] > 0xffffu ||
+          (seed[1] | seed[2] | seed[3] | seed[5] | seed[6] | seed[7])) return bNoncanonical;
+      const uint32_t word = seed[0] | (seed[4] << 16);
+      if (i == 0 && word != first + k) return bIdentity;
+      s_word(frame, word);
+    }
+    for (uint32_t i = 0; i < 8; ++i) s_word(frame, img[kRootsAt + 8 + i]);
+    for (uint32_t i = 0; i < claim_words; ++i) {
+      const uint32_t word = tail[8 * public_words + i];
+      if (word >= kModulus) return bNoncanonical;
+      s_word(frame, word);
+    }
+  }
+  s_final(frame, digest);
+  return kNone;
+}
+
 __global__ void seed_finish(StwoRv64OuterSeedIo io) {
   uint32_t *rank = io.scratch + (io.scratch_words - 8);
   const uint32_t worst = *rank;
@@ -423,7 +470,7 @@ __global__ void seed_finish(StwoRv64OuterSeedIo io) {
   const uint32_t *p = io.program;
   const uint32_t kind = p[pStatement];
   const uint32_t n_self = p[pOutputs];
-  if (worst <= sImageHeader || (kind != 1 && kind != 2) || io.outputs_words < 4 * n_self) {
+  if (worst <= sImageHeader || kind < 1 || kind > 3 || io.outputs_words < 4 * n_self) {
     *io.bind_status = (kChildBinding << 16) | bRegion;
     return;
   }
@@ -440,37 +487,45 @@ __global__ void seed_finish(StwoRv64OuterSeedIo io) {
       io.outputs[i] = r[at + i];
     }
   } else {
-    Stream m;
-    s_init(m, 0);
-    s_word(m, p[pDomain]);
-    s_word(m, p[pVersionWord]);
-    const uint32_t *profile = p + p[pProfile];
-    for (uint32_t k = 0; k < io.n_children; ++k) {
-      const uint32_t *e = p + p[pChildrenAt] + k * cWords;
-      const uint32_t *r = io.children[k];
-      const uint32_t n_out = e[cOutputs];
-      if (r[0] < 4u * (19 + 4 * n_out) || e[cImage] < 20 + 4 * n_out) {
-        bworst = min(bworst, uint32_t(bRegion));
-        continue;
-      }
-      if (r[1] != kWireMagic0 || r[2] != kWireMagic1) bworst = min(bworst, uint32_t(bMagic));
-      for (int i = 0; i < 8; ++i) {
-        if (r[3 + i] != profile[i]) bworst = min(bworst, uint32_t(bProfile));
-        if (r[11 + i] != e[cIdentity + i]) bworst = min(bworst, uint32_t(bIdentity));
-      }
-      if (r[19] != n_out) bworst = min(bworst, uint32_t(bOutputs));
-      const uint32_t *img = r + e[cImage];
-      for (int i = 0; i < 8; ++i)
-        if (img[kRootsAt + i] != e[cFixedRoot + i]) bworst = min(bworst, uint32_t(bFixedRoot));
-      for (uint32_t i = 0; i < 4 * n_out; ++i)
-        if (r[20 + i] >= kModulus) bworst = min(bworst, uint32_t(bNoncanonical));
-      for (int i = 0; i < 8; ++i) s_word(m, r[11 + i]);
-      for (int i = 0; i < 8; ++i) s_word(m, img[kRootsAt + i]);
-      s_word(m, n_out);
-      for (uint32_t i = 0; i < 4 * n_out; ++i) s_word(m, r[20 + i]);
-    }
     uint32_t digest[8];
-    s_final(m, digest);
+    if (kind == 3) {
+      bworst = service_group_digest(io, digest);
+      if (bworst != kNone) {
+        *io.bind_status = (kChildBinding << 16) | bworst;
+        return;
+      }
+    } else {
+      Stream m;
+      s_init(m, 0);
+      s_word(m, p[pDomain]);
+      s_word(m, p[pVersionWord]);
+      const uint32_t *profile = p + p[pProfile];
+      for (uint32_t k = 0; k < io.n_children; ++k) {
+        const uint32_t *e = p + p[pChildrenAt] + k * cWords;
+        const uint32_t *r = io.children[k];
+        const uint32_t n_out = e[cOutputs];
+        if (r[0] < 4u * (19 + 4 * n_out) || e[cImage] < 20 + 4 * n_out) {
+          bworst = min(bworst, uint32_t(bRegion));
+          continue;
+        }
+        if (r[1] != kWireMagic0 || r[2] != kWireMagic1) bworst = min(bworst, uint32_t(bMagic));
+        for (int i = 0; i < 8; ++i) {
+          if (r[3 + i] != profile[i]) bworst = min(bworst, uint32_t(bProfile));
+          if (r[11 + i] != e[cIdentity + i]) bworst = min(bworst, uint32_t(bIdentity));
+        }
+        if (r[19] != n_out) bworst = min(bworst, uint32_t(bOutputs));
+        const uint32_t *img = r + e[cImage];
+        for (int i = 0; i < 8; ++i)
+          if (img[kRootsAt + i] != e[cFixedRoot + i]) bworst = min(bworst, uint32_t(bFixedRoot));
+        for (uint32_t i = 0; i < 4 * n_out; ++i)
+          if (r[20 + i] >= kModulus) bworst = min(bworst, uint32_t(bNoncanonical));
+        for (int i = 0; i < 8; ++i) s_word(m, r[11 + i]);
+        for (int i = 0; i < 8; ++i) s_word(m, img[kRootsAt + i]);
+        s_word(m, n_out);
+        for (uint32_t i = 0; i < 4 * n_out; ++i) s_word(m, r[20 + i]);
+      }
+      s_final(m, digest);
+    }
     for (uint32_t i = 0; i < n_self; ++i) {
       const uint32_t v = i < 8 ? digest[i] : 0;
       io.outputs[4 * i] = v & 0xffffu;

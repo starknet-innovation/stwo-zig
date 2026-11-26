@@ -31,7 +31,7 @@ const shapes = [_]C.Shape{
     .{ .log_size = 5, .encoding = .evaluations },
 };
 
-const Placement = enum { allocated, sorted, original };
+const Placement = enum { allocated, sorted, original, shared_evaluations };
 const Probe = struct {
     placement: Placement,
     plan: *C.CommitPlan,
@@ -63,8 +63,11 @@ const Probe = struct {
     pub fn enqueue(self: *Probe, e: *api.Enqueue) !void {
         try e.channel.initFromCheckpoint(self.seed_buffer.?);
         const root = try e.slab.device.slice(0, 8);
-        const committed = if (self.placement == .allocated)
-            try self.plan.enqueue(self.sym, e, &self.inputs, root, true)
+        const workspace = if (self.placement == .shared_evaluations) try e.alloc(self.plan.eval_cells) else null;
+        const committed = if (workspace != null)
+            try self.plan.enqueueUsingEvaluations(self.sym, e, &self.inputs, root, true, workspace)
+        else if (self.placement == .allocated)
+            try self.plan.enqueueWithNodes(self.sym, e, &self.inputs, root, true, true)
         else blk: {
             const output = try e.alloc(self.plan.coefficient_cells);
             var views: [shapes.len]C.Input = undefined;
@@ -82,7 +85,14 @@ const Probe = struct {
         };
         try e.channel.snapshot(e.slab, 8);
         try O.check(self.sym.copy_d2d(e.ctx(), e.slab.device.ptr + 24, committed.coefficients.ptr, committed.coefficients.words * 4));
+        if (self.placement == .allocated or self.placement == .shared_evaluations) {
+            const nodes = committed.node_storage orelse return error.CommitNodesMissing;
+            const node_root = try nodes.slice(self.plan.tree_words - 8, 8);
+            try O.check(self.sym.copy_d2d(e.ctx(), e.slab.device.ptr + 24 + committed.coefficients.words, node_root.ptr, node_root.bytes()));
+            e.free(nodes);
+        }
         e.free(committed.coefficients);
+        if (workspace) |buffer| e.free(buffer);
     }
     pub fn finish(self: *Probe, v: api.SlabView) !void {
         @memcpy(self.result, v.words[0..self.slab_words]);
@@ -102,6 +112,7 @@ const Done = struct {
 test "GPU: enqueue-only trace commit root, device root mix and coefficients equal the host engine" {
     var gpu = (try @import("native_gpu_support_test.zig").Gpu.openNamed("native_commit_test")) orelse return error.SkipZigTest;
     defer gpu.close();
+    try std.testing.expect(gpu.libs.ops.exec.circle_twiddles != null);
     for (1..5) |beta| {
         for (std.enums.values(Placement)) |placement| try compareCommit(&gpu.libs, @intCast(beta), placement, false);
         if (beta > 1) try compareCommit(&gpu.libs, @intCast(beta), .original, true);
@@ -156,7 +167,7 @@ fn compareCommit(libs: *O.Libraries, beta: u32, placement: Placement, addressed:
         const values = if (shape.encoding == .evaluations) ev else c;
         w.* = @as([*]const u32, @ptrCast(values.ptr))[0..values.len];
     }
-    const slab_words = 24 + plan.coefficient_cells;
+    const slab_words = 24 + plan.coefficient_cells + (if (placement == .allocated or placement == .shared_evaluations) @as(usize, 8) else 0);
     const result = try a.alloc(u32, slab_words);
     defer a.free(result);
     var probe = Probe{ .placement = placement, .plan = &plan, .sym = sym, .seed = seed, .host = host_words, .slab_words = slab_words, .result = result };
@@ -169,6 +180,7 @@ fn compareCommit(libs: *O.Libraries, beta: u32, placement: Placement, addressed:
         if (done.err) |err| return err;
 
         for (0..8) |i| try std.testing.expectEqual(std.mem.readInt(u32, host_root[i * 4 ..][0..4], .little), result[i]);
+        if (placement == .allocated or placement == .shared_evaluations) try std.testing.expectEqualSlices(u32, result[0..8], result[slab_words - 8 ..]);
         for (0..8) |i| try std.testing.expectEqual(std.mem.readInt(u32, channel.inner.digest[i * 4 ..][0..4], .little), result[8 + i]);
         try std.testing.expectEqual(channel.inner.n_draws, result[8 + 8]);
         try std.testing.expectEqual(@as(u32, 0), result[8 + 10]); // channel status

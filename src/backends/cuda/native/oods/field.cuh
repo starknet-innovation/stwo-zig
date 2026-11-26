@@ -1,13 +1,14 @@
 #pragma once
 
 #include <cuda_runtime_api.h>
+#include "../common/m31.cuh"
 
 #include <cstddef>
 #include <cstdint>
 
 namespace stwo::cuda::oods {
 
-using M31 = std::uint32_t;
+using ::stwo::cuda::M31;
 
 struct CM31 {
     M31 a;
@@ -45,32 +46,24 @@ static_assert(offsetof(CirclePoint, y) == sizeof(std::uint32_t));
 static_assert(offsetof(SecureCirclePoint, x) == 0);
 static_assert(offsetof(SecureCirclePoint, y) == 4 * sizeof(std::uint32_t));
 
-constexpr M31 kPrime = 2147483647u;
+constexpr M31 kPrime = kM31Prime;
 constexpr CM31 kExtensionR{2u, 1u};
 constexpr CirclePoint kCircleGenerator{2u, 1268011823u};
 
 __host__ __device__ __forceinline__ M31 add(M31 lhs, M31 rhs) {
-    // Canonical inputs are below 2^31 - 1, so their sum fits in u32.
-    const M31 sum = lhs + rhs;
-    return sum < kPrime ? sum : sum - kPrime;
+    return m31_add(lhs, rhs);
 }
 
 __host__ __device__ __forceinline__ M31 sub(M31 lhs, M31 rhs) {
-    return add(lhs, kPrime - rhs);
+    return m31_sub(lhs, rhs);
 }
 
 __host__ __device__ __forceinline__ M31 neg(M31 value) {
-    return value == 0 ? 0 : kPrime - value;
+    return m31_neg(value);
 }
 
 __host__ __device__ __forceinline__ M31 mul(M31 lhs, M31 rhs) {
-    const std::uint64_t value =
-        static_cast<std::uint64_t>(lhs) * static_cast<std::uint64_t>(rhs);
-    // value < 2^62. Folding its high and low 31-bit halves produces a
-    // value below 2*p, which needs only one conditional subtraction.
-    const M31 folded = static_cast<M31>(value & kPrime) +
-                       static_cast<M31>(value >> 31);
-    return folded < kPrime ? folded : folded - kPrime;
+    return m31_mul(lhs, rhs);
 }
 
 __host__ __device__ __forceinline__ M31 square(M31 value) {
@@ -117,6 +110,19 @@ __host__ __device__ __forceinline__ CM31 mul(M31 lhs, CM31 rhs) {
     return {mul(lhs, rhs.a), mul(lhs, rhs.b)};
 }
 
+namespace detail {
+// i^2 = -1 and the quartic twist is 2+i. Both maps use canonical M31
+// operations and avoid a general complex multiplication.
+__host__ __device__ __forceinline__ CM31 square_complex(CM31 value) {
+    const M31 ab = mul(value.a, value.b);
+    return {mul(add(value.a, value.b), sub(value.a, value.b)), add(ab, ab)};
+}
+
+__host__ __device__ __forceinline__ CM31 mul_twist(CM31 value) {
+    return {sub(add(value.a, value.a), value.b), add(add(value.b, value.b), value.a)};
+}
+} // namespace detail
+
 __host__ __device__ __forceinline__ CM31 inverse(CM31 value) {
     const M31 factor =
         inverse(add(mul(value.a, value.a), mul(value.b, value.b)));
@@ -147,7 +153,7 @@ __host__ __device__ __forceinline__ QM31 mul(QM31 lhs, QM31 rhs) {
     const CM31 v0 = mul(lhs.a, rhs.a);
     const CM31 v1 = mul(lhs.b, rhs.b);
     const CM31 v2 = mul(add(lhs.a, lhs.b), add(rhs.a, rhs.b));
-    return {add(v0, mul(kExtensionR, v1)), sub(v2, add(v0, v1))};
+    return {add(v0, detail::mul_twist(v1)), sub(v2, add(v0, v1))};
 }
 
 __host__ __device__ __forceinline__ QM31 mul(M31 lhs, QM31 rhs) {
@@ -155,14 +161,12 @@ __host__ __device__ __forceinline__ QM31 mul(M31 lhs, QM31 rhs) {
 }
 
 __host__ __device__ __forceinline__ QM31 square(QM31 value) {
-    return mul(value, value);
+    const CM31 ab = mul(value.a, value.b);
+    return {add(detail::square_complex(value.a), detail::mul_twist(detail::square_complex(value.b))), add(ab, ab)};
 }
 
 __host__ __device__ __forceinline__ QM31 inverse(QM31 value) {
-    const CM31 b_squared = mul(value.b, value.b);
-    const CM31 rotated{neg(b_squared.b), b_squared.a};
-    const CM31 denominator =
-        sub(mul(value.a, value.a), add(add(b_squared, b_squared), rotated));
+    const CM31 denominator = sub(detail::square_complex(value.a), detail::mul_twist(detail::square_complex(value.b)));
     const CM31 denominator_inverse = inverse(denominator);
     return {
         mul(value.a, denominator_inverse),

@@ -110,6 +110,9 @@ pub const TruthSetup = struct {
         return initWithSuite(a, kind, logs, Key.Suite.production());
     }
     pub fn initWithSuite(a: std.mem.Allocator, kind: S.program.Kind, logs: [2]u32, suite: Key.Suite) !TruthSetup {
+        return initWithFixedMode(a, kind, logs, suite, .committed);
+    }
+    pub fn initWithFixedMode(a: std.mem.Allocator, kind: S.program.Kind, logs: [2]u32, suite: Key.Suite, mode: Key.FixedMode) !TruthSetup {
         try suite.validate();
         const p = S.program.get(kind);
         _ = try S.layout.admitRoster(&.{ .{ .kind = .product, .program = p, .calls = 0, .first_id = 1, .log = logs[0] }, .{ .kind = .linear, .program = p, .calls = 0, .first_id = 1, .log = logs[1] } }, &.{});
@@ -122,7 +125,7 @@ pub const TruthSetup = struct {
         var self = TruthSetup{ .allocator = a, .kind = kind, .logs = logs, .product_fixed = pf, .linear_fixed = lf, .bytes = bytes, .key = undefined };
         const cols = try self.fixedColumns(a);
         defer a.free(cols);
-        self.key = try Key.sealWithSuite(a, cols, suite);
+        self.key = try Key.prepare(a, cols, suite, mode);
         return self;
     }
     pub fn deinit(self: *TruthSetup) void {

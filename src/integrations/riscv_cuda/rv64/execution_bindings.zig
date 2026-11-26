@@ -1,6 +1,9 @@
 //! Typed native device and job interfaces used by product orchestration.
 //! Device programs and proof records keep their existing canonical owners.
 pub const runtime = struct {
+    pub const guest_execution = @import("guest_execution.zig");
+    pub const guest_capture = @import("guest_capture.zig");
+    pub const guest_family_census = @import("guest_family_census.zig");
     pub const resident_router = @import("resident_router.zig");
     pub const cuda_events = @import("cuda_events.zig");
     pub const abi = @import("abi.zig");
@@ -21,6 +24,7 @@ pub const jobs = struct {
     pub const native_gkr = @import("jobs/native_gkr.zig");
     pub const native_global = @import("jobs/native_global.zig");
     pub const native_commit = @import("jobs/native_commit.zig");
+    pub const native_fixed_seed = @import("jobs/native_fixed_seed.zig");
     pub const native_stage1 = @import("jobs/native_stage1.zig");
     pub const native_binding = @import("jobs/native_binding.zig");
     pub const native_composition = @import("jobs/native_composition.zig");

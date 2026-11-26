@@ -121,8 +121,6 @@ fn parallel(count: usize, lanes: usize, ctx: anytype, comptime func: fn (@TypeOf
 }
 
 pub fn verifyTree(a: std.mem.Allocator, setups: []const *const R.CpuSetup, truths: []const R.Truth, bundle: *const Coordinator.Bundle, expected: P.Expected, config: W.PcsConfig, fixed: *const FixedSet, dir: std.fs.Dir, lanes: usize, sink: *RV.Sink) !Report {
-    if (Om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1)
-        return error.MixedArithmeticPortableKeyUnsupported;
     var timer = try std.time.Timer.start();
     const arity = try @import("om31_native/execution_wrap.zig").foldArity();
     var inventory = try Execution.Inventory.initWithAuthority(a, setups, truths, bundle.requests, expected, config, fixed);

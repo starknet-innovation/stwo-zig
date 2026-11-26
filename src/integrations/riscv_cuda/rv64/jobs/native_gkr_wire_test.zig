@@ -155,6 +155,8 @@ fn manifestParity(a: std.mem.Allocator, instances: []const NG.Instance, proof: a
         try std.testing.expectEqual(@as(u32, 0), output[output.len - 1]);
         try std.testing.expectEqual(expected.len, output[0]);
         try std.testing.expectEqualSlices(u8, expected, std.mem.sliceAsBytes(output[1..])[0..expected.len]);
+        const tail = std.mem.sliceAsBytes(output[1..])[expected.len..std.mem.alignForward(usize, expected.len, 4)];
+        try std.testing.expect(std.mem.allEqual(u8, tail, 0));
         exchange[child.flag] = 0;
         try run(worker, &probe);
         exchange[child.flag] = tag;
@@ -192,12 +194,14 @@ fn gpuParity(program: W.Program, section: []u32, scope: []const u32, marginals: 
         try run(worker, &probe);
         section[bad] = bad_word;
         try std.testing.expectEqual(@as(u32, 0x02090002), output[output.len - 1]);
+        try std.testing.expect(std.mem.allEqual(u32, output[0..16], 0));
         try std.testing.expectEqual(@as(u32, 0), output[16]);
         const saved = marginals[0];
         marginals[0] = 0x7fffffff;
         try run(worker, &probe);
         marginals[0] = saved;
         try std.testing.expectEqual(@as(u32, 0x02090003), output[output.len - 1]);
+        try std.testing.expect(std.mem.allEqual(u32, output[0..16], 0));
         try std.testing.expectEqual(@as(u32, 0), output[16]);
         std.debug.print("GPU_M8_LOCAL_GKR_WIRE_PARITY device={} wire_bytes={} digest_equal=1 invalid_length_rejected=1 noncanonical_rejected=1\n", .{ device, expected.len });
     }

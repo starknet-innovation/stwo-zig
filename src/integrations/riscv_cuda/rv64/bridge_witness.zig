@@ -107,43 +107,9 @@ pub const Context = struct {
         return .{ .context = owner, .release = Owner.release };
     }
 };
-fn pair(out: []u32, value: u64) void {
-    out[0] = @truncate(value);
-    out[1] = @truncate(value >> 32);
-}
-fn packet(out: []u32, pointer: u64, epoch: u16, tick: u24) void {
-    pair(out, pointer);
-    out[2] = epoch;
-    out[3] = tick;
-}
-fn ram(out: []u32, before: u64, after: u64, pred: A.memory.closed_ram.types.State) void {
-    pair(out, before);
-    pair(out[2..], after);
-    pair(out[4..], pred.value);
-    out[6] = @as(u32, pred.epoch) | (@as(u32, pred.rights) << 16);
-    out[7] = pred.tick;
-}
-pub fn encodeKeccak(a: std.mem.Allocator, calls: []const K.types.Call) ![]u32 {
-    const stride = 4 + 25 * 8;
-    const out = try a.alloc(u32, try std.math.mul(usize, calls.len, stride));
-    for (calls, 0..) |call, i| {
-        const row = out[i * stride ..][0..stride];
-        packet(row, call.pointer, call.epoch, call.tick);
-        for (0..25) |j| ram(row[4 + j * 8 ..], call.before[j], call.after[j], call.predecessors[j]);
-    }
-    return out;
-}
-pub fn encodeWire(a: std.mem.Allocator, kind: W.types.Kind, calls: []const W.types.Call) ![]u32 {
-    const words = 4 * W.types.coordinates(kind);
-    const stride = 4 + words * 8;
-    const out = try a.alloc(u32, try std.math.mul(usize, calls.len, stride));
-    for (calls, 0..) |call, i| {
-        const row = out[i * stride ..][0..stride];
-        packet(row, call.pointer, call.epoch, call.tick);
-        for (0..words) |j| ram(row[4 + j * 8 ..], call.before[j], call.after[j], call.predecessors[j]);
-    }
-    return out;
-}
+const Bridge = @import("guest_service_inputs.zig").Bridge;
+pub const encodeKeccak = Bridge.encodeKeccak;
+pub const encodeWire = Bridge.encodeWire;
 const Owner = struct {
     allocator: std.mem.Allocator,
     service: *Service.Context,

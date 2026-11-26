@@ -364,7 +364,43 @@ pub const ClassCache = struct {
         if (i != seeds.len) return error.PlanClassSeedLayout;
         return seeds;
     }
+    // Completed runtime classes already retain the packed assignment image.
+    // Pay for a second, independently reusable CPU copy after reuse is observed.
+    // Colliding hints only delay admission. Template lookup still checks the full key.
+    const ReuseHistory = struct {
+        keys: [512][32]u8 = undefined,
+        seen: std.StaticBitSet(512) = .initEmpty(),
+
+        fn observe(self: *@This(), key: [32]u8) bool {
+            const slot = std.mem.readInt(u16, key[0..2], .little) % self.keys.len;
+            const repeated = self.seen.isSet(slot) and std.mem.eql(u8, &self.keys[slot], &key);
+            self.keys[slot] = key;
+            self.seen.set(slot);
+            return repeated;
+        }
+    };
+
+    var history: ReuseHistory = .{};
+
+    test "assignment cache admits only repeated full identities in a colliding slot" {
+        var h: ReuseHistory = .{};
+        const first: [32]u8 = @splat(0);
+        var second = first;
+        second[31] = 1;
+        try std.testing.expect(!h.observe(first));
+        try std.testing.expect(h.observe(first));
+        try std.testing.expect(!h.observe(second));
+        try std.testing.expect(!h.observe(first));
+        try std.testing.expect(h.observe(first));
+    }
+
     fn insert(key: [32]u8, p: *const Prepared, ctx: *const Circuit.builder.Context(Q)) void {
+        if (ctx.trace_only) {
+            mutex.lock();
+            const repeated = history.observe(key);
+            mutex.unlock();
+            if (!repeated) return;
+        }
         insertImpl(key, p, ctx) catch |err| std.debug.print("GPU_OUTER_PLAN_CLASS insert_error={s}\n", .{@errorName(err)});
     }
     fn insertImpl(key: [32]u8, p: *const Prepared, ctx: *const Circuit.builder.Context(Q)) !void {
@@ -413,6 +449,8 @@ pub const Prepared = struct {
     allocator: std.mem.Allocator,
     reference: ?[*]const Q,
     count: usize,
+    staged_zero_variables: u32 = 0,
+    staged_two_variables: u32 = 0,
     plan: Schedule.Plan,
     tasks: []Task,
     indices: []u32,
@@ -696,11 +734,15 @@ pub const Prepared = struct {
             }
             for (tasks) |task| if (capabilities & (@as(u32, 1) << @intCast(task.kind)) == 0) return error.UnsupportedCircuitAssignmentHint;
         }
+        a.free(plan.tasks);
+        plan.tasks = &.{};
         const task_pack_ns = timer.lap();
 
         const seeds = try a.alloc(Seed, plan.seeds.len);
         errdefer a.free(seeds);
         for (plan.seeds, seeds) |input, *out| out.* = .{ .out = input.variable, .value = Circuit.builder.ivalue.limbs(input.value) };
+        a.free(plan.seeds);
+        plan.seeds = &.{};
         const seed_pack_ns = timer.lap();
         // This cache identity binds every generation byte. Chunking changes
         // only the private immutable-cache key, never the proof transcript.
@@ -791,6 +833,7 @@ pub const Prepared = struct {
         self.* = undefined;
     }
     pub fn generate(self: *const Prepared, owner: anytype, ctx: *SC.Context) !N.Lease {
+        if (self.staged_zero_variables != 0 or self.staged_two_variables != 0) return error.StagedAssignmentRequired;
         const execution = @import("outer_assignment_execution.zig").Execution{ .prepared = self };
         return execution.generate(owner, ctx);
     }

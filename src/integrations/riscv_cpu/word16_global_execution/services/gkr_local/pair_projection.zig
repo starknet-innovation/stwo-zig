@@ -11,14 +11,15 @@ pub fn andTerms(pairs: bool) u32 {
     return if (pairs) 2 else 1;
 }
 pub fn emitCpuMetadata(cpu: anytype, logical: usize, pairs: bool, sink: anytype) !void {
-    if (cpu.log_size > 22) return error.UnqualifiedWideClockGkr;
+    const wide = A.word16_execution.layout.wideClock(cpu.log_size);
+    if (wide and (cpu.log_size != 23 or pairs)) return error.UnqualifiedWideClockGkr;
     if (cpu.u8_pairs != pairs) return error.LocalGkrMetadataShape;
     const main = try cpu.row(logical);
     if (cpu.compact) {
         // Compact decode: the ROM pc coordinate reads the cyclic previous row
         // (row 0 uses the public initial PC through the `first` selector), the
         // same projection the authenticated AIR binding evaluates from masks.
-        if (!pairs) return error.LocalGkrMetadataShape;
+        if (!pairs and !wide) return error.LocalGkrMetadataShape;
         const n = cpu.size();
         if (logical >= n) return error.LocalGkrMetadataShape;
         const previous = try cpu.row(if (logical == 0) n - 1 else logical - 1);
@@ -30,7 +31,7 @@ pub fn emitCpuMetadata(cpu: anytype, logical: usize, pairs: bool, sink: anytype)
             }
         };
         var adapter = Adapter{ .target = sink };
-        Fns.cpuCompactFor(M, &fixed, &main, &previous, M.fromCanonical(cpu.epoch), A.word16_execution.types.nativePcFelt((try A.word16_execution.types.inputs(cpu.public, cpu.epoch, cpu.log_size)).initial_pc), &adapter);
+        Fns.cpuCompactClockFor(M, &fixed, &main, &previous, M.fromCanonical(cpu.epoch), A.word16_execution.types.nativePcFelt((try A.word16_execution.types.inputs(cpu.public, cpu.epoch, cpu.log_size)).initial_pc), wide, &adapter);
         return;
     }
     const fixed = [_]M{ M.fromCanonical(@intCast(logical)), M.zero(), M.zero() };
@@ -41,7 +42,7 @@ pub fn emitCpuMetadata(cpu: anytype, logical: usize, pairs: bool, sink: anytype)
         }
     };
     var adapter = Adapter{ .target = sink };
-    Fns.cpuModeFor(M, &fixed, &main, M.fromCanonical(cpu.epoch), pairs, &adapter);
+    Fns.cpuClockFor(M, &fixed, &main, M.fromCanonical(cpu.epoch), if (wide) .wide else if (pairs) .pair else .byte, &adapter);
 }
 pub fn emitAndMetadata(logical: usize, and_count: u64, pair_counts: []const u32, pairs: bool, sink: anytype) !void {
     if (logical >= 65536 or and_count >= core.fields.m31.Modulus or pair_counts.len != (if (pairs) @as(usize, 65536) else 0)) return error.LocalGkrMetadataShape;

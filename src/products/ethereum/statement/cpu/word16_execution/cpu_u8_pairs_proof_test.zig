@@ -149,7 +149,7 @@ fn run(tamper: Tamper) !Outcome {
     const honest_claims = claims;
     try claims.validate();
     claims.cpu = try repairPairs(actual, source.cpu.interaction, try X.types.inputs(request.cpu, request.epoch, 5), draw.cpu, draw.and_, tamper);
-    if (tamper == .table_inverse) claims.and_table = try forgeTable(&source.and_table, &setup.materials.and_table, draw.and_, tamper.table_inverse.row);
+    if (tamper == .table_inverse) claims.and_table = try forgeTable(&source.and_table, &setup.materials.tables.and_, draw.and_, tamper.table_inverse.row);
     if (tamper == .none) {
         try std.testing.expect(claims.cpu.eql(honest_claims.cpu));
         try std.testing.expectEqualSlices(M, honest, source.cpu.interaction);

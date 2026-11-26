@@ -8,33 +8,25 @@
 //!   for each role, in order:
 //!     staged coefficients (columns that are not degree el-1 / el-2)
 //!     auxiliary columns (hc: auxiliary kernel + B2N; last: anchor + B2N)
-//!     twiddles + LDE descriptors into the role arena
+//!     addressed runs stage twiddles and descriptors inside the role arena
 //!     LDE: direct n2b_columns / n2b_columns_compact runs straight from the
 //!          committed coefficient views, addressed n2b for staged runs
 //!     role kernel, accumulating into the per-eval-log quotient bucket
 //!   finish (bucket fold + interpolation + split) → coefficient chunks (kept)
 //!   commit LDE (compact for beta 2) + one Merkle segment → root (device)
 //!
-//! Same kernels, same arena layout per role, same values: the only
-//! differences are custody. Parameters/masks/denominators/twiddles are staged
-//! in phase 1 (pure host, class geometry), alpha and its powers never reach
-//! the host, nothing joins, and the root is D2D-copied into a slab field.
-//! Direct vs staged LDE is an exact-field storage choice (identical
-//! evaluations); the job takes the direct path whenever the degree allows,
-//! because every source is a device coefficient view here.
-//!
-//! Role descriptions (`RoleSpec`) are built outside jobs/ from the frontend
-//! authorities (rv64/native_composition_roles.zig), because that mapping
-//! reads legacy owner-path metadata the sync lint forbids under jobs/.
+//! The device channel owns alpha. Each role borrows class twiddles and
+//! geometry. A device copy publishes the composition root to the proof slab.
 const std = @import("std");
 const core = @import("stwo_core");
 const engine = @import("stwo_prover_engine");
 const A = @import("stwo_riscv_frontend").rv64_air;
 const api = @import("api.zig");
 const C = @import("native_commit.zig");
+const Copies = @import("column_copy_runs.zig");
 const Abi = @import("../abi.zig");
 
-const M = core.fields.m31.M31;
+const Circle = @import("circle_twiddles.zig");
 
 pub const RoleKernel = *const @TypeOf(Abi.stwo_rv64_composition_role_on);
 pub const Finish = *const @TypeOf(Abi.stwo_rv64_composition_finish_on);
@@ -54,6 +46,7 @@ pub const Symbols = struct {
     b2n: C.B2n,
     tree: C.Tree,
     copy_d2d: C.CopyD2d,
+    validate_allocation: ?Copies.Validate = null,
     memset: Memset,
     powers: Powers,
     /// `base`: the frozen base image; `addon`: libstwo-rv64-jobs.so.
@@ -69,6 +62,7 @@ pub const Symbols = struct {
             .b2n = base.lookup(C.B2n, "stwo_ntt_b2n_columns_compact_on") orelse return error.MissingNativeCompositionSymbol,
             .tree = base.lookup(C.Tree, "stwo_rv64_trace_tree_on") orelse return error.MissingNativeCompositionSymbol,
             .copy_d2d = base.lookup(C.CopyD2d, "stwo_exec_context_memcpy_d2d_async") orelse return error.MissingNativeCompositionSymbol,
+            .validate_allocation = base.lookup(Copies.Validate, "stwo_exec_context_validate_allocation"),
             .memset = base.lookup(Memset, "stwo_exec_context_memset_async") orelse return error.MissingNativeCompositionSymbol,
             .powers = addon.lookup(Powers, "stwo_rv64_jobs_native_powers_v1_on") orelse return error.MissingNativeCompositionSymbol,
         };
@@ -122,8 +116,8 @@ pub const Spec = struct {
 
 const Source = struct { tree: u8, index: u32, log: u32 };
 
-/// Per-role arena geometry, exactly as resident_composition.zig lays it out:
-/// [staging | evaluations (columns * n) | twiddles(el) | descriptors (6/col)].
+/// Every role owns its evaluations. Addressed LDE also requires its input,
+/// twiddles and descriptors inside the same device allocation.
 const RolePlan = struct {
     spec: RoleSpec,
     sources: []Source,
@@ -152,16 +146,13 @@ pub const Plan = struct {
     total: u32,
     beta: u32,
     roles: []RolePlan,
-    /// Distinct twiddle logs held in the class twiddle region (log → offset).
-    /// The host trees are built only by `stage` when the region is fresh.
-    tw_offsets: [29]?usize = @splat(null),
-    tw_words: usize = 0,
     table: []u32,
     /// Offsets of the global table entries.
     t_one: usize,
     t_commit_desc: usize,
     key: [32]u8,
     max_role_arena: usize,
+    retain_opening: bool = false,
     buckets: [29]bool = @splat(false),
     /// Original-order offsets of the output coefficient chunks (for the PCS).
     offsets: []usize,
@@ -192,12 +183,8 @@ pub const Plan = struct {
     fn commitEvalWords(self: *const Plan) usize {
         return @as(usize, self.outputColumns()) << @intCast(self.commitLog());
     }
-    fn scratchLayout(self: *const Plan) struct { tw: usize, desc: usize, words: usize } {
-        // Separate coefficients (beta 1 or 2): evaluations at 0, then the
-        // commit twiddles, then one log per output column.
-        const tw = self.commitEvalWords();
-        const desc = std.mem.alignForward(usize, tw + twLen(self.commitLog()), 2);
-        return .{ .tw = tw, .desc = desc, .words = desc + self.outputColumns() };
+    pub fn retainedOpeningWords(self: *const Plan) usize {
+        return if (self.retain_opening) self.commitEvalWords() + self.treeWords() else 0;
     }
 
     pub fn init(a: std.mem.Allocator, spec: Spec) !Plan {
@@ -266,7 +253,7 @@ pub const Plan = struct {
             if (aux != 0) needed[rl] = true;
             const tw_base = staging + columns * n;
             const desc_base = std.mem.alignForward(usize, tw_base + tw_len, 2);
-            r.* = .{ .spec = rs, .sources = sources, .columns = columns, .aux_count = aux, .direct = direct, .staging_offsets = staging_offsets, .staging_words = staging, .tw_base = tw_base, .desc_base = desc_base, .arena_words = desc_base + columns * 6, .t_logs = 0, .t_params = 0, .t_masks = 0, .t_denoms = 0, .t_hc = 0, .t_desc = 0, .denominator_words = @as(usize, 1) << @intCast(el - rl) };
+            r.* = .{ .spec = rs, .sources = sources, .columns = columns, .aux_count = aux, .direct = direct, .staging_offsets = staging_offsets, .staging_words = staging, .tw_base = tw_base, .desc_base = desc_base, .arena_words = if (staging == 0) columns * n else desc_base + columns * 6, .t_logs = 0, .t_params = 0, .t_masks = 0, .t_denoms = 0, .t_hc = 0, .t_desc = 0, .denominator_words = @as(usize, 1) << @intCast(el - rl) };
             r.t_logs = table_words;
             table_words += columns;
             r.t_params = table_words;
@@ -291,12 +278,7 @@ pub const Plan = struct {
         if (constraints != spec.total) return error.WrongNativeCompositionConstraintCount;
         needed[self.commitLog()] = true;
         needed[self.log] = true;
-        // Class twiddle region: twiddles ++ itwiddles of every needed log.
-        for (needed, 0..) |want, log| if (want) {
-            self.tw_offsets[log] = self.tw_words;
-            self.tw_words += 2 * twLen(@intCast(log));
-            key.update(std.mem.asBytes(&@as(u32, @intCast(log))));
-        };
+        for (needed, 0..) |want, log| if (want) key.update(std.mem.asBytes(&@as(u32, @intCast(log))));
         self.t_one = table_words;
         table_words += 2;
         self.t_commit_desc = table_words;
@@ -448,38 +430,31 @@ pub const Plan = struct {
     }
     /// Class-persistent words (the twiddle region).
     pub fn persistentWords(self: *const Plan) usize {
-        return self.tw_words;
+        return 2 * twLen(self.twiddleLog());
     }
     /// Pinned words `stage` may use (table + a fresh twiddle region).
     pub fn pinnedWords(self: *const Plan) usize {
-        return self.table.len + self.tw_words + 64;
+        return self.table.len + self.persistentWords() + 64;
     }
     /// Enqueue-time peak (excluding the staged table and the twiddle region):
     /// kept output + powers + buckets + max(role arena, finish/commit scratch).
     pub fn enqueueWords(self: *const Plan) usize {
         const g = 64;
         const fixed = std.mem.alignForward(usize, self.coefficientWords(), g) + std.mem.alignForward(usize, 8 * @as(usize, self.total), g) + self.bucketWords() + g;
-        const tail = std.mem.alignForward(usize, self.coefficientWords(), g) + std.mem.alignForward(usize, self.scratchLayout().words, g) + std.mem.alignForward(usize, self.treeWords(), g);
+        const tail = std.mem.alignForward(usize, self.coefficientWords(), g) + std.mem.alignForward(usize, self.commitEvalWords(), g) + std.mem.alignForward(usize, self.treeWords(), g);
         return fixed + @max(std.mem.alignForward(usize, self.max_role_arena, g), tail) + 4 * g;
     }
 
-    /// Phase 1: the class twiddle region (persistent, filled by the first job
-    /// of the class: only then are the host trees built) and the role table
+    fn twiddleLog(self: *const Plan) u32 {
+        return @max(self.log, self.commitLog());
+    }
+
+    /// Phase 1: the canonical tower shared with trace commitments and the role table
     /// (parameters, masks, denominators, hc, LDE logs and descriptors).
     pub fn stage(self: *Plan, s: *api.Stager) !void {
-        const region = try s.persistent(self.key, self.tw_words);
-        if (region.fresh) {
-            const pinned = try s.pinned(self.tw_words);
-            for (self.tw_offsets, 0..) |maybe, log| if (maybe) |o| {
-                var t = try engine.poly.twiddles.precomputeM31(self.a, core.poly.circle.canonic.CanonicCoset.new(@intCast(log)).circleDomain().half_coset);
-                defer engine.poly.twiddles.deinitM31(self.a, &t);
-                const n = twLen(@intCast(log));
-                if (t.twiddles.len != n or t.itwiddles.len != n) return error.InvalidNativeCompositionTwiddles;
-                @memcpy(pinned[o..][0..n], mWords(t.twiddles));
-                @memcpy(pinned[o + n ..][0..n], mWords(t.itwiddles));
-            };
-            try s.upload(region.buffer, pinned);
-        }
+        const log = self.twiddleLog();
+        const region = try s.persistent(Circle.pairKey(log), self.persistentWords());
+        if (region.fresh) try Circle.fill(self.a, s, region.buffer, log, .both);
         self.tw_device = region.buffer;
         const table = try s.alloc(self.table.len);
         const pinned = try s.pinned(self.table.len);
@@ -489,9 +464,17 @@ pub const Plan = struct {
     }
 
     fn twOf(self: *const Plan, log: u32) struct { fwd: [*]const u32, fwd_len: usize, inv: [*]const u32, inv_len: usize } {
-        const base = self.tw_device.?.ptr + self.tw_offsets[log].?;
+        const base = self.tw_device.?.ptr;
+        const full = twLen(self.twiddleLog());
         const n = twLen(log);
-        return .{ .fwd = base, .fwd_len = n, .inv = base + n, .inv_len = n };
+        return .{ .fwd = base + full - n, .fwd_len = n, .inv = base + 2 * full - n, .inv_len = n };
+    }
+
+    pub fn bindPcsTables(self: *const Plan, pcs: *@import("native_pcs.zig").PcsJob) !void {
+        if (!pcs.prepared.geometry_only) return;
+        if (self.tw_device == null) return error.NativeCompositionNotStaged;
+        const pair = self.twOf(self.twiddleLog());
+        try pcs.bindTables(pair.fwd[0..pair.fwd_len], pair.inv[0..pair.inv_len]);
     }
 
     /// Phase 2. `trees`: FIXED, MAIN, INTER coefficient views (device, job
@@ -513,11 +496,13 @@ pub const Plan = struct {
         const ctx = e.ctx();
         const stream = e.stream();
         var launches: u32 = 0;
+        var copies: Copies.Runs = .{ .ctx = ctx, .copy = sym.copy_d2d, .validate = sym.validate_allocation };
         for (self.roles) |*r| for (r.spec.claim_slots) |slot| {
             const source = claims orelse return error.NativeCompositionClaimsRequired;
             if ((@as(usize, slot.claim) + 1) * 8 > source.words) return error.NativeCompositionClaimOutOfRange;
-            try check(sym.copy_d2d(ctx, table + r.t_params + 8 * @as(usize, slot.parameter), source.ptr + 8 * @as(usize, slot.claim), 32));
+            try copies.push(table + r.t_params + 8 * @as(usize, slot.parameter), source.ptr + 8 * @as(usize, slot.claim), 8);
         };
+        try copies.finish();
         const output = try e.alloc(self.coefficientWords());
         const powers = try e.alloc(8 * @as(usize, self.total));
         try check(sym.memset(ctx, status, 0, 4));
@@ -541,8 +526,9 @@ pub const Plan = struct {
             // Staged coefficients (non-direct sources), arena-local copies.
             for (r.sources, 0..) |s, i| if (!r.direct[i]) {
                 const src = try trees[s.tree].at(s.index, s.log);
-                try check(sym.copy_d2d(ctx, base + r.staging_offsets[i], src, (@as(usize, 1) << @intCast(s.log)) * 4));
+                try copies.push(base + r.staging_offsets[i], src, @as(usize, 1) << @intCast(s.log));
             };
+            try copies.finish();
             if (r.aux_count != 0) {
                 const at = base + r.staging_offsets[r.sources.len];
                 const rows = @as(usize, 1) << @intCast(rl);
@@ -559,8 +545,10 @@ pub const Plan = struct {
                 try check(sym.b2n(at, rows, at, rows, rl, r.aux_count, it.inv, @intCast(it.inv_len), @intCast(rows / 2), stream, &launches));
             }
             const t = self.twOf(el);
-            try check(sym.copy_d2d(ctx, base + r.tw_base, t.fwd, t.fwd_len * 4));
-            try check(sym.copy_d2d(ctx, base + r.desc_base, table + r.t_desc, 6 * @as(usize, r.columns) * 4));
+            if (r.staging_words != 0) {
+                try check(sym.copy_d2d(ctx, base + r.tw_base, t.fwd, t.fwd_len * 4));
+                try check(sym.copy_d2d(ctx, base + r.desc_base, table + r.t_desc, 6 * @as(usize, r.columns) * 4));
+            }
             const logs = table + r.t_logs;
             var column: usize = 0;
             while (column < r.columns) {
@@ -575,7 +563,7 @@ pub const Plan = struct {
                         if (following != first + (end - column) * stride) break;
                     }
                     const dst = base + eval_base + column * n;
-                    const twp = base + r.tw_base + t.fwd_len - n / 2;
+                    const twp = t.fwd + (t.fwd_len - n / 2);
                     if (stride == n / 2) {
                         try check(sym.n2b_columns(first, n / 2, logs + column, dst, n, el, @intCast(end - column), twp, @intCast(n / 2), @intCast(n / 2), stream, &launches));
                     } else {
@@ -623,27 +611,8 @@ pub const Plan = struct {
             listed += 1;
         };
         const accumulator = try e.alloc(self.coefficientWords());
-        const layout = self.scratchLayout();
-        const scratch = try e.alloc(layout.words);
         const inv = self.twOf(self.log);
         try check(sym.finish(ctx, 0, &list, listed, accumulator.ptr, output.ptr, self.log, self.split, inv.inv, @intCast(inv.inv_len), &launches));
-        const ct = self.twOf(self.commitLog());
-        try check(sym.copy_d2d(ctx, scratch.ptr + layout.tw, ct.fwd, ct.fwd_len * 4));
-        try check(sym.copy_d2d(ctx, scratch.ptr + layout.desc, table + self.t_commit_desc, @as(usize, self.outputColumns()) * 4));
-        const commit_log = self.commitLog();
-        const rows = @as(usize, 1) << @intCast(commit_log);
-        const source_words = @as(usize, 1) << @intCast(self.chunkLog());
-        if (self.beta == 2) {
-            try check(sym.n2b_compact(output.ptr, source_words, scratch.ptr + layout.desc, scratch.ptr, rows, commit_log, self.outputColumns(), scratch.ptr + layout.tw, @intCast(ct.fwd_len), @intCast(rows / 2), source_words, stream, &launches));
-        } else {
-            try check(sym.n2b_columns(output.ptr, source_words, scratch.ptr + layout.desc, scratch.ptr, rows, commit_log, self.outputColumns(), scratch.ptr + layout.tw, @intCast(ct.fwd_len), @intCast(rows / 2), stream, &launches));
-        }
-        const tree = try e.alloc(self.treeWords());
-        const segment = C.MixedSegment{ .columns = scratch.ptr, .stride_words = rows, .capacity_words = self.commitEvalWords(), .source_size = @intCast(rows) };
-        try check(sym.tree(ctx, 0, @ptrCast(&segment), 1, commit_log, tree.ptr, tree.words));
-        try check(sym.copy_d2d(ctx, root_out.ptr, tree.ptr + self.treeWords() - 8, 32));
-        e.free(tree);
-        e.free(scratch);
         e.free(accumulator);
         var i: usize = buckets.len;
         while (i > 0) {
@@ -651,7 +620,31 @@ pub const Plan = struct {
             if (buckets[i]) |b| e.free(b);
         }
         e.free(powers);
-        return .{ .coefficients = output, .root = root_out.ptr };
+
+        // The commitment needs only the finished coefficients and the
+        // immutable class tables. Finish scratch can retire before the LDE.
+        const image = if (self.retain_opening) try e.alloc(self.retainedOpeningWords()) else null;
+        const eval_words = self.commitEvalWords();
+        const evaluations = if (image) |b| try b.slice(0, eval_words) else try e.alloc(eval_words);
+        const ct = self.twOf(self.commitLog());
+        const logs = table + self.t_commit_desc;
+        const commit_log = self.commitLog();
+        const rows = @as(usize, 1) << @intCast(commit_log);
+        const source_words = @as(usize, 1) << @intCast(self.chunkLog());
+        if (self.beta == 2) {
+            try check(sym.n2b_compact(output.ptr, source_words, logs, evaluations.ptr, rows, commit_log, self.outputColumns(), ct.fwd, @intCast(ct.fwd_len), @intCast(rows / 2), source_words, stream, &launches));
+        } else {
+            try check(sym.n2b_columns(output.ptr, source_words, logs, evaluations.ptr, rows, commit_log, self.outputColumns(), ct.fwd, @intCast(ct.fwd_len), @intCast(rows / 2), stream, &launches));
+        }
+        const tree = if (image) |b| try b.slice(eval_words, self.treeWords()) else try e.alloc(self.treeWords());
+        const segment = C.MixedSegment{ .columns = evaluations.ptr, .stride_words = rows, .capacity_words = eval_words, .source_size = @intCast(rows) };
+        try check(sym.tree(ctx, 0, @ptrCast(&segment), 1, commit_log, tree.ptr, tree.words));
+        try check(sym.copy_d2d(ctx, root_out.ptr, tree.ptr + self.treeWords() - 8, 32));
+        if (image == null) {
+            e.free(tree);
+            e.free(evaluations);
+        }
+        return .{ .coefficients = output, .root = root_out.ptr, .opening_image = image };
     }
 };
 
@@ -673,9 +666,6 @@ pub const Columns = struct {
     }
 };
 
-fn mWords(values: []const M) []const u32 {
-    return @as([*]const u32, @ptrCast(values.ptr))[0..values.len];
-}
 fn check(code: c_int) !void {
     if (code != 0) return error.CudaEnqueueFailed;
 }
@@ -706,14 +696,23 @@ test "native composition plan mirrors the legacy role arena layout and power ord
     try std.testing.expectEqualSlices(u32, &.{ 5, 4, 5, 5 }, plan.table[r0.t_logs..][0..4]);
     // Mask offsets are column * n (u64 little-endian pairs).
     try std.testing.expectEqual(@as(u32, 3 * 64), plan.table[r0.t_masks + 4]);
+    // Direct el-1 and el-2 transforms borrow the staged class twiddles.
+    const direct_logs = [_]u32{ 4, 5 };
+    var direct_plan = try Plan.init(a, .{ .roles = roles[0..1], .log = 8, .split = 1, .total = roles[0].constraints, .beta = 2, .tree_logs = .{ &fixed_logs, &direct_logs, &inter_logs } });
+    defer direct_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 4 * 64), direct_plan.roles[0].arena_words);
+    try std.testing.expectEqual(@as(usize, 0), direct_plan.roles[0].staging_words);
     const r1 = plan.roles[1];
     try std.testing.expectEqual(@as(u32, 11), r1.columns);
     try std.testing.expectEqual(@as(usize, 10 * 32), r1.staging_words); // aux columns at rl
     try std.testing.expectEqual(@as(usize, 4), r1.denominator_words);
     try std.testing.expectEqual(@as(u32, 16), plan.outputColumns());
     try std.testing.expectEqual(@as(u32, 9), plan.commitLog());
-    try std.testing.expect(plan.tw_offsets[6] != null and plan.tw_offsets[7] != null and plan.tw_offsets[5] != null and plan.tw_offsets[9] != null and plan.tw_offsets[8] != null);
+    try std.testing.expectEqual(@as(usize, 1 << 9), plan.persistentWords());
     try std.testing.expectEqual(@as(u32, 7), plan.table[plan.t_commit_desc]);
+    try std.testing.expectEqual(@as(usize, 0), plan.retainedOpeningWords());
+    plan.retain_opening = true;
+    try std.testing.expectEqual(@as(usize, 16 * 512 + (1024 - 1) * 8), plan.retainedOpeningWords());
     try std.testing.expectError(error.WrongNativeCompositionConstraintCount, Plan.init(a, .{ .roles = roles[0..1], .log = 8, .split = 1, .total = 6, .beta = 2, .tree_logs = .{ &fixed_logs, &main_logs, &inter_logs } }));
 }
 
@@ -823,12 +822,25 @@ test "framing cache: detach under allocation failure neither leaks nor double fr
     try std.testing.expect(failed_detach);
 }
 
-test "twiddle region lengths match precomputeM31 (host trees are built only for a fresh region)" {
+test "one canonical tower supplies exact composition twiddles at every role height" {
     const a = std.testing.allocator;
-    for ([_]u32{ 4, 5, 9, 13 }) |log| {
-        var t = try engine.poly.twiddles.precomputeM31(a, core.poly.circle.canonic.CanonicCoset.new(log).circleDomain().half_coset);
+    var plan: Plan = undefined;
+    plan.log = 12;
+    plan.split = 1;
+    plan.beta = 2;
+    const log = plan.twiddleLog();
+    var top = try engine.poly.twiddles.precomputeM31(a, core.poly.circle.canonic.CanonicCoset.new(log).circleDomain().half_coset);
+    defer engine.poly.twiddles.deinitM31(a, &top);
+    const buffer = try a.alloc(u32, plan.persistentWords());
+    defer a.free(buffer);
+    @memcpy(buffer[0..top.twiddles.len], std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(top.twiddles)));
+    @memcpy(buffer[top.twiddles.len..], std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(top.itwiddles)));
+    plan.tw_device = .{ .ptr = buffer.ptr, .words = buffer.len };
+    for ([_]u32{ 4, 5, 9, 13 }) |role_log| {
+        var t = try engine.poly.twiddles.precomputeM31(a, core.poly.circle.canonic.CanonicCoset.new(role_log).circleDomain().half_coset);
         defer engine.poly.twiddles.deinitM31(a, &t);
-        try std.testing.expectEqual(Plan.twLen(log), t.twiddles.len);
-        try std.testing.expectEqual(Plan.twLen(log), t.itwiddles.len);
+        const tw = plan.twOf(role_log);
+        try std.testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(t.twiddles)), tw.fwd[0..tw.fwd_len]);
+        try std.testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(t.itwiddles)), tw.inv[0..tw.inv_len]);
     }
 }

@@ -13,7 +13,10 @@ const Components = @import("../../word16_global_execution/services/gkr_local/cpu
 const Fixed = @import("../../word16_global_execution/services/gkr_local/fixed_authority.zig");
 const W = @import("../../word16_global_execution/services/gkr_local/worker_protocol.zig");
 pub fn geometry(a: std.mem.Allocator, setup: *const R.CpuSetup, config: W.PcsConfig) !V.Shape {
-    var plan = try Components.Plan.init(a, setup);
+    return geometryFor(.admitted, a, setup, config);
+}
+pub fn geometryFor(envelope: @import("../../word16_global_execution/services/gkr_local/service_scope.zig").Envelope, a: std.mem.Allocator, setup: *const R.CpuSetup, config: W.PcsConfig) !V.Shape {
+    var plan = try Components.Plan.initFor(envelope, a, setup);
     defer plan.deinit();
     var global_log: u32 = 0;
     for (plan.slots) |slot| global_log = @max(global_log, slot.log);
@@ -32,7 +35,7 @@ pub fn geometry(a: std.mem.Allocator, setup: *const R.CpuSetup, config: W.PcsCon
     }
     // Copy immutable offsets to arena-owned slices; array literals are static.
     for (plan.slots) |slot| {
-        const descriptor = Oods.Authority.Source.Descriptor{ .origin = slot.origin, .cpu_u8_pairs = setup.materials.geometry.cpu_u8_pairs, .cpu_compact_decode = setup.materials.geometry.cpu_compact_decode };
+        const descriptor = Oods.Authority.Source.Descriptor.forGeometry(slot.origin, setup.materials.geometry);
         const shape = try Oods.Authority.shape(descriptor);
         const f = @constCast(offsets[0]);
         const main = @constCast(offsets[1]);
@@ -66,7 +69,7 @@ pub fn verify(a: std.mem.Allocator, setup: *const R.CpuSetup, request: P.Request
     // once below with proof capture (same verifyImpl, components, transcript).
     var proof = try Worker.admitCpuBeforeCoreVerify(a, setup, request, expected, first, manifest, index, config, encoded, fixed);
     errdefer proof.deinit(a);
-    var plan = try Components.Plan.init(a, setup);
+    var plan = try Components.Plan.initFor(expected.envelope, a, setup);
     defer plan.deinit();
     var set = try Components.Set.init(a, setup, request, first, &plan, &manifest.entries[index].local.?, manifest.shared, encoded.claims);
     defer set.deinit();

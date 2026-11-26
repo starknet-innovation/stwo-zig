@@ -400,6 +400,16 @@ test "outer encode: host mirror equals the reference assembler + wire writer on 
         try t.expectEqualSlices(u32, expected, out[1..][0..expected.len]);
         // Bound is an upper bound with distinct queries too.
         try t.expect(expected.len <= desc[Schema.D.max_payload_words]);
+        if (cases == 0) {
+            // Generated packed classes authenticate the rebuilt FIXED tree
+            // at this request boundary, against the untouched class root.
+            in.roots[0] = desc[Schema.D.fixed_root..][0..8];
+            img[Schema.Image.of(desc).roots] ^= 1;
+            const bad = try Schema.encodeHost(a, desc, img, in, out);
+            try t.expectEqual(G.Verdict.reject(.node_pcs_status, @intFromEnum(Schema.PcsDetail.root)), bad.pcs);
+            try t.expectEqual(@as(u32, 0), out[0]);
+            try t.expectError(error.NativePcsTreeRootMismatch, Ref.encode(a, desc, img, in));
+        }
     }
 }
 

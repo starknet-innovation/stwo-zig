@@ -8,21 +8,20 @@ pub fn write(a: std.mem.Allocator, dir: std.fs.Dir, id: u32, comptime op: C.spec
     const N = T.N;
     const L = T.L;
     const d = L.DEF;
-    const log: u32 = 8;
-    const n = 1 << log;
     const packets = try a.alloc(N.Packet, calls);
     defer a.free(packets);
     var rng = std.Random.DefaultPrng.init(0x917613 + id);
     for (packets, 0..) |*packet, j| {
         rng.random().bytes(packet);
-        if (op == .bn254_g1_add or op == .bn254_g1_double) {
+        if (d.nonzero != null) {
+            const modulus = d.modulus.constant;
             for (0..d.inputs) |i| {
-                var x = N.operand(packet, i) % C.spec.BN254_P;
+                var x = N.operand(packet, i) % modulus;
                 if (j == 0) x = i + 1;
-                if (op == .bn254_g1_double and i == 1 and x == 0) x = 1;
+                if (d.inputs == 2 and i == 1 and x == 0) x = 1;
                 for (0..d.limbs) |b| packet[i * d.limbs + b] = C.spec.limbOf(x, b);
             }
-            if (op == .bn254_g1_add and N.operand(packet, 0) == N.operand(packet, 2)) packet[64] ^= 1;
+            if (d.inputs == 4 and N.operand(packet, 0) == N.operand(packet, 2)) packet[2 * d.limbs] ^= 1;
         } else if (op == .arith384_mont) {
             packet[96] |= 1;
             if (j < 3) {
@@ -36,6 +35,29 @@ pub fn write(a: std.mem.Allocator, dir: std.fs.Dir, id: u32, comptime op: C.spec
             }
         } else if (j == 0) @memset(packet, 255) else if (j == 1) @memset(packet, 0);
     }
+    try writeMatrix(a, dir, id, T, packets, @intFromEnum(op) - 5);
+}
+
+pub fn writeSecp(a: std.mem.Allocator, dir: std.fs.Dir, id: u32, comptime kind: C.spec.SecpKind, calls: u32) !void {
+    const T = C.trace.Trace(kind);
+    const N = T.N;
+    const packets = try a.alloc(N.Packet, calls);
+    defer a.free(packets);
+    var rng = std.Random.DefaultPrng.init(0x617131 + id);
+    for (packets, 0..) |*p, i| {
+        rng.random().bytes(p);
+        if (i == 0) @memset(p, 255);
+        if (i == 1) @memset(p, 0);
+    }
+    try writeMatrix(a, dir, id, T, packets, @intFromBool(kind == .double));
+}
+
+fn writeMatrix(a: std.mem.Allocator, dir: std.fs.Dir, id: u32, comptime T: type, packets: []const T.N.Packet, kind_word: u32) !void {
+    const N = T.N;
+    const L = T.L;
+    const log: u32 = 8;
+    const n = 1 << log;
+    const calls: u32 = @intCast(packets.len);
     const counts = try T.byteCounts(packets, n);
     const matrix = try a.alloc(u32, L.MAIN * n);
     defer a.free(matrix);
@@ -48,7 +70,7 @@ pub fn write(a: std.mem.Allocator, dir: std.fs.Dir, id: u32, comptime op: C.spec
     var bytes: std.ArrayList(u8) = .empty;
     defer bytes.deinit(a);
     const w = bytes.writer(a);
-    try IO.words(w, &.{ 0x52565357, 1, id, log, calls, 17, L.MAIN, @intFromEnum(op) - 5 });
+    try IO.words(w, &.{ 0x52565357, 1, id, log, calls, 17, L.MAIN, kind_word });
     try w.writeAll(std.mem.sliceAsBytes(packets));
     try IO.words(w, matrix);
     for (counts) |c| try IO.words(w, &.{@intCast(c)});

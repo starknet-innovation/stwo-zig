@@ -28,6 +28,7 @@ const Merkle = @FieldType(Tree, "commitment");
 const Coefficient = engine.poly.circle.CircleCoefficients;
 pub const Key = struct {
     pub const Suite = SuiteType;
+    pub const FixedMode = union(enum) { committed, producer_coefficients, producer_evaluations: [32]u8 };
     suite: Suite = Suite.production(),
     allocator: std.mem.Allocator,
     root: [32]u8,
@@ -36,11 +37,24 @@ pub const Key = struct {
     /// column shape) and, for identity-only keys, coefficients. It can feed a
     /// receiver-derived candidate fixed authority but never a PCS (append()).
     root_only: bool = false,
+    /// An uncommitted producer descriptor is never admitted as receiver authority.
+    producer_only: bool = false,
     pub fn seal(a: std.mem.Allocator, columns: []const engine.pcs.ColumnEvaluation) !Key {
         return sealWithSuite(a, columns, Suite.production());
     }
     pub fn sealWithSuite(a: std.mem.Allocator, columns: []const engine.pcs.ColumnEvaluation, suite: Suite) !Key {
         return sealWithSuiteAndCache(a, columns, suite, null);
+    }
+    pub fn prepare(a: std.mem.Allocator, columns: []const engine.pcs.ColumnEvaluation, suite: Suite, mode: FixedMode) !Key {
+        return switch (mode) {
+            .committed => sealWithSuite(a, columns, suite),
+            .producer_coefficients => blk: {
+                var key = try identityOnly(a, columns, suite, null);
+                key.producer_only = true;
+                break :blk key;
+            },
+            .producer_evaluations => |custody| evaluationDescriptor(a, columns, suite, custody),
+        };
     }
     pub fn sealWithCache(a: std.mem.Allocator, columns: []const engine.pcs.ColumnEvaluation, cache: ?*const NativeCache.Cache) !Key {
         return sealWithSuiteAndCache(a, columns, Suite.production(), cache);
@@ -79,6 +93,37 @@ pub const Key = struct {
         errdefer tree.deinit(a);
         try tree.share(a);
         return .{ .allocator = a, .suite = suite, .root = root, .tree = tree, .root_only = true };
+    }
+
+    /// Shape and scoped producer custody only. No interpolation; the owner
+    /// of `columns` retains the evaluations until the device seal completes.
+    pub fn evaluationDescriptor(a: std.mem.Allocator, columns: []const engine.pcs.ColumnEvaluation, suite: Suite, custody: [32]u8) !Key {
+        try suite.validate();
+        const logs = try a.alloc(u32, columns.len);
+        defer a.free(logs);
+        const blowup = suite.config().fri_config.log_blowup_factor;
+        for (columns, logs) |column, *log| {
+            if (column.log_size < 1 or column.log_size > 28 or column.values.len != @as(usize, 1) << @intCast(column.log_size))
+                return error.InvalidSharedTruthKeyShape;
+            log.* = column.log_size + blowup;
+        }
+        var key = try rootOnly(a, suite, custody, logs);
+        key.producer_only = true;
+        return key;
+    }
+    /// Preserve the exact authenticated source descriptor after the
+    /// candidate lease has acquired independent polynomial ownership.
+    pub fn retireIdentityCoefficients(self: *Key) !void {
+        if (!self.root_only) return error.CommittedFixedSource;
+        if (self.tree.coefficients == null) return;
+        const a = self.allocator;
+        const logs = try a.alloc(u32, self.tree.columns.len);
+        defer a.free(logs);
+        for (self.tree.columns, logs) |column, *log| log.* = column.log_size;
+        var identity = try rootOnly(a, self.suite, self.root, logs);
+        identity.producer_only = self.producer_only;
+        std.mem.swap(Key, self, &identity);
+        identity.deinit();
     }
     /// Identity-only source: exact interpolated coefficients of `columns`
     /// (the same polynomials a commit retains) under a domain-separated

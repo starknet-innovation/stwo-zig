@@ -24,6 +24,7 @@ const SecpRow = @import("../secp/row_roster.zig");
 const M = core.fields.m31.M31;
 const Col = engine.pcs.ColumnEvaluation;
 pub const CpuSetup = struct {
+    pub const FixedTables = Mat.FixedTables;
     materials: Mat.Materials,
     bridges: T.Logs,
     fixed: [T.FAMILIES][]M,
@@ -65,14 +66,34 @@ pub const CpuSetup = struct {
         return initWithAuthorityAndSuiteAndCaches(a, authority, g, bridges, suite, .{ .native = cache });
     }
     pub fn initWithAuthorityAndSuiteAndCaches(a: std.mem.Allocator, authority: *const @import("../../rv64_full.zig").ProgramAuthority, g: Mat.Geometry, bridges: T.Logs, suite: Mat.Suite, caches: Mat.ImmutableCaches) !CpuSetup {
-        var m = try Mat.Materials.initWithAuthorityAndSuiteAndMetadataCache(a, authority, g, suite, caches.program);
+        return initWithProjection(.classic, a, authority, g, bridges, suite, caches);
+    }
+    pub fn initWithProjection(projection: Mat.Geometry.Projection, a: std.mem.Allocator, authority: *const @import("../../rv64_full.zig").ProgramAuthority, g: Mat.Geometry, bridges: T.Logs, suite: Mat.Suite, caches: Mat.ImmutableCaches) !CpuSetup {
+        var m = switch (projection) {
+            .classic => try Mat.Materials.initWithAuthorityAndSuiteAndMetadataCache(a, authority, g, suite, caches.program),
+            .gkr_main => try Mat.Materials.initMainProjectionWithFixedTables(a, authority, g, suite, caches.program, null),
+        };
         errdefer m.deinit();
-        return sealWithCache(a, m, bridges, caches.native);
+        return sealWithCache(a, m, bridges, caches.native, .committed);
+    }
+    /// Candidate CPU statements bind the separately sealed candidate FIXED
+    /// tree. Interpolate the same source polynomials without a classic PCS
+    /// commitment. Candidate truth statements still require their source roots.
+    pub fn initCandidateWithAuthority(a: std.mem.Allocator, authority: *const @import("../../rv64_full.zig").ProgramAuthority, g: Mat.Geometry, bridges: T.Logs, suite: Mat.Suite, cache: ?*const Mat.ProgramMetadata.Cache) !CpuSetup {
+        var m = try Mat.Materials.initWithAuthorityAndSuiteAndMetadataCache(a, authority, g, suite, cache);
+        errdefer m.deinit();
+        return sealWithCache(a, m, bridges, null, .identity_only);
+    }
+
+    pub fn initDeviceWithAuthority(a: std.mem.Allocator, authority: *const @import("../../rv64_full.zig").ProgramAuthority, g: Mat.Geometry, bridges: T.Logs, suite: Mat.Suite, cache: ?*const Mat.ProgramMetadata.Cache, tables: *const FixedTables, custody: [32]u8) !CpuSetup {
+        var m = try Mat.Materials.initMainProjectionWithFixedTables(a, authority, g, suite, cache, tables);
+        errdefer m.deinit();
+        return sealWithCache(a, m, bridges, null, .{ .evaluation_custody = custody });
     }
     fn seal(a: std.mem.Allocator, m: Mat.Materials, bridges: T.Logs) !CpuSetup {
-        return sealWithCache(a, m, bridges, null);
+        return sealWithCache(a, m, bridges, null, .committed);
     }
-    fn sealWithCache(a: std.mem.Allocator, m: Mat.Materials, bridges: T.Logs, cache: ?*const Mat.NativeCache.Cache) !CpuSetup {
+    fn sealWithCache(a: std.mem.Allocator, m: Mat.Materials, bridges: T.Logs, cache: ?*const Mat.NativeCache.Cache, source: union(enum) { committed, identity_only, evaluation_custody: [32]u8 }) !CpuSetup {
         var self = CpuSetup{ .materials = m, .bridges = bridges, .fixed = @splat(&.{}), .key = undefined };
         var done: usize = 0;
         errdefer for (self.fixed[0..done]) |f| a.free(f);
@@ -118,7 +139,11 @@ pub const CpuSetup = struct {
         }
         const columns = try self.fixedColumns(a);
         defer a.free(columns);
-        self.key = try Key.sealWithSuiteAndCache(a, columns, m.suite, cache);
+        self.key = switch (source) {
+            .committed => try Key.sealWithSuiteAndCache(a, columns, m.suite, cache),
+            .identity_only => try Key.identityOnly(a, columns, m.suite, cache),
+            .evaluation_custody => |identity| try Key.evaluationDescriptor(a, columns, m.suite, identity),
+        };
         return self;
     }
     /// The complete sealed key retains independent coefficient/tree ownership.

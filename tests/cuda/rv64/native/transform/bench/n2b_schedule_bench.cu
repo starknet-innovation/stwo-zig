@@ -192,6 +192,57 @@ static void compare_wide(uint32_t log_n, uint32_t cols,
   }
 }
 
+// Check exact selected values in transcript order, including duplicate,
+// conjugate, and invalid rows. The dense transform remains the control.
+static void check_wide_queries(uint32_t log, uint32_t cols, const M31 *coeffs,
+                               uint32_t *logs, M31 *dense, M31 *scratch,
+                               const M31 *tw, cudaStream_t stream) {
+  if (!n2b_wide_supported(log)) return;
+  constexpr uint32_t count = 70;
+  const uint32_t n = 1u << log, lifting = log + 2;
+  std::vector<uint32_t> queries(count);
+  for (uint32_t i = 0; i < count; ++i)
+    queries[i] = uint32_t(uint64_t(i) * 58048897u) & ((1u << lifting) - 1);
+  queries[0] = 1u << lifting;
+  queries[1] = 0;
+  queries[2] = 1;
+  queries[3] = 1;
+  queries[4] = (1u << lifting) - 1;
+  uint32_t *raw, *values, *status;
+  CK(cudaMalloc(&raw, count * 4));
+  CK(cudaMalloc(&values, size_t(cols) * count * 4));
+  CK(cudaMalloc(&status, 4));
+  CK(cudaMemcpy(raw, queries.data(), count * 4, cudaMemcpyHostToDevice));
+  const WideQueries opening{raw, values, status, count, lifting};
+  for (uint32_t beta : {1u, 2u}) {
+    const std::vector<uint32_t> sizes(cols, log - beta);
+    CK(cudaMemcpyAsync(logs, sizes.data(), cols * 4, cudaMemcpyHostToDevice, stream));
+    CK(cudaMemsetAsync(status, 0, 4, stream));
+    CK(launch_n2b_wide<true>({coeffs, n >> beta}, logs, {dense, n}, log,
+                             cols, true, tw, stream));
+    CK(launch_n2b_wide<true>({coeffs, n >> beta}, logs, {scratch, n}, log,
+                             cols, true, tw, stream, &opening));
+    CK(cudaStreamSynchronize(stream));
+    std::vector<uint32_t> expected(size_t(cols) * n), got(size_t(cols) * count);
+    uint32_t verdict = 0;
+    CK(cudaMemcpy(expected.data(), dense, expected.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(got.data(), values, got.size() * 4, cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(&verdict, status, 4, cudaMemcpyDeviceToHost));
+    if (verdict != 1) std::exit(3);
+    for (uint32_t c = 0; c < cols; ++c) {
+      if (got[size_t(c) * count] != 0) std::exit(3);
+      for (uint32_t q = 1; q < count; ++q) {
+        const uint32_t row = ((queries[q] >> 3) << 1) | (queries[q] & 1u);
+        if (got[size_t(c) * count + q] != expected[size_t(c) * n + row]) std::exit(3);
+      }
+    }
+  }
+  CK(cudaFree(status));
+  CK(cudaFree(values));
+  CK(cudaFree(raw));
+  std::printf("SELECTED_LDE log=%u columns=%u queries=%u beta_one_two=exact\n", log, cols, count);
+}
+
 int main(int argc, char **argv) {
   if (argc < 5) {
     std::fprintf(stderr, "usage: LOG_N COLUMNS OLD NEW [REPS]\n");
@@ -261,5 +312,6 @@ int main(int argc, char **argv) {
     compare_two_pass<12, 2, 512, 12, 512>("A12l2t512+B12t512", log_n, cols, b, coeffs, log_sizes, ea, eb, tw, s, reps);
     compare_two_pass<12, 3, 512, 13, 512>("A12l3t512+B13t512", log_n, cols, b, coeffs, log_sizes, ea, eb, tw, s, reps);
   }
+  check_wide_queries(log_n, cols, coeffs, log_sizes, ea, eb, tw, s);
   return 0;
 }

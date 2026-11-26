@@ -25,6 +25,7 @@ pub const Authority = struct {
     image: *const Image.Owner,
     program_identity: [32]u8,
     native_config: Worker.PcsConfig,
+    envelope: Fixed.Envelope = .admitted,
     tnat: [32]u8,
     trec: [32]u8,
     max_total_steps: u64,
@@ -72,7 +73,7 @@ pub fn checkAuthenticated(authority: Authority, public: Public, summary: Summary
     if (!same(summary.tnat, authority.tnat) or !same(summary.trec, authority.trec) or !same(summary.image, authority.image.identity)) return error.TypedRootAuthority;
     const expected = try authority.expected(public);
     const base = Execution.executionIdentity(authority.native_config, expected);
-    const scope = try Fixed.gkrExecutionIdentity(base, authority.native_config);
+    const scope = try Fixed.gkrExecutionIdentityFor(authority.envelope, base, authority.native_config);
     if (!same(summary.expected, base) or !same(summary.statement, scope)) return error.TypedRootExecutionScope;
     if (summary.lo != 0 or summary.count != summary.hi + 1 or summary.steps_in != 0 or summary.steps_out != public.total_steps) return error.TypedRootCoverage;
     if (!same(summary.m_in, Canon.chainIv(Canon.versionIdentityV2(Canon.RUNGS, .native_gkr)))) return error.TypedRootChainIv;
@@ -136,6 +137,16 @@ test "typed root semantic gate recomputes public RAM target image scope and term
     const shared = Manifest.drawShared(summary.chi);
     summary.bus[0] = (try Boundary.claim(memory.initial, true, shared.ram)).add(try Boundary.claim(memory.terminal, false, shared.ram)).neg();
     try std.testing.expectEqualSlices(u8, &fixture.image.expected_output, &(try checkAuthenticated(authority, public, summary)));
+    var wide_authority = authority;
+    wide_authority.envelope = .compact_wide;
+    try std.testing.expectError(error.TypedRootExecutionScope, checkAuthenticated(wide_authority, public, summary));
+    var wide_summary = summary;
+    wide_summary.statement = try Fixed.gkrExecutionIdentityFor(.compact_wide, base, authority.native_config);
+    wide_summary.chi = Canon.chi(wide_summary.statement, wide_summary.m_out);
+    const wide_shared = Manifest.drawShared(wide_summary.chi);
+    wide_summary.bus[0] = (try Boundary.claim(memory.initial, true, wide_shared.ram)).add(try Boundary.claim(memory.terminal, false, wide_shared.ram)).neg();
+    try std.testing.expectEqualSlices(u8, &fixture.image.expected_output, &(try checkAuthenticated(wide_authority, public, wide_summary)));
+    try std.testing.expectError(error.TypedRootExecutionScope, checkAuthenticated(authority, public, wide_summary));
     // This test deliberately supplies an already-authenticated summary: it
     // tests semantic reception, and makes no STARK/production proof claim.
     for (0..15) |mutation| {

@@ -16,7 +16,7 @@
 
 #include "../common/circle_twiddle.cuh"
 #include "../common/provider_compat.cuh"
-#include "transform_internal.cuh"
+#include "n2b_fused.cuh"
 #include "wide_tile.cuh"
 
 #include <cstdlib>
@@ -162,34 +162,59 @@ inline cudaError_t launch_n2b_smem_pass(
 #ifndef STWO_N2B_WIDE_STRIDED_COLUMN_FASTEST
 #define STWO_N2B_WIDE_STRIDED_COLUMN_FASTEST 0
 #endif
+// Fixed register phases cover line stages only. The final subgroup owns
+// the optional circle stage. Every pair in these phases is active.
 template <uint32_t Stages, uint32_t TopBit, typename Index>
 __device__ __forceinline__ void n2b_wide_stages(
-    M31 (&v)[kWideValues], uint32_t first_stage, uint32_t last_stage,
-    uint32_t log_n, const M31 *twiddles, Index index) {
+    M31 (&v)[kWideValues], uint32_t first_stage, uint32_t log_n,
+    const M31 *twiddles, Index index) {
 #pragma unroll
     for (uint32_t i = 0; i < Stages; ++i) {
         const uint32_t stage = first_stage + i;
-        if (stage <= last_stage) {
-            const uint32_t kb = TopBit - i;
-            const uint32_t bit = log_n - stage;
-            const uint32_t offset = stage == log_n
-                ? 0u
-                : (1u << (log_n - 1u)) - (1u << stage);
+        const uint32_t kb = TopBit - i;
+        const uint32_t bit = log_n - stage;
+        const uint32_t offset = (1u << (log_n - 1u)) - (1u << stage);
 #pragma unroll
-            for (uint32_t q = 0; q < kWideValues / 2u; ++q) {
-                const uint32_t kl =
-                    (q & ((1u << kb) - 1u)) | ((q >> kb) << (kb + 1u));
-                const uint32_t kr = kl | (1u << kb);
-                const uint32_t butterfly = index(kl) >> (bit + 1u);
-                const M31 twiddle = stage == log_n
-                    ? circle_twiddle(twiddles, butterfly)
-                    : twiddles[offset + butterfly];
-                const M31 left = v[kl];
-                const M31 product = m31_mul(twiddle, v[kr]);
-                v[kl] = m31_add(left, product);
-                v[kr] = m31_sub(left, product);
-            }
+        for (uint32_t q = 0; q < kWideValues / 2u; ++q) {
+            const uint32_t kl =
+                (q & ((1u << kb) - 1u)) | ((q >> kb) << (kb + 1u));
+            const uint32_t kr = kl | (1u << kb);
+            const uint32_t butterfly = index(kl) >> (bit + 1u);
+            const M31 left = v[kl];
+            const M31 product = m31_mul(twiddles[offset + butterfly], v[kr]);
+            v[kl] = m31_add(left, product);
+            v[kr] = m31_sub(left, product);
         }
+    }
+}
+
+// Coefficient loads promise at most half a domain. Stage one pairs each
+// coefficient with zero, giving (x, x) for every twiddle. In the strided
+// layouts bit four of k selects that upper half of the full domain.
+template <bool LoadCoefficients, typename Index>
+__device__ __forceinline__ void n2b_wide_first_five(
+    M31 (&v)[kWideValues], const M31 *input, uint32_t input_count,
+    uint32_t log_n, const M31 *twiddles, Index index) {
+    if constexpr (LoadCoefficients) {
+        // Every leading stage that pairs the active prefix with zeros just
+        // repeats that prefix. Later stages still use the full global index
+        // for the twiddle, including the bits introduced by the copies.
+        const uint32_t padding = input_count > 1 ? log_n - (32u - __clz(input_count - 1u)) : log_n;
+        const uint32_t skipped = padding < 5u ? padding : 5u;
+        const uint32_t mask = (kWideValues >> skipped) - 1;
+#pragma unroll
+        for (uint32_t k = 0; k < kWideValues / 2; ++k) {
+            const uint32_t g = index(k & mask);
+            v[k] = v[k + kWideValues / 2] = g < input_count ? input[g] : 0u;
+        }
+        if (skipped <= 1u) n2b_wide_stages<1, 3>(v, 2, log_n, twiddles, index);
+        if (skipped <= 2u) n2b_wide_stages<1, 2>(v, 3, log_n, twiddles, index);
+        if (skipped <= 3u) n2b_wide_stages<1, 1>(v, 4, log_n, twiddles, index);
+        if (skipped <= 4u) n2b_wide_stages<1, 0>(v, 5, log_n, twiddles, index);
+    } else {
+#pragma unroll
+        for (uint32_t k = 0; k < kWideValues; ++k) v[k] = input[index(k)];
+        n2b_wide_stages<5, 4>(v, 1, log_n, twiddles, index);
     }
 }
 
@@ -225,17 +250,8 @@ __global__ __launch_bounds__(kWideStridedThreads) void n2b_wide_strided(
     M31 v[kWideValues];
     // Phase 1: high bits 10..6 <- k4..k0.
     const auto h1 = [&](uint32_t k) { return j | (k << 6); };
-#pragma unroll
-    for (uint32_t k = 0; k < kWideValues; ++k) {
-        const uint32_t g = (h1(k) << shift) | fixed;
-        if constexpr (LoadCoefficients) {
-            v[k] = g < input_count ? input[g] : 0u;
-        } else {
-            v[k] = input[g];
-        }
-    }
-    n2b_wide_stages<5, 4>(v, 1, log_n, log_n, twiddles,
-                          [&](uint32_t k) { return (h1(k) << shift) | fixed; });
+    n2b_wide_first_five<LoadCoefficients>(v, input, input_count, log_n,
+        twiddles, [&](uint32_t k) { return (h1(k) << shift) | fixed; });
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
         tile_values[wide_tile_pad(h1(k) * 8u + lane)] = v[k];
@@ -247,7 +263,7 @@ __global__ __launch_bounds__(kWideStridedThreads) void n2b_wide_strided(
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
         v[k] = tile_values[wide_tile_pad(h2(k) * 8u + lane)];
-    n2b_wide_stages<5, 4>(v, 6, log_n, log_n, twiddles,
+    n2b_wide_stages<5, 4>(v, 6, log_n, twiddles,
                           [&](uint32_t k) { return (h2(k) << shift) | fixed; });
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
@@ -258,7 +274,7 @@ __global__ __launch_bounds__(kWideStridedThreads) void n2b_wide_strided(
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
         v[k] = tile_values[wide_tile_pad(h3(k) * 8u + lane)];
-    n2b_wide_stages<1, 0>(v, 11, log_n, log_n, twiddles,
+    n2b_wide_stages<1, 0>(v, 11, log_n, twiddles,
                           [&](uint32_t k) { return (h3(k) << shift) | fixed; });
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
@@ -295,17 +311,8 @@ __global__ __launch_bounds__(8u << (High - 5u)) void n2b_wide_strided_short(
     }
     M31 v[kWideValues];
     const auto h1 = [&](uint32_t k) { return j | (k << J); };
-#pragma unroll
-    for (uint32_t k = 0; k < kWideValues; ++k) {
-        const uint32_t g = (h1(k) << shift) | fixed;
-        if constexpr (LoadCoefficients) {
-            v[k] = g < input_count ? input[g] : 0u;
-        } else {
-            v[k] = input[g];
-        }
-    }
-    n2b_wide_stages<5, 4>(v, 1, log_n, log_n, twiddles,
-                          [&](uint32_t k) { return (h1(k) << shift) | fixed; });
+    n2b_wide_first_five<LoadCoefficients>(v, input, input_count, log_n,
+        twiddles, [&](uint32_t k) { return (h1(k) << shift) | fixed; });
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
         tile_values[wide_tile_pad(h1(k) * 8u + lane)] = v[k];
@@ -314,7 +321,7 @@ __global__ __launch_bounds__(8u << (High - 5u)) void n2b_wide_strided_short(
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
         v[k] = tile_values[wide_tile_pad(h2(k) * 8u + lane)];
-    n2b_wide_stages<J, J - 1u>(v, 6, log_n, log_n, twiddles,
+    n2b_wide_stages<J, J - 1u>(v, 6, log_n, twiddles,
                                [&](uint32_t k) { return (h2(k) << shift) | fixed; });
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
@@ -327,26 +334,47 @@ constexpr uint32_t kWideContiguousWords = 1u << kWideLowBits;
 
 // A template (like every kernel in these headers) so that the instantiations
 // in lde.cu and n2b.cu merge at the -rdc device link.
-template <uint32_t LowBits = kWideLowBits>
+struct WideQueries {
+    const uint32_t *rows;
+    M31 *values;
+    uint32_t *status;
+    uint32_t count, lifting_log;
+};
+
+template <bool Selected, bool DenseCircle = false>
 __global__ __launch_bounds__(kWideContiguousThreads) void n2b_wide_contiguous(
     ColumnSlab<M31> columns,
     uint32_t log_n,
     uint32_t last_stage,
     const M31 *twiddles,
-    uint32_t column_fastest) {
+    uint32_t column_fastest, WideQueries queries) {
     __shared__ M31 tile_values[kWideContiguousWords + kWideContiguousWords / 32u];
     const uint32_t column_index = column_fastest ? blockIdx.x : blockIdx.y;
-    const uint32_t tile = column_fastest ? blockIdx.y : blockIdx.x;
-    M31 *column = columns.column(column_index) + (size_t(tile) << kWideLowBits);
+    const uint32_t item = column_fastest ? blockIdx.y : blockIdx.x;
+    M31 *column = columns.column(column_index);
     const uint32_t t = threadIdx.x;
+    uint32_t row = 0, tile = item;
+    if constexpr (Selected) {
+        const uint32_t q = queries.rows[item];
+        if (q >= (1u << queries.lifting_log)) {
+            if (t == 0) {
+                atomicOr(queries.status, 1u);
+                queries.values[uint64_t(column_index) * queries.count + item] = 0;
+            }
+            return;
+        }
+        const uint32_t shift = queries.lifting_log - log_n;
+        row = ((q >> (shift + 1u)) << 1u) | (q & 1u);
+        tile = row >> kWideLowBits;
+    }
     const uint32_t base = tile << kWideLowBits;
     const uint32_t first = log_n - (kWideLowBits - 1u);
     M31 v[kWideValues];
     // Phase 1: bits 12..8 <- k4..k0 (coalesced load).
     const auto e1 = [&](uint32_t k) { return t | (k << 8); };
 #pragma unroll
-    for (uint32_t k = 0; k < kWideValues; ++k) v[k] = column[e1(k)];
-    n2b_wide_stages<5, 4>(v, first, last_stage, log_n, twiddles,
+    for (uint32_t k = 0; k < kWideValues; ++k) v[k] = column[base | e1(k)];
+    n2b_wide_stages<5, 4>(v, first, log_n, twiddles,
                           [&](uint32_t k) { return base | e1(k); });
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
@@ -359,27 +387,27 @@ __global__ __launch_bounds__(kWideContiguousThreads) void n2b_wide_contiguous(
 #pragma unroll
     for (uint32_t k = 0; k < kWideValues; ++k)
         v[k] = tile_values[wide_tile_pad(e2(k))];
-    n2b_wide_stages<5, 4>(v, first + 5u, last_stage, log_n, twiddles,
+    n2b_wide_stages<5, 4>(v, first + 5u, log_n, twiddles,
                           [&](uint32_t k) { return base | e2(k); });
-#pragma unroll
-    for (uint32_t k = 0; k < kWideValues; ++k)
-        tile_values[wide_tile_pad(e2(k))] = v[k];
-    __syncthreads();
-    // Phase 3: bits 2..0 <- k2..k0 (includes the circle stage).
-    const auto e3 = [&](uint32_t k) { return k | (t << 5); };
-#pragma unroll
-    for (uint32_t k = 0; k < kWideValues; ++k)
-        v[k] = tile_values[wide_tile_pad(e3(k))];
-    n2b_wide_stages<3, 2>(v, first + 10u, last_stage, log_n, twiddles,
-                          [&](uint32_t k) { return base | e3(k); });
-#pragma unroll
-    for (uint32_t k = 0; k < kWideValues; ++k)
-        tile_values[wide_tile_pad(e3(k))] = v[k];
-    __syncthreads();
-    // Coalesced store.
-#pragma unroll
-    for (uint32_t k = 0; k < kWideValues; ++k)
-        column[e1(k)] = tile_values[wide_tile_pad(e1(k))];
+    // The three remaining bits are already the lane axis of each eight-lane
+    // group in e2. Finish in registers without another block transpose.
+    const uint32_t lane = t & 7u;
+    const uint32_t group = base | ((t >> 3) << 8);
+    if constexpr (Selected) {
+        n2b_warp_butterflies<3, 5>(v, lane, group, log_n, true, twiddles);
+        // The existing contiguous store maps pair i to group + 16*i + 2*lane.
+        if ((row >> 8) == (group >> 8) && ((row >> 1) & 7u) == lane) {
+            const M31 value = v[((row >> 4) & 15u) * 2u + (row & 1u)];
+            if (value >= kM31Prime) atomicOr(queries.status, 2u);
+            queries.values[uint64_t(column_index) * queries.count + item] =
+                value < kM31Prime ? value : 0u;
+        }
+    } else if constexpr (DenseCircle) {
+        n2b_warp_tail<3, 5, true>(v, lane, group, log_n, true, twiddles, column);
+    } else {
+        n2b_warp_tail<3, 5>(v, lane, group, log_n, last_stage == log_n,
+                            twiddles, column);
+    }
 }
 
 // Strided pass with wide rows (T4 FFT passes, M8 round 1): the tile holds
@@ -403,21 +431,15 @@ __device__ __forceinline__ void n2b_wide_rows_phase(
     };
     const auto g = [&](uint32_t k) { return (h(k) << shift) | fixed; };
     if constexpr (Phase == 0) {
-#pragma unroll
-        for (uint32_t k = 0; k < kWideValues; ++k) {
-            if constexpr (LoadCoefficients) {
-                v[k] = g(k) < input_count ? input[g(k)] : 0u;
-            } else {
-                v[k] = input[g(k)];
-            }
-        }
+        static_assert(count == 5u);
+        n2b_wide_first_five<LoadCoefficients>(v, input, input_count, log_n, twiddles, g);
     } else {
 #pragma unroll
         for (uint32_t k = 0; k < kWideValues; ++k)
             v[k] = tile_values[wide_tile_pad((h(k) << LaneLog) | lane)];
+        n2b_wide_stages<count, count - 1u>(v, 5u * Phase + 1u, log_n,
+                                           twiddles, g);
     }
-    n2b_wide_stages<count, count - 1u>(v, 5u * Phase + 1u, log_n, log_n,
-                                       twiddles, g);
     if constexpr (Phase + 1u == phases) {
 #pragma unroll
         for (uint32_t k = 0; k < kWideValues; ++k) column[g(k)] = v[k];
@@ -543,7 +565,8 @@ inline cudaError_t launch_n2b_wide(
     uint32_t column_count,
     bool include_circle,
     const M31 *twiddles,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const WideQueries *queries = nullptr) {
     if (!n2b_wide_supported(log_n) || column_count == 0)
         return STWO_CUDA_ERROR_INVALID_CONFIGURATION;
     const uint32_t high = log_n - kWideLowBits;
@@ -602,10 +625,18 @@ inline cudaError_t launch_n2b_wide(
 #undef STWO_N2B_ROWS_CASE
     if (status != cudaSuccess) return status;
     const uint32_t b_fast = column_count > 1u && contiguous_tiles <= 65535u;
-    n2b_wide_contiguous<kWideLowBits><<<b_fast ? dim3{column_count, contiguous_tiles}
-                                 : dim3{contiguous_tiles, column_count},
-                          kWideContiguousThreads, 0, stream>>>(
-        columns, log_n, include_circle ? log_n : log_n - 1u, twiddles, b_fast);
+    const uint32_t tiles = queries ? queries->count : contiguous_tiles;
+    const dim3 grid = b_fast ? dim3{column_count, tiles} : dim3{tiles, column_count};
+    if (queries) {
+        n2b_wide_contiguous<true><<<grid, kWideContiguousThreads, 0, stream>>>(
+            columns, log_n, log_n, twiddles, b_fast, *queries);
+    } else if (include_circle) {
+        n2b_wide_contiguous<false, true><<<grid, kWideContiguousThreads, 0, stream>>>(
+            columns, log_n, log_n, twiddles, b_fast, {});
+    } else {
+        n2b_wide_contiguous<false><<<grid, kWideContiguousThreads, 0, stream>>>(
+            columns, log_n, include_circle ? log_n : log_n - 1u, twiddles, b_fast, {});
+    }
     return cudaPeekAtLastError();
 }
 

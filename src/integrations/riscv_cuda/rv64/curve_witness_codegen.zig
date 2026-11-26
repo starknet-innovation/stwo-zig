@@ -5,6 +5,36 @@ const C = A.crypto.curves;
 fn vector(comptime L: type, v: C.spec.Vec) usize {
     return L.column(v);
 }
+
+fn queryLess(_: void, a: C.layout.Query, b: C.layout.Query) bool {
+    if (a.addend != b.addend) return a.addend < b.addend;
+    return a.column < b.column;
+}
+
+fn emitHistogram(comptime L: type, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
+    var queries: [L.BYTE_QUERIES]C.layout.Query = undefined;
+    @memcpy(&queries, L.QUERIES);
+    // Histogram updates commute. Group by addend and column so alternating
+    // carry bytes form strided runs. Retain duplicate queries as weights.
+    std.mem.sortUnstable(C.layout.Query, &queries, {}, queryLess);
+    try out.appendSlice(a, "static __device__ bool histogram(const uint32_t*row,uint32_t*counts){\n");
+    var start: usize = 0;
+    while (start < queries.len) {
+        const q = queries[start];
+        var end = start + 1;
+        var stride: usize = 1;
+        if (end < queries.len and queries[end].addend == q.addend) {
+            stride = queries[end].column - q.column;
+            while (end < queries.len and queries[end].addend == q.addend and
+                queries[end].column == q.column + stride * (end - start)) : (end += 1)
+            {}
+        }
+        try out.print(a, "if(!count_queries<{d},{d},{d}>(row+{d},counts))return false;\n", .{ end - start, stride, q.addend, q.column });
+        start = end;
+    }
+    try out.appendSlice(a, "return true;}\n");
+}
+
 fn emit(comptime kind: anytype, a: std.mem.Allocator, out: *std.ArrayList(u8)) !void {
     const L = C.layout.Layout(kind);
     const d = L.DEF;
@@ -24,11 +54,13 @@ fn emit(comptime kind: anytype, a: std.mem.Allocator, out: *std.ArrayList(u8)) !
         }
         try out.appendSlice(a, "}\nstatic __device__ uint32_t checkColumn(uint32_t j){switch(j){");
         for (L.CHECKS, 0..) |check, i| try out.print(a, "case {d}:return {d};", .{ i, L.column(check.x) });
-        try out.appendSlice(a, "}return 0;}\nstatic __device__ uint32_t rInverse(uint32_t i){switch(i){");
-        if (kind == .bls12_381_fp2_mul) for (0..48) |i| try out.print(a, "case {d}:return {d};", .{ i, C.spec.limbOf(C.native.blsRInv(), i) });
         try out.appendSlice(a, "}return 0;}\n");
-    }
+    } else try out.print(a, "static constexpr uint32_t LIMBS={d},PACKET_BYTES={d};\n", .{ d.limbs, L.PACKET_BYTES });
     for (d.relations, 0..) |terms, r| {
+        if (terms.len > 8) return error.DeviceCurveTooManyTerms;
+        var bound: u64 = 255;
+        for (terms) |term| bound += @as(u64, @abs(term.coef)) * (if (term.b != null) 255 * 255 * d.limbs else 255);
+        if (bound + (bound + 254) / 255 + 255 > std.math.maxInt(i32)) return error.DeviceCurveCoefficientOverflow;
         try out.print(a, "static __device__ uint32_t terms{d}(Term*t) {{\n", .{r});
         for (terms, 0..) |term, i| try out.print(a, "t[{d}]={{ {d},{d},{d},{d} }};\n", .{ i, vector(L, term.a), if (term.b) |b| @as(i32, @intCast(vector(L, b))) else -1, term.coef, term.shift });
         try out.print(a, "return {d}; }}\n", .{terms.len});
@@ -41,9 +73,15 @@ fn emit(comptime kind: anytype, a: std.mem.Allocator, out: *std.ArrayList(u8)) !
     }
     try out.appendSlice(a, "}return {}; }\nstatic __device__ uint32_t terms(uint32_t r,Term*t){switch(r){\n");
     for (d.relations, 0..) |_, r| try out.print(a, "case {d}:return terms{d}(t);\n", .{ r, r });
-    try out.appendSlice(a, "}return 0;}\nstatic __device__ Query query(uint32_t i){switch(i){\n");
-    for (L.QUERIES, 0..) |q, i| try out.print(a, "case {d}:return {{{d},{d}}};\n", .{ i, q.column, q.addend });
-    try out.appendSlice(a, "}return {};}\nstatic __device__ uint32_t dbase(uint32_t j){switch(j){\n");
+    try out.appendSlice(a, "}return 0;}\n");
+    try emitHistogram(L, a, out);
+    var padding: [256]u32 = @splat(0);
+    for (L.QUERIES) |q| padding[q.addend] += 1;
+    try out.appendSlice(a, "static __device__ uint32_t padding_queries(uint32_t bin){switch(bin){");
+    for (padding, 0..) |count, bin| {
+        if (count != 0) try out.print(a, "case {d}:return {d};", .{ bin, count });
+    }
+    try out.appendSlice(a, "}return 0;}\nstatic __device__ uint32_t dbase(uint32_t j){switch(j){\n");
     for (L.D, 0..) |v, i| try out.print(a, "case {d}:return {d};\n", .{ i, v });
     try out.appendSlice(a, "}return 0;}\nstatic __device__ uint32_t borrow(uint32_t j){switch(j){\n");
     for (L.BORROW, 0..) |v, i| try out.print(a, "case {d}:return {d};\n", .{ i, v });
@@ -64,7 +102,7 @@ test "device secp metadata is derived from native layouts" {
     try std.testing.expect(out.items.len > 1000);
 }
 
-pub const EXTENDED = [_]C.spec.Op{ .bn254_g1_add, .bn254_g1_double, .bn254_fp2_mul, .bls12_381_fp2_mul, .arith384_mont };
+pub const EXTENDED = C.spec.ALL;
 pub fn writeExtended(a: std.mem.Allocator, dir: std.fs.Dir) !void {
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(a);

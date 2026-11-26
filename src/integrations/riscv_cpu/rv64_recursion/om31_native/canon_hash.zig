@@ -137,9 +137,13 @@ pub fn executionIdentity(ctx: *C.Context, config: Worker.PcsConfig, expected: Ex
     Execution.emitExecutionIdentity(config, expected, &writer);
     return writer.final();
 }
+pub const ExecutionEnvelope = FixedSet.Envelope;
 pub fn gkrExecutionIdentity(ctx: *C.Context, config: Worker.PcsConfig, base: Digest) !Digest {
+    return gkrExecutionIdentityFor(.admitted, ctx, config, base);
+}
+pub fn gkrExecutionIdentityFor(envelope: ExecutionEnvelope, ctx: *C.Context, config: Worker.PcsConfig, base: Digest) !Digest {
     var writer = IdentityWriter{ .ctx = ctx, .channel = try C.Channel.init(ctx) };
-    try FixedSet.emitGkrExecutionIdentity(base, config, &writer);
+    try FixedSet.emitGkrExecutionIdentityFor(envelope, base, config, &writer);
     return writer.final();
 }
 
@@ -391,11 +395,13 @@ test "fold-v3 circuit CPU truth segment and chi hashes reproduce native authorit
 test "fold-v3 semantic execution scope matches native and binds public E and GKR domain" {
     const Fixture = @import("../../word16_global_execution/services/fixture.zig");
     const expected = Fixture.expectedFor(@splat(41));
-    const config = Worker.Candidate.configFor(.conjectured128_b2_q108_p20_fold4);
+    const config = Worker.Candidate.configFor(.d2_native_b4_q54_p20_fold4);
     const native_base = Execution.executionIdentity(config, expected);
     const native_gkr = try FixedSet.gkrExecutionIdentity(native_base, config);
     try std.testing.expect(!std.mem.eql(u8, &native_base, &native_gkr));
-    for (0..2) |mutation| {
+    const wide_gkr = try FixedSet.gkrExecutionIdentityFor(.compact_wide, native_base, config);
+    try std.testing.expect(!std.mem.eql(u8, &wide_gkr, &native_gkr));
+    for (0..4) |mutation| {
         var ctx = try C.Context.init(std.testing.allocator, 0);
         defer ctx.deinit();
         ctx.assert_eq_on_eval = false;
@@ -404,9 +410,9 @@ test "fold-v3 semantic execution scope matches native and binds public E and GKR
         var fields = try mirror(Expected, &ctx, expected);
         if (mutation == 1) fields.max_total_steps[0] = try guessWord(&ctx, 9);
         const base = try executionIdentity(&ctx, config, fields);
-        const gkr = try gkrExecutionIdentity(&ctx, config, base);
+        const gkr = try gkrExecutionIdentityFor(if (mutation >= 2) .compact_wide else .admitted, &ctx, config, base);
         try require(&ctx, base, native_base);
-        try require(&ctx, gkr, native_gkr);
-        try std.testing.expectEqual(mutation == 0, try ctx.isCircuitValid());
+        try require(&ctx, gkr, if (mutation == 2) wide_gkr else native_gkr);
+        try std.testing.expectEqual(mutation == 0 or mutation == 2, try ctx.isCircuitValid());
     }
 }

@@ -24,15 +24,8 @@ pub const Plan = struct {
     sub_removed: std.DynamicBitSetUnmanaged,
 
     pub fn init(a: Allocator, circuit: *const Circuit) !Plan {
-        var multiplicities = try circuit.computeMultiplicities(a);
-        defer multiplicities.deinit(a);
-        const removable = try a.alloc(u32, circuit.n_vars);
+        const removable = try productCandidates(a, circuit);
         defer a.free(removable);
-        @memset(removable, absent);
-        for (circuit.mul.items, 0..) |gate, index| {
-            if (multiplicities.n_uses[gate.out] == 1 and multiplicities.n_yields[gate.out] == 1)
-                removable[gate.out] = std.math.cast(u32, index) orelse return error.InvalidArithmeticRoster;
-        }
 
         var mul_removed = try std.DynamicBitSetUnmanaged.initEmpty(a, circuit.mul.items.len);
         errdefer mul_removed.deinit(a);
@@ -50,6 +43,68 @@ pub const Plan = struct {
             .add_removed = add_removed,
             .sub_removed = sub_removed,
         };
+    }
+
+    /// Only a product with one MUL writer and a single ADD/SUB input can
+    /// disappear. Keep its producing ordinal; other variables need no counts.
+    fn productCandidates(a: Allocator, graph: *const Circuit) ![]u32 {
+        const products = graph.mul.items;
+        const owner = try a.alloc(u32, graph.n_vars);
+        errdefer a.free(owner);
+        @memset(owner, absent);
+        for (products, 0..) |gate, index| {
+            if (gate.out >= owner.len or index >= absent) return error.InvalidArithmeticRoster;
+            owner[gate.out] = @intCast(index);
+        }
+        // A second writer or a use outside ADD/SUB excludes the wire. No
+        // candidate is introduced after this pass begins.
+        for (products, 0..) |gate, index| {
+            if (owner[gate.out] != index) owner[gate.out] = absent;
+            try exclude(owner, gate.in0);
+            try exclude(owner, gate.in1);
+        }
+        for (graph.pointwise_mul.items) |gate| {
+            try exclude(owner, gate.in0);
+            try exclude(owner, gate.in1);
+            try exclude(owner, gate.out);
+        }
+        for (graph.eq.items) |gate| {
+            try exclude(owner, gate.in0);
+            try exclude(owner, gate.in1);
+        }
+        for (graph.blake_g_gate.items) |gate| {
+            if (gate.out_base >= owner.len or owner.len - gate.out_base < 4) return error.InvalidArithmeticRoster;
+            for (gate.inputs()) |v| try exclude(owner, v);
+            @memset(owner[gate.out_base..][0..4], absent);
+        }
+        for (graph.triple_xor.items) |gate| {
+            for ([_]u32{ gate.input_a, gate.input_b, gate.input_c, gate.out }) |v| try exclude(owner, v);
+        }
+        for (graph.m31_to_u32.items) |gate| {
+            try exclude(owner, gate.input);
+            try exclude(owner, gate.out);
+        }
+        for (graph.permutation.inputs.items) |v| try exclude(owner, v);
+        for (graph.permutation.outputs.items) |v| try exclude(owner, v);
+        for (graph.output.items) |v| try exclude(owner, v);
+
+        var seen = try std.DynamicBitSetUnmanaged.initEmpty(a, products.len);
+        defer seen.deinit(a);
+        for ([_][]const Gate{ graph.add.items, graph.sub.items }) |gates| for (gates) |gate| {
+            try exclude(owner, gate.out);
+            for ([_]u32{ gate.in0, gate.in1 }) |v| {
+                if (v >= owner.len) return error.InvalidArithmeticRoster;
+                const index = owner[v];
+                if (index == absent) continue;
+                if (seen.isSet(index)) owner[v] = absent else seen.set(index);
+            }
+        };
+        return owner;
+    }
+
+    inline fn exclude(owner: []u32, variable: u32) !void {
+        if (variable >= owner.len) return error.InvalidArithmeticRoster;
+        owner[variable] = absent;
     }
 
     pub fn deinit(self: *Plan, a: Allocator) void {
@@ -121,4 +176,34 @@ test "arithmetic lowering fuses both subtraction orientations without removing p
     try std.testing.expect(plan.mul_removed.isSet(0) and plan.mul_removed.isSet(1));
     try std.testing.expect(!plan.mul_removed.isSet(2) and !plan.mul_removed.isSet(3));
     try std.testing.expectEqual(@as(usize, 0), plan.add_removed.count());
+}
+
+test "arithmetic lowering only removes single-use single-writer products" {
+    const a = std.testing.allocator;
+    var graph: Circuit = .{ .n_vars = 128 };
+    defer graph.deinit(a);
+    // Every product is initially a candidate for the left input of an add.
+    for (0..13) |j| {
+        const v: u32 = @intCast(8 + j);
+        try graph.mul.append(a, .{ .in0 = 1, .in1 = 2, .out = v });
+        try graph.add.append(a, .{ .in0 = v, .in1 = 3, .out = 64 + v });
+    }
+    // Disqualify products via duplicate writers, non-arithmetic consumers,
+    // repeated ports, permutation wiring, public outputs, and operands of MUL.
+    try graph.mul.append(a, .{ .in0 = 1, .in1 = 2, .out = 8 });
+    try graph.eq.append(a, .{ .in0 = 9, .in1 = 3 });
+    graph.add.items[2].in1 = 10;
+    try graph.blake_g_gate.append(a, .{ .input_a = 0, .input_b = 0, .input_c = 0, .input_d = 0, .input_f0 = 0, .input_f1 = 11, .out_base = 12 });
+    try graph.m31_to_u32.append(a, .{ .input = 16, .out = 50 });
+    try graph.permutation.inputs.append(a, 17);
+    try graph.permutation.outputs.append(a, 18);
+    try graph.permutation.ends.append(a, 1);
+    try graph.output.append(a, 19);
+    try graph.mul.append(a, .{ .in0 = 3, .in1 = 3, .out = 36 });
+    try graph.mul.append(a, .{ .in0 = 36, .in1 = 2, .out = 37 });
+    try graph.sub.append(a, .{ .in0 = 36, .in1 = 3, .out = 38 });
+    var plan = try Plan.init(a, &graph);
+    defer plan.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), plan.fused.len);
+    try std.testing.expectEqual(@as(u32, 84), plan.fused[0].out);
 }

@@ -90,7 +90,7 @@ pub const Plan = struct {
         errdefer for (items[0..made]) |item| a.free(item.offsets);
         for (request.instances, items) |instance, *item| {
             const mode_role = instance.origin == .core and (instance.origin.core == .cpu or instance.origin.core == .and_table);
-            const descriptor = Source.Descriptor{ .origin = instance.origin, .cpu_u8_pairs = mode_role and native.core.cpu.u8_pairs, .cpu_compact_decode = instance.origin == .core and instance.origin.core == .cpu and native.core.cpu.compact };
+            const descriptor = Source.Descriptor{ .origin = instance.origin, .cpu_u8_pairs = mode_role and native.core.cpu.u8_pairs, .cpu_wide_clock = instance.origin == .core and instance.origin.core == .cpu and instance.row_log == 23, .cpu_compact_decode = instance.origin == .core and instance.origin.core == .cpu and native.core.cpu.compact };
             const kernel = try catalogue.find(descriptor);
             const artifact = &catalogue.artifacts[kernel];
             if (artifact.terms != instance.terms or try instance.variables() > 28) return error.InvalidGkrSourceColumn;

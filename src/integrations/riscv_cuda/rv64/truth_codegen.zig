@@ -51,24 +51,30 @@ pub fn classicKernelId(policy: A.crypto.keccak.equations.BatchPolicy, kind: Role
         else => return error.UnsupportedTruthCompositionRole,
     });
 }
-/// Extended curve IDs are disjoint from both secp and the triple Keccak roster.
-/// Unsupported curve operations stay closed even if a shared library exports a
-/// wider implementation; native Wire35 program kinds remain unchanged.
+/// Extended curve IDs follow Wire35 order, after the classic and secp roles.
+pub const curve_ops = A.crypto.curves.spec.ALL;
+pub const curve_start = 10;
+pub const role_count = curve_start + curve_ops.len;
+
 pub fn curveKernelId(op: A.crypto.curves.spec.Op) !u32 {
-    return switch (op) {
-        .bn254_g1_add => 10,
-        .bn254_g1_double => 11,
-        .bn254_fp2_mul => 12,
-        .bls12_381_fp2_mul => 13,
-        .arith384_mont => 14,
-        else => error.UnsupportedDeviceTruthFamily,
+    return @intCast(curve_start + A.crypto.curves.spec.index(op));
+}
+
+pub fn delegatedKernelId(family: V3Catalog.Family) !u32 {
+    return switch (family) {
+        .sha256 => 3,
+        .arith256_mod => 4,
+        .add => 5,
+        .double => 6,
+        .keccak => error.UnsupportedTruthCompositionRole,
+        inline else => |f| curveKernelId(@enumFromInt(@intFromEnum(f))),
     };
 }
-test "curve AOT IDs preserve triple policy and reject unimplemented families" {
-    const ops = [_]A.crypto.curves.spec.Op{ .bn254_g1_add, .bn254_g1_double, .bn254_fp2_mul, .bls12_381_fp2_mul, .arith384_mont };
-    for (ops, 10..) |op, expected| try std.testing.expectEqual(@as(u32, @intCast(expected)), try curveKernelId(op));
-    try std.testing.expectError(error.UnsupportedDeviceTruthFamily, curveKernelId(.bls12_381_g1_add));
-    try std.testing.expectError(error.UnsupportedDeviceTruthFamily, curveKernelId(.bls12_381_g1_double));
+test "curve AOT IDs are stable across the full truth roster" {
+    for (curve_ops, curve_start..) |op, expected| {
+        try std.testing.expectEqual(@as(u32, @intCast(expected)), try curveKernelId(op));
+        try std.testing.expectEqual(@as(u32, @intCast(expected)), try delegatedKernelId(@enumFromInt(@intFromEnum(op))));
+    }
     try std.testing.expectEqual(@as(u32, 7), try classicKernelId(.triple_v2, .keccak));
     try std.testing.expectEqual(@as(u32, 9), try classicKernelId(.triple_v2, .xor5));
 }

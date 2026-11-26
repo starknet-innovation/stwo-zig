@@ -26,6 +26,7 @@ const Results = @import("../gkr_result.zig");
 const Sources = @import("../gkr_sources.zig");
 const Source = @import("../projection_codegen.zig").Source;
 const F = @import("../projection_fixture_support.zig");
+const Circle = @import("circle_twiddles.zig");
 
 const Child = CPU.rv64_gkr_child;
 const D = CPU.rv64_device_pcs;
@@ -68,10 +69,9 @@ pub const Symbols = struct {
     gather: Gather,
     copy_d2d: CopyD2d,
     memset: Memset,
-    launch: [F.count]Launch,
+    launch: [F.count]?Launch,
     numerical: N.Api,
-    /// Numerical routes, mirrored from the legacy Backend.init environment
-    /// rules (same defaults, same flags). Routes never change proof bytes.
+    /// Available proof-preserving numerical schedules for this device image.
     batched_oracles: bool,
     batched_trees: bool,
     batched_tail: bool,
@@ -92,7 +92,8 @@ pub const Symbols = struct {
         };
         for (&out.launch, 0..) |*launch, i| {
             var name: [32]u8 = undefined;
-            launch.* = try lookup(Launch, base, try std.fmt.bufPrintZ(&name, "launch_{}", .{i}));
+            const symbol = try std.fmt.bufPrintZ(&name, "launch_{}", .{i});
+            launch.* = if (i < F.standard_count) try lookup(Launch, base, symbol) else base.lookup(Launch, symbol);
         }
         out.selectRoutes();
 
@@ -102,7 +103,9 @@ pub const Symbols = struct {
     fn selectRoutes(self: *Symbols) void {
         const n = &self.numerical;
         self.batched_oracles = n.stwo_rv64_batch_sum_on != null and n.stwo_rv64_batch_fold_on != null;
-        self.batched_trees = false;
+        // Independent trees at the same input height share one kernel grid.
+        // The product still keeps every intermediate for top-down traversal.
+        self.batched_trees = n.stwo_rv64_batch_layer_on != null;
         // These existing OM31 kernels preserve the mixed-height batch's draw
         // order: fold also computes the next round's sums; tail finishes the
         // last four rounds with the same records and sleeping-oracle weights.
@@ -344,13 +347,32 @@ pub const Plan = struct {
     /// of {decoded values} and {traversal workspace} (values are freed LIFO
     /// before the workspace is allocated, as the legacy stage retires them).
     pub fn enqueueWords(self: *const Plan) usize {
+        return self.enqueueWordsForTraversal(self.traversal.total_words);
+    }
+    pub fn enqueueWordsForTraversal(self: *const Plan, traversal_words: usize) usize {
+        return self.enqueueWithTailWords(traversal_words, 0);
+    }
+    /// Projection, GKR traversal, and the consumer of its completed transcript
+    /// run on the same stream. The raw fractions and terminal state survive all
+    /// three phases. Their large, disjoint scratch buffers share the arena.
+    pub fn enqueueWithTailWords(self: *const Plan, traversal_words: usize, consumer_words: usize) usize {
         const g = @import("worker.zig").Arena.granule;
-        var words: usize = std.mem.alignForward(usize, DC.state_words, g) + std.mem.alignForward(usize, reservoir_felts * 8, g) + g;
+        var words: usize = std.mem.alignForward(usize, A.gkr_state_words, g) + std.mem.alignForward(usize, DC.state_words, g) + std.mem.alignForward(usize, reservoir_felts * 8, g) + g;
         for (self.source.items) |item| {
             words += std.mem.alignForward(usize, @max(1, self.parameterWords(item)), g);
             words += std.mem.alignForward(usize, item.facts, g) + std.mem.alignForward(usize, @as(usize, item.facts) * 8, g);
         }
-        return words + @max(std.mem.alignForward(usize, self.source.cells, g), std.mem.alignForward(usize, self.traversal.total_words, g));
+        return words + std.mem.alignForward(usize, @max(self.source.cells, traversal_words, consumer_words), g);
+    }
+    /// Keep the faster retained tree for smaller jobs. On large jobs the
+    /// recomputation pays for freeing a device-wide phase-A reservation.
+    pub fn compactTraversalWords(self: *const Plan) ?usize {
+        const threshold = (8 << 30) / @sizeOf(u32);
+        const min_saving = (256 << 20) / @sizeOf(u32);
+        if (self.traversal.total_words < threshold) return null;
+        const compact = G.Plan.initMode(self.variables, self.byte_cap, .recomputed_frontier) catch return null;
+        if (self.enqueueWords() -| self.enqueueWordsForTraversal(compact.total_words) < min_saving) return null;
+        return compact.total_words;
     }
     /// Phase-1 arena words (metadata + host columns not held in a persistent region).
     pub fn stagedWords(self: *const Plan, persistent_host: bool) usize {
@@ -388,6 +410,7 @@ pub const Gkr = struct {
     child_steps: u32 = 0,
     child_chain: u64 = 0,
     traversal: ?G.ClosureEnqueued = null,
+    compact_traversal_words: ?usize = null,
     reservoir: ?api.DeviceBuffer = null,
     launches: u64 = 0,
 
@@ -446,19 +469,10 @@ pub const Gkr = struct {
         const staged = try s.alloc(p.staged_words);
         try s.upload(staged, meta);
         self.staged = staged;
-        // Twiddles: the legacy GKR cache's tower for the largest log (immutable setup).
-        var key: [32]u8 = @splat(0);
-        @memcpy(key[0..16], "rv64-m8-gkr-twid");
-        key[16] = @intCast(p.source.max_log);
+        // GKR and global interaction use the same canonical forward tower.
+        const key = Circle.tableKey(p.source.max_log, .forward);
         const tw = try s.persistent(key, p.twiddle_words);
-        if (tw.fresh) {
-            var cache = @import("../gkr_twiddles.zig").Cache{ .allocator = self.a };
-            defer cache.deinit();
-            var borrow = try cache.acquire(p.source.max_log);
-            defer borrow.deinit();
-            if (borrow.values.len != p.twiddle_words) return error.InvalidGkrTwiddles;
-            try s.upload(tw.buffer, @as([*]const u32, @ptrCast(borrow.values.ptr))[0..borrow.values.len]);
-        }
+        if (tw.fresh) try Circle.fill(self.a, s, tw.buffer, p.source.max_log, .forward);
         self.twiddles = tw.buffer;
         var words: usize = 0;
         for (inputs, p.logs, self.host_offsets) |input, log, *offset| {
@@ -527,6 +541,7 @@ pub const Gkr = struct {
             const denominator = try e.alloc(@as(usize, item.facts) * 8);
             fraction.* = .{ .n = .{ .data = DeviceContext.slice(numerator), .stride = item.facts, .coordinates = 1 }, .d = .{ .data = DeviceContext.slice(denominator), .stride = item.facts, .coordinates = 8 }, .count = item.facts };
         }
+        const terminal_state = try e.alloc(A.gkr_state_words);
         const values = try e.alloc(p.source.cells);
         // Ingress in sorted order (Sources.Plan offsets), device or staged host.
         var cells: usize = 0;
@@ -546,31 +561,45 @@ pub const Gkr = struct {
             const meta = staged.ptr + offset;
             packet.* = .{ .fixed = values.ptr, .main = values.ptr, .public_values = meta + 2 * item.offsets.len, .offsets = @ptrCast(@alignCast(meta)), .parameters = parameters.ptr, .n = @ptrFromInt(fraction.n.data.address), .d = @ptrFromInt(fraction.d.data.address), .status = status.ptr, .log = item.log, .first = 0, .rows = @as(u32, 1) << @intCast(item.log) };
             try check(sym.gather(ctx, 0, reservoir.ptr, parameters.ptr, artifact.source_slots.ptr, @intCast(artifact.source_slots.len), p.relation_count, status.ptr));
-            try check(sym.launch[item.kernel](stream, packet));
+            const launch = sym.launch[item.kernel] orelse return error.MissingWideGkrProjection;
+            try check(launch(stream, packet));
         }
         e.free(values);
-        const workspace = try e.alloc(p.traversal.total_words);
+        const workspace = try e.alloc(self.compact_traversal_words orelse p.traversal.total_words);
         var device = DeviceContext{ .native = ctx };
         var commands = R.Commands(DeviceContext, N.Api){ .context = &device, .api = &sym.numerical, .lane_index = 0 };
         commands.batched_oracles = sym.batched_oracles;
         commands.batched_trees = sym.batched_trees;
         commands.batched_tail = sym.batched_tail;
         commands.batched_fold_sum = sym.batched_fold_sum;
-        const traversal = try G.enqueueWithClosure(&commands, self.fractions, DeviceContext.slice(.{ .ptr = child.state, .words = 9 }), DeviceContext.slice(workspace), p.byte_cap, traversal_chain, DeviceContext.slice(status));
-        self.traversal = traversal;
+        const mode: G.Mode = if (self.compact_traversal_words != null) .recomputed_frontier else .retained_tree;
+        const traversal = try G.enqueueWithClosureMode(&commands, self.fractions, DeviceContext.slice(.{ .ptr = child.state, .words = 9 }), DeviceContext.slice(workspace), p.byte_cap, traversal_chain, DeviceContext.slice(status), mode);
+        var retained = traversal;
         self.launches = commands.launches + launches + 2 * p.source.items.len;
         // The section into the slab (the legacy compact readback, minus the host).
         const t = traversal.traversal;
         try check(sym.copy_d2d(ctx, (try e.slab.field(.status, f.status())).ptr, status.ptr, 4));
         try check(sym.copy_d2d(ctx, (try e.slab.field(.gkr_section, f.header())).ptr, @ptrFromInt(t.state.address), 20 * 4));
         try check(sym.copy_d2d(ctx, (try e.slab.field(.gkr_section, f.roots())).ptr, @ptrFromInt(t.roots.address), t.roots.len * 4));
+        const root_field = try e.slab.field(.gkr_section, f.roots());
+        retained.traversal.roots = DeviceContext.slice(root_field);
         for (t.proof[0..t.layers], 0..) |layer, depth| {
             const records = try e.slab.field(.gkr_section, f.records(@intCast(depth)));
             const masks = try e.slab.field(.gkr_section, f.masks(@intCast(depth)));
             if (records.words != layer.records.len or masks.words != layer.masks.len) return error.NativeGkrSlabGeometry;
             if (records.words != 0) try check(sym.copy_d2d(ctx, records.ptr, @ptrFromInt(layer.records.address), records.words * 4));
             try check(sym.copy_d2d(ctx, masks.ptr, @ptrFromInt(layer.masks.address), masks.words * 4));
+            retained.traversal.proof[depth].records = DeviceContext.slice(records);
+            retained.traversal.proof[depth].masks = DeviceContext.slice(masks);
         }
+        if (t.state.len != terminal_state.words) return error.NativeGkrSlabGeometry;
+        try check(sym.copy_d2d(ctx, terminal_state.ptr, @ptrFromInt(t.state.address), terminal_state.bytes()));
+        retained.traversal.state = DeviceContext.slice(terminal_state);
+        // Every retained slice now has independent custody. The final copy is
+        // ordered before binding on the worker stream, so the entire traversal
+        // allocation is available to that stage without a host wait.
+        e.free(workspace);
+        self.traversal = retained;
     }
 };
 
@@ -761,6 +790,25 @@ test "slab fields of a section are namespaced by base and sized by the traversal
     try std.testing.expectEqual(@as(u32, 108), fields.masks(2));
 }
 
+test "large native GKR uses the frontier only when it reduces the arena reservation" {
+    var heights = [_]u32{ 23, 22, 23, 21, 27, 26, 24, 24 };
+    var plan: Plan = undefined;
+    plan.variables = &heights;
+    plan.byte_cap = std.math.maxInt(usize);
+    plan.traversal = try G.Plan.init(&heights, plan.byte_cap);
+    plan.source.items = &.{};
+    plan.source.cells = 0;
+    const compact = plan.compactTraversalWords() orelse return error.ExpectedCompactTraversal;
+    try std.testing.expectEqual(@as(usize, 1_526_735_104), (plan.enqueueWords() - plan.enqueueWordsForTraversal(compact)) * @sizeOf(u32));
+
+    plan.source.cells = plan.traversal.total_words;
+    try std.testing.expectEqual(@as(?usize, null), plan.compactTraversalWords());
+    plan.source.cells = 0;
+    plan.variables = heights[0..4];
+    plan.traversal = try G.Plan.init(plan.variables, plan.byte_cap);
+    try std.testing.expectEqual(@as(?usize, null), plan.compactTraversalWords());
+}
+
 test "local GKR job path is fully analyzed (stage, enqueue, finish, job adapter)" {
     _ = &Symbols.load;
     _ = &Plan.init;
@@ -776,19 +824,22 @@ test "local GKR job path is fully analyzed (stage, enqueue, finish, job adapter)
 }
 
 test "active native OM31 GKR enables only available batched fusions" {
-    // The selector inspects symbol presence only. Function pointers require alignment on ARM.
-    const present = std.heap.page_size_min;
-    for (0..16) |mask| {
+    // Route selection inspects symbol presence without calling the kernel.
+    const Present = struct {
+        fn kernel() callconv(.c) void {}
+    };
+    for (0..32) |mask| {
         var sym: Symbols = undefined;
-        sym.numerical.stwo_rv64_batch_sum_on = if (mask & 1 != 0) @ptrFromInt(present) else null;
-        sym.numerical.stwo_rv64_batch_fold_on = if (mask & 2 != 0) @ptrFromInt(present) else null;
-        sym.numerical.stwo_rv64_batch_tail_on = if (mask & 4 != 0) @ptrFromInt(present) else null;
-        sym.numerical.stwo_rv64_batch_fold_sum_on = if (mask & 8 != 0) @ptrFromInt(present) else null;
+        sym.numerical.stwo_rv64_batch_sum_on = if (mask & 1 != 0) @ptrCast(&Present.kernel) else null;
+        sym.numerical.stwo_rv64_batch_fold_on = if (mask & 2 != 0) @ptrCast(&Present.kernel) else null;
+        sym.numerical.stwo_rv64_batch_tail_on = if (mask & 4 != 0) @ptrCast(&Present.kernel) else null;
+        sym.numerical.stwo_rv64_batch_fold_sum_on = if (mask & 8 != 0) @ptrCast(&Present.kernel) else null;
+        sym.numerical.stwo_rv64_batch_layer_on = if (mask & 16 != 0) @ptrCast(&Present.kernel) else null;
         sym.selectRoutes();
         const batch = mask & 3 == 3;
         try std.testing.expectEqual(batch, sym.batched_oracles);
         try std.testing.expectEqual(batch and mask & 4 != 0, sym.batched_tail);
         try std.testing.expectEqual(batch and mask & 8 != 0, sym.batched_fold_sum);
-        try std.testing.expect(!sym.batched_trees);
+        try std.testing.expectEqual(mask & 16 != 0, sym.batched_trees);
     }
 }

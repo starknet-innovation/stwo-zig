@@ -22,13 +22,18 @@ pub fn truthMass(truth: R.Truth) !M.Mass {
     return .{ .ram = 0, .kio = 0, .wire = try std.math.mul(u64, truth.count(), x.wires) };
 }
 pub fn truthStatement(truth: R.Truth, config: W.PcsConfig, execution: [32]u8) ![32]u8 {
+    if (truth.key().producer_only) return error.FixedSetupRootMismatch;
+    return truthStatementFromSourceRoot(truth, config, execution, truth.key().root);
+}
+
+pub fn truthStatementFromSourceRoot(truth: R.Truth, config: W.PcsConfig, execution: [32]u8, source_root: [32]u8) ![32]u8 {
     try C.validate(truth);
     const d = try C.shape(truth);
     var ch = W.Channel.init();
     config.mixInto(&ch);
     ch.mixU32s(&.{ 0x56335431, 1, 8, @intFromEnum(std.meta.activeTag(truth)), @intFromEnum(truth.family()), truth.first(), truth.count(), try C.logSize(truth), @intCast(d.main), @intCast(d.inter), @intCast(d.constraints), d.degree });
     W.digest(&ch, execution);
-    W.digest(&ch, truth.key().root);
+    W.digest(&ch, source_root);
     return ch.digestBytes();
 }
 pub fn truthStatementWithAuthority(truth: R.Truth, config: W.PcsConfig, execution: [32]u8, fixed: ?*const Fixed.Binding) ![32]u8 {

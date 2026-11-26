@@ -33,16 +33,33 @@ struct HashStream {
     fill = 0;
     count = 0;
   }
-  __device__ void byte(uint32_t value) {
-    // Keep a full final block until the next byte arrives (Blake2s framing).
+  // The final block stays buffered until another byte arrives.
+  __device__ void makeRoom() {
     if (fill == 64) {
       count += 64;
       stwo::cuda::blake2s::compress(h, block, count, 0);
       for (uint32_t i = 0; i < 16; ++i) block[i] = 0;
       fill = 0;
     }
+  }
+  __device__ void byte(uint32_t value) {
+    makeRoom();
     block[fill >> 2] |= (value & 255u) << (8 * (fill & 3));
     ++fill;
+  }
+  __device__ void word(uint32_t value) {
+    makeRoom();
+    const uint32_t shift = fill & 3;
+    if (shift == 0) {
+      block[fill / 4] = value;
+      fill += 4;
+    } else {
+      block[fill / 4] |= value << (8 * shift);
+      fill += 4 - shift;
+      makeRoom();
+      block[fill / 4] = value >> (8 * (4 - shift));
+      fill += shift;
+    }
   }
   __device__ void finish(uint32_t *out) {
     count += fill;
@@ -64,7 +81,15 @@ struct Sink {
     ++written;
   }
   __device__ void word(uint32_t value) {
-    for (uint32_t k = 0; k < 4; ++k) byte(value >> (8 * k));
+    if (capacity - written < 4) { detail = 4; return; }
+    if (hash) hash->word(value);
+    else if ((written & 3) == 0) out[written / 4] = value;
+    else {
+      const uint32_t bits = 8 * (written & 3);
+      out[written / 4] |= value << bits;
+      out[written / 4 + 1] = value >> (32 - bits);
+    }
+    written += 4;
   }
 };
 
@@ -113,27 +138,35 @@ __device__ uint32_t interpret(const StwoRv64GkrWireRun &r, bool wire, Sink &sink
 }
 
 __global__ void encode(StwoRv64GkrWireRun r) {
-  if (blockIdx.x || threadIdx.x) return;
-  r.wire[0] = 0;
-  for (uint32_t i = 0; i < 16; ++i) r.receipt[i] = 0;
   const uint32_t *p = r.program;
-  uint32_t detail = 0;
-  if (r.program_words < 12 || p[0] != kMagic || p[1] != 1 || p[2] != r.program_words ||
+  // The digest and binary child independently read the same sealed proof.
+  // Keep their interpreters on separate warps, with a single publication
+  // barrier and the original receipt-before-wire error priority.
+  __shared__ uint32_t status[2];
+  __shared__ uint32_t length, digest[8];
+  const bool invalid = r.program_words < 12 || p[0] != kMagic || p[1] != 1 || p[2] != r.program_words ||
       p[7] != r.section_words || p[8] != r.marginal_words || p[9] != 12 ||
       uint64_t(p[10]) != 12 + 4ull * p[3] || uint64_t(p[11]) != 12 + 4ull * (uint64_t(p[3]) + p[4]) ||
-      uint64_t(p[11]) * 4 + p[6] > r.program_words * 4 || p[5] > (r.wire_words - 1) * 4) detail = 2;
-  HashStream hash;
-  hash.init();
-  Sink receipt{&hash, nullptr, 64ull << 20, 0, 0};
-  Sink wire{nullptr, r.wire + 1, (r.wire_words - 1) * 4, 0, 0};
-  if (!detail) detail = interpret(r, false, receipt);
-  if (!detail) detail = interpret(r, true, wire);
-  if (!detail && (wire.written > p[5] || wire.written > UINT32_MAX)) detail = 4;
-  if (!detail) {
-    hash.finish(r.receipt);
-    r.wire[0] = uint32_t(wire.written);
+      uint64_t(p[11]) * 4 + p[6] > r.program_words * 4 || p[5] > (r.wire_words - 1) * 4;
+  if (threadIdx.x == 0) {
+    HashStream hash;
+    hash.init();
+    Sink receipt{&hash, nullptr, 64ull << 20, 0, 0};
+    status[0] = invalid ? 2 : interpret(r, false, receipt);
+    if (!status[0]) hash.finish(digest);
+  } else if (threadIdx.x == 32) {
+    Sink wire{nullptr, r.wire + 1, (r.wire_words - 1) * 4, 0, 0};
+    status[1] = invalid ? 2 : interpret(r, true, wire);
+    if (!status[1] && (wire.written > p[5] || wire.written > UINT32_MAX)) status[1] = 4;
+    length = uint32_t(wire.written);
   }
-  *r.verdict = detail ? (r.reject_code | detail) : 0;
+  __syncthreads();
+  const uint32_t detail = status[0] ? status[0] : status[1];
+  if (threadIdx.x < 16) r.receipt[threadIdx.x] = threadIdx.x < 8 && !detail ? digest[threadIdx.x] : 0;
+  if (threadIdx.x == 0) {
+    r.wire[0] = detail ? 0 : length;
+    *r.verdict = detail ? (r.reject_code | detail) : 0;
+  }
 }
 } // namespace
 
@@ -149,6 +182,6 @@ extern "C" int stwo_rv64_gkr_receipt_encode_v1_on(void *context, uint32_t lane, 
       !custody.range(run->scope, 25, false) || !custody.range(run->marginals, run->marginal_words, false) ||
       !custody.range(run->receipt, 16, true) || !custody.range(run->wire, run->wire_words, true) || !custody.range(run->verdict, 1, true))
     return custody.status;
-  encode<<<1, 1, 0, custody.stream>>>(*run);
+  encode<<<1, 64, 0, custody.stream>>>(*run);
   return int(cudaPeekAtLastError());
 }

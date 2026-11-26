@@ -20,6 +20,7 @@ import time
 if __package__ in (None, ""):  # run as a file: make `scripts.*` importable
     __import__("sys").path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.rv64 import rv64_cuda_private_host_symbols as PrivateHost
+from scripts.rv64 import rv64_cuda_guest_aot as GuestAot
 
 
 def sha(path):
@@ -192,6 +193,7 @@ def main():
     parser.add_argument("--nvcc", default="/usr/local/cuda/bin/nvcc")
     parser.add_argument("--extra-object", action="append", type=Path, default=[], help="Additional AOT dispatcher/projection objects")
     parser.add_argument("--extra-native-source", action="append", default=[], help="Additional .cu source relative to the native directory")
+    parser.add_argument("--guest-aot-profile", type=Path, help="Build bounded CUDA regions from a hash-pinned guest ELF profile")
     parser.add_argument("--compile-timeout", type=float, default=180, help="Seconds per compiler process group")
     parser.add_argument("--link-timeout", type=float, default=180)
     parser.add_argument("--required-symbols", type=Path, help="Required export manifest; defaults to the native RV64 contract")
@@ -207,13 +209,15 @@ def main():
     if not required or len(set(required)) != len(required) or any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s) for s in required):
         parser.error("invalid required native export manifest")
     build.mkdir(parents=True, exist_ok=True)
+    guest_aot = GuestAot.generate(args.guest_aot_profile, build / "rv64_guest_aot.inc") if args.guest_aot_profile else None
     if args.object_store:
         tokens = [tuple(item.split("=", 1)) for item in args.path_token] or [(str(build), "@BUILD"), (str(root), "@ROOT")]
         configure_object_store(args.object_store, tokens)
     logs = build / "logs"
     logs.mkdir(exist_ok=True)
     sources = ["rv64/pcs_native.cu", "runtime/context.cu", "transform/lde.cu", "transform/n2b.cu", "transform/b2n_retained.cu", "transform/composition_split.cu",
-               "commitment/merkle.cu", "commitment/progressive.cu", "pow/search.cu"]
+               "commitment/merkle.cu", "commitment/progressive.cu", "pow/search.cu",
+               "rv64/guest_execution/guest.cu", "rv64/family_facts.cu"]
     sources += ["rv64/" + name + ".cu" for name in ["deep", "samples", "fri", "channel", "pcs", "trace", "sample_order", "composition_finalize",
                 "gkr", "round", "tail", "batch", "batch_oracles", "gkr_loop", "binding", "parameters", "closure", "global", "ls_dword_witness", "cpu_witness", "family_witness", "memory_witness", "arithmetic_witness", "bridge_witness", "bulk_witness", "sponge_witness", "keccak_witness", "sha256_witness", "arith256_witness", "secp_witness", "events"]]
     for name in args.extra_native_source:
@@ -231,7 +235,8 @@ def main():
     def compile_one(relative):
         source = native / relative
         obj = build / (relative.replace("/", "-") + ".o")
-        cached = compile_native(args.nvcc, version, flags, source, obj,
+        guest_flags = [f"-I{build}", "-DSTWO_RV64_GUEST_AOT=1"] if guest_aot and relative == "rv64/guest_execution/guest.cu" else []
+        cached = compile_native(args.nvcc, version, flags + guest_flags, source, obj,
                                 logs / (relative.replace("/", "-") + ".log"), args.compile_timeout)
         print(json.dumps({"compiled": relative, "cached": bool(cached)}), flush=True)
         return obj
@@ -251,9 +256,25 @@ def main():
             localized.append(repair)
     library = build / "libstwo-rv64-native.so"
     pending = build / f".libstwo-rv64-native-{os.getpid()}.so"
+    link_flags = ["-shared", "-Xcompiler=-pthread", "-Xlinker=-Bsymbolic"]
+    if args.device_link:
+        # Full catalogues can exceed the signed displacement of host PC-relative
+        # relocations. Keep registration descriptors near host code and put their
+        # 64-bit CUDA image pointer targets after the host data.
+        layout = build / "cuda-fatbin-placement.ld"
+        layout.write_text(
+            "SECTIONS {\n"
+            "  .nv_fatbin : { *(.nv_fatbin) }\n"
+            "  __nv_relfatbin : { *(__nv_relfatbin) }\n"
+            "} INSERT AFTER .bss;\n"
+        )
+        link_flags.extend([
+            "-rdc=true", "-gencode", "arch=compute_120,code=sm_120",
+            "-Xlinker=--no-relax", f"-Xlinker=-T,{layout}",
+        ])
     try:
         with (logs / "link.log").open("w") as log:
-            run_checked([args.nvcc, "-shared", "-Xcompiler=-pthread", "-Xlinker=-Bsymbolic", *(["-rdc=true", "-gencode", "arch=compute_120,code=sm_120"] if args.device_link else []), *map(str, objects), "-o", str(pending)], log, args.link_timeout)
+            run_checked([args.nvcc, *link_flags, *map(str, objects), "-o", str(pending)], log, args.link_timeout)
         # Check the candidate inode before replacing the live library. This
         # catches hidden symbols and missing TUs without a producer rebuild or
         # capture/setup run. Existing sessions keep their admitted old inode.
@@ -271,6 +292,8 @@ def main():
                "library_sha256": sha(library), "builder_sha256": sha(Path(__file__).resolve()),
                "compile_timeout_seconds": args.compile_timeout, "link_timeout_seconds": args.link_timeout,
                "objects": {str(p): sha(p) for p in objects}, "localized_private_host_helpers": localized, "scope": "AOT build only; no proof or residency qualification"}
+    if guest_aot:
+        receipt["guest_aot"] = guest_aot
     (build / "build.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(str(library), flush=True)
 

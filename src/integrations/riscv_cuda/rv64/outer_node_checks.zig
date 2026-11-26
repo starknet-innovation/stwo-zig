@@ -1,5 +1,5 @@
 //! Producer diagnostics owner: native encoder mirror, seed binding and optional captures.
-const Timer = @import("outer_gpu_timer.zig");
+const Timer = @import("cuda_events.zig");
 const Schema = @import("outer_job_factory.zig");
 const std = @import("std");
 const Outer = @import("stwo_circuit_cpu_integration").om31;
@@ -253,7 +253,11 @@ pub const GnCheck = struct {
             for (found.items) |*f| f.deinit(a);
             found.deinit(a);
         }
-        try GnRecord.Live.find(a, seeds, !input.is_leaf, &found);
+        const typed_starts = input.child_proof_starts.len != 0;
+        const n_constants = input.graph.constants.count();
+        if (typed_starts) {
+            try GnRecord.Live.findAt(a, seeds, n_constants, input.child_proof_starts, !input.is_leaf, &found);
+        } else try GnRecord.Live.find(a, seeds, !input.is_leaf, &found);
         if (found.items.len == 0 or (input.is_leaf and found.items.len != 1) or found.items.len > Seed.max_children) {
             std.debug.print("GN_NODE ordinal={d} error=GnNodeChildrenNotFound found={d} leaf={}\n", .{ input.ordinal, found.items.len, input.is_leaf });
             return error.GnNodeChildrenNotFound;
@@ -291,6 +295,7 @@ pub const GnCheck = struct {
             const f = found.items[0];
             const s0 = f.at;
             const proof_len = try Seed.leafTapeLength(a, classes[0], leaf_cap_log);
+            if (typed_starts and s0 != n_constants) return error.GnNodeSeedLayout;
             if (s0 + proof_len > n) return error.GnNodeLeafTapeTooLong;
             const tail: u32 = @intCast(n - s0 - proof_len);
             const outputs_at: u32 = @intCast(wire_words + f.entry.image.len + 4 * tail);
@@ -310,9 +315,20 @@ pub const GnCheck = struct {
             regions[0] = region;
             made = 1;
         } else {
-            const tape = try Seed.tapeLength(classes[0..found.items.len], cap_log, a);
-            if (tape > n) return error.GnNodeFoldTapeTooLong;
-            const constants = try a.alloc([4]u32, n - tape);
+            const prefix_len = if (typed_starts) blk: {
+                var at = n_constants;
+                for (found.items, classes[0..found.items.len]) |child, class| {
+                    if (child.at != at) return error.GnNodeSeedLayout;
+                    at += try Seed.tapeLength(&.{class}, cap_log, a);
+                }
+                if (at != n) return error.GnNodeSeedLayout;
+                break :blk n_constants;
+            } else blk: {
+                const tape = try Seed.tapeLength(classes[0..found.items.len], cap_log, a);
+                if (tape > n) return error.GnNodeFoldTapeTooLong;
+                break :blk n - tape;
+            };
+            const constants = try a.alloc([4]u32, prefix_len);
             defer a.free(constants);
             for (constants, 0..) |*c, j| c.* = seeds[5 * j + 1 ..][0..4].*;
             for (found.items, 0..) |f, k| {

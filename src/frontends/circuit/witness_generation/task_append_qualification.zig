@@ -1,5 +1,5 @@
 //! CPU-only registration-dispatch benchmark over the unchanged original graph.
-//! Uses only production BuildMetrics: no append census or reserve path.
+//! Uses production BuildMetrics and fixed pre-optimization fingerprints.
 const std = @import("std");
 const C = @import("../builder/context.zig");
 const Schedule = @import("plan.zig");

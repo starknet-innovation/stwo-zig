@@ -171,12 +171,32 @@ static void exercise(const std::string &directory, uint32_t id, Fusion fusion,
       CHECK(cudaMemcpyAsync(destination, source, words * 4,
                             cudaMemcpyDeviceToDevice, stream));
   };
-  for (auto &w : workers)
-    for (uint32_t level = 1; level <= w.variables; ++level) {
-      const auto &before = w.tree[level - 1], &after = w.tree[level];
-      CHECK(stwo_rv64_gkr_layer_on(o.ctx, 1, before.n, before.d, before.count,
-                                   1, after.n, after.d));
+  if (fusion == Fusion::separate) {
+    for (auto &w : workers)
+      for (uint32_t level = 1; level <= w.variables; ++level) {
+        const auto &before = w.tree[level - 1], &after = w.tree[level];
+        CHECK(stwo_rv64_gkr_layer_on(o.ctx, 1, before.n, before.d, before.count,
+                                    1, after.n, after.d));
+      }
+  } else {
+    std::vector<StwoRv64BatchFoldJob> level;
+    level.reserve(workers.size());
+    for (uint32_t height = layers; height != 0; --height) {
+      level.clear();
+      for (const auto &w : workers) {
+        if (w.variables < height)
+          continue;
+        const uint32_t from = w.variables - height;
+        const auto &before = w.tree[from], &after = w.tree[from + 1];
+        level.push_back({before.n, before.d, after.n, after.d});
+      }
+      uint32_t launches = 0;
+      CHECK(stwo_rv64_batch_layer_on(o.ctx, 1, level.data(), uint32_t(level.size()),
+                                      1u << height, &launches));
+      if (launches != 1)
+        throw std::runtime_error("batched tree did not issue one launch per height");
     }
+  }
   CHECK(stwo_rv64_gkr_pack_roots_on(o.ctx, 1, roots.data(), count,
                                     root_words.words));
   if (attack == 6)

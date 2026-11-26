@@ -5,7 +5,7 @@ const G = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.gpu_native;
 const ManifestM = CPU.rv64_gkr_manifest;
 const NE = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_encode;
 const NO = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_encode_oods;
-const Peer = @import("gn_s2_common.zig").Peer;
+const Peer = @import("native_common.zig").Peer;
 const Recorder = @import("gn_s2_capture.zig").Recorder;
 const S2D = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_device_stage2;
 const Seg = @import("gn_s2_capture.zig").Seg;
@@ -13,9 +13,9 @@ const W = jobs.worker;
 const api = jobs.api;
 const core = @import("stwo_core");
 const jobs = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.runtime;
-const run = @import("gn_s2_common.zig").run;
+const run = @import("native_common.zig").run;
 const std = @import("std");
-const words8 = @import("gn_s2_common.zig").words8;
+const words8 = @import("native_common.zig").words8;
 
 pub const Fault = enum { none, sample, parameter, hc_row, alpha, point_status, noncanonical_sample, composition_sample, descriptor, pcs_header, seal_flag, seal_receipt };
 /// Slab words of the tail job.

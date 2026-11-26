@@ -27,7 +27,7 @@ pub fn cpu(a: std.mem.Allocator, setup: *const Setup) !Plan {
     const spans = try a.alloc(Span, old.slots.len);
     errdefer a.free(spans);
     for (old.slots, specs, spans, 0..) |slot, *spec, *span, index| {
-        const descriptor = CPU.Authority.Source.Descriptor{ .origin = slot.origin, .cpu_u8_pairs = setup.materials.geometry.cpu_u8_pairs, .cpu_compact_decode = setup.materials.geometry.cpu_compact_decode };
+        const descriptor = CPU.Authority.Source.Descriptor.forGeometry(slot.origin, setup.materials.geometry);
         const shape = try CPU.Authority.shape(descriptor);
         spec.* = .{ .origin = CPU.Authority.Source.Frame.originWords(slot.origin), .row_log = slot.log, .terms = try CPU.terms(descriptor) };
         span.* = .{ .fixed_offset = slot.fixed_offset, .main_offset = slot.main_offset, .inter_offset = 16 * index, .fixed = shape.fixed, .main = shape.main, .constraints = shape.constraints + 3, .degree = 3, .split = 1, .max_main_samples = 2 };

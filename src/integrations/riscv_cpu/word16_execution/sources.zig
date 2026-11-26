@@ -185,13 +185,13 @@ pub const Source = struct {
         var range16 = blk: {
             var stage = try Profile.StageScope.begin(recorder, "source_range16", "U16 multiplicities");
             defer stage.end();
-            break :blk try W.table_trace.Source.initRange16(a, materials.range16_fixed, c16);
+            break :blk try W.table_trace.Source.initRange16(a, materials.tables.range16, c16);
         };
         errdefer range16.deinit();
         var range8 = blk: {
             var stage = try Profile.StageScope.begin(recorder, "source_range8", "U8 multiplicities");
             defer stage.end();
-            break :blk try W.table_trace.Source.initRange8(a, materials.range8_fixed, c8);
+            break :blk try W.table_trace.Source.initRange8(a, materials.tables.range8, c8);
         };
         errdefer range8.deinit();
         const and_counts = if (tails.binary != null) try a.dupe(u64, binary.and_counts) else null;
@@ -204,13 +204,13 @@ pub const Source = struct {
             var stage = try Profile.StageScope.begin(recorder, "source_and_table", "AND multiplicities");
             defer stage.end();
             const counts = and_counts orelse binary.and_counts;
-            break :blk if (pair_counts) |pairs| try A.providers.tables.Request.initWithPairs(a, &materials.and_table, counts, pairs) else try A.providers.tables.Request.init(a, &materials.and_table, counts);
+            break :blk if (pair_counts) |pairs| try A.providers.tables.Request.initWithPairs(a, &materials.tables.and_, counts, pairs) else try A.providers.tables.Request.init(a, &materials.tables.and_, counts);
         };
         errdefer and_table.deinit();
         var shift_table = blk: {
             var stage = try Profile.StageScope.begin(recorder, "source_shift_table", "SHIFT table multiplicities");
             defer stage.end();
-            break :blk try B.shift_word_packed_experiment.table.Request.init(a, &materials.shift_table, shift_counts orelse shift.shift_counts);
+            break :blk try B.shift_word_packed_experiment.table.Request.init(a, &materials.tables.shift, shift_counts orelse shift.shift_counts);
         };
         errdefer shift_table.deinit();
         {
@@ -299,7 +299,7 @@ pub const Source = struct {
         const boundary = block: {
             var stage = try Profile.StageScope.begin(recorder, "inter_register_boundary", "Public register boundary interactions");
             defer stage.end();
-            break :block try W.boundary_trace.generate(self.allocator, self.materials.boundary_fixed, self.cpu.public, self.materials.geometry.cpu_log, old.register);
+            break :block try W.boundary_trace.generate(self.allocator, self.materials.tables.boundary, self.cpu.public, self.materials.geometry.cpu_log, old.register);
         };
         self.boundary = boundary.values;
         const cpu = block: {

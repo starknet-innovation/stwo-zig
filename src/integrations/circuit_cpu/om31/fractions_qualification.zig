@@ -21,6 +21,7 @@ const Job = extern struct {
     row_log: u32,
     reserved: [2]u32 = .{ 0, 0 },
 };
+extern "c" fn stwo_circuit_om31_contribution_emulate(*const [8]u32, *const [8]u32, *[8]u32) void;
 extern "c" fn stwo_circuit_om31_fractions_emulate(*const Job) c_int;
 const Projected = extern struct {
     fixed: ?[*]const u32,
@@ -188,4 +189,97 @@ test "native octic circuit CUDA fractions share tuple authority all components" 
         try std.testing.expect(status & 4 != 0);
     }
     std.debug.print("OM31_CUDA_FRACTIONS components=11 physical_rows=16 native_tuple_parity=true geometry_overlap_mutants=44 zero_denominator_cases=11\n", .{});
+}
+
+test "lane-local CUDA contribution matches octic division and rejects malformed fractions" {
+    var prng = std.Random.DefaultPrng.init(0x320f);
+    var n: [8]u32 = undefined;
+    var d: [8]u32 = undefined;
+    var actual: [8]u32 = undefined;
+    for (0..1024) |_| {
+        var numerator: [8]P.M = undefined;
+        var denominator: [8]P.M = undefined;
+        for (&numerator, &denominator, &n, &d) |*x, *y, *a, *b| {
+            x.* = P.M.fromU64(prng.random().int(u32));
+            y.* = P.M.fromU64(prng.random().int(u32));
+            a.* = x.v;
+            b.* = y.v;
+        }
+        stwo_circuit_om31_contribution_emulate(&n, &d, &actual);
+        const expected = try P.O.fromM31Array(numerator).div(P.O.fromM31Array(denominator));
+        for (expected.toM31Array(), actual) |limb, word| try std.testing.expectEqual(limb.v, word);
+    }
+    const zero: [8]u32 = @splat(0);
+    for (0..8) |i| {
+        var invalid = d;
+        invalid[i] = 0x7fffffff;
+        stwo_circuit_om31_contribution_emulate(&n, &invalid, &actual);
+        try std.testing.expectEqual(zero, actual);
+        stwo_circuit_om31_contribution_emulate(&invalid, &d, &actual);
+        try std.testing.expectEqual(zero, actual);
+    }
+    stwo_circuit_om31_contribution_emulate(&n, &zero, &actual);
+    try std.testing.expectEqual(zero, actual);
+    stwo_circuit_om31_contribution_emulate(&zero, &d, &actual);
+    try std.testing.expectEqual(zero, actual);
+}
+
+test "mixed arithmetic CUDA fractions bind all four authenticated addresses" {
+    const rows = 16;
+    const M = P.M;
+    const row = @import("arithmetic/row.zig");
+    const z = P.O.fromM31Array(.{ M.fromU64(11), M.fromU64(13), M.fromU64(17), M.fromU64(23), M.fromU64(31), M.fromU64(43), M.fromU64(53), M.fromU64(61) });
+    const elements = W.Elements.init(z, z.add(P.O.basis()));
+    var parameters: [56]u32 = undefined;
+    for (z.toM31Array(), parameters[0..8]) |m, *word| word.* = m.v;
+    for (elements.powers, 0..) |power, i| for (power.toM31Array(), parameters[8 + 8 * i ..][0..8]) |m, *word| {
+        word.* = m.v;
+    };
+    var fixed: [8][rows]u32 = undefined;
+    var main: [16][rows]u32 = undefined;
+    const forms = std.enums.values(row.Mode);
+    for (0..rows) |r| {
+        for (forms[r % forms.len].fixed(), 0..) |value, i| fixed[i][r] = value.v;
+        for (3..8) |i| fixed[i][r] = @intCast(17 * i + r);
+        for (0..16) |i| main[i][r] = @intCast(19 * i + r + 1);
+    }
+    var numerators: [2][8][rows]u32 = undefined;
+    var denominators: [2][8][rows]u32 = undefined;
+    var status: u32 = 0;
+    var job = Job{
+        .fixed = &fixed[0],
+        .main = &main[0],
+        .parameters = &parameters,
+        .numerators = &numerators[0][0],
+        .denominators = &denominators[0][0],
+        .status = &status,
+        .fixed_words = 8 * rows,
+        .main_words = 16 * rows,
+        .numerator_words = 16 * rows,
+        .denominator_words = 16 * rows,
+        .component = 1,
+        .row_log = 4,
+    };
+    try std.testing.expectEqual(@as(c_int, 0), stwo_circuit_om31_fractions_emulate(&job));
+    try std.testing.expectEqual(@as(u32, 0), status);
+    const Lookup = circuit.witness.components.Lookup;
+    for (0..rows) |r| {
+        const flags = forms[r % forms.len].fixed();
+        const weights = [_]M{ M.one(), M.one(), row.addendWeight(M, M.one(), flags), M.fromCanonical(fixed[7][r]).neg() };
+        var lookups: [4]Lookup = undefined;
+        for (&lookups, [_]usize{ 4, 5, 3, 6 }, [_]usize{ 0, 4, 12, 8 }, weights) |*lookup, addr, start, weight| {
+            lookup.* = .{ .numerator = weight, .tuple = .{ M.fromCanonical(row.gate_id), M.fromCanonical(fixed[addr][r]), undefined, undefined, undefined, undefined }, .len = 6 };
+            for (lookup.tuple[2..], start..) |*limb, i| limb.* = M.fromCanonical(main[i][r]);
+        }
+        var expected: [2]L.Fraction = undefined;
+        try W.pairFractions(&elements, &lookups, &expected);
+        for (expected, 0..) |fraction, pair| {
+            for (fraction.numerator.toM31Array(), fraction.denominator.toM31Array(), 0..) |n, d, i| {
+                try std.testing.expectEqual(n.v, numerators[pair][i][r]);
+                try std.testing.expectEqual(d.v, denominators[pair][i][r]);
+            }
+        }
+    }
+    job.component = 0;
+    try std.testing.expectEqual(@as(c_int, 1), stwo_circuit_om31_fractions_emulate(&job));
 }

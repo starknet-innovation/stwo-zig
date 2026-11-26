@@ -135,8 +135,8 @@ const Worker = struct {
         @memset(dirty.bits, 0);
         walk.memory.backing.dirty = &dirty;
         defer walk.memory.backing.dirty = null;
-        var taken = (try walk.nextTaking()) orelse return error.GuestSegmentContinuity;
-        errdefer taken.deinit();
+        var captured = (try walk.next()) orelse return error.GuestSegmentContinuity;
+        errdefer captured.finished.deinit();
         // Continuity: this segment ends exactly where the first pass's next
         // checkpoint (or its end state) begins.
         checkpoint_timer.reset();
@@ -146,9 +146,9 @@ const Worker = struct {
         if (self.index == 0) if (owner.minimal_cpu0) |trace| {
             // checkpointAt(1) acquires the first pass publication mutex after
             // CPU0 is sealed; later batches never write this record span.
-            if (trace.len != taken.tape.len) return error.GuestMinimalCpuMismatch;
-            var pc = taken.tape.initial_pc;
-            for (trace.records[0..trace.len], taken.tape.steps()) |record, step| {
+            if (trace.len != walk.tape.len) return error.GuestMinimalCpuMismatch;
+            var pc = walk.tape.initial_pc;
+            for (trace.records[0..trace.len], walk.tape.steps()) |record, step| {
                 if (pc < owner.engine.code_lo or pc >= owner.engine.code_hi or pc & 3 != 0) return error.GuestMinimalCpuMismatch;
                 const op = (try owner.main.request.authority.instructionAt(pc)).instruction.opcode;
                 const branch = switch (op) {
@@ -160,14 +160,17 @@ const Worker = struct {
             }
         };
         self.completed = walk.completed;
-        self.retired = taken.tape.len;
+        self.retired = walk.tape.len;
         self.traced_ns = walk.traced_ns;
         self.finish_ns = walk.finish_ns;
         self.fast_retired = walk.fast_retired;
         self.fast_ns = walk.fast_ns;
         self.reference_ns = walk.reference_ns;
         self.reference_steps = walk.reference_steps;
-        self.taken = taken;
+        // No successor will run on this walk. Move the captured storage only
+        // after all fallible continuity checks; destroy still owns the capture.
+        self.taken = .{ .index = captured.index, .finished = captured.finished, .tape = walk.tape };
+        walk.owns_tape = false;
     }
 };
 

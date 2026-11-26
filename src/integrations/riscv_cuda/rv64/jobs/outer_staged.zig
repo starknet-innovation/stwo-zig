@@ -14,6 +14,7 @@ const std = @import("std");
 const Plan = @import("outer_plan.zig");
 const K = @import("outer_kernels.zig");
 const Comp = @import("outer_composition.zig");
+const api = @import("api.zig");
 
 pub const Region = enum(u2) { node, class, twiddles, fixed };
 /// Regions packed from host images (FIXED coefficients are produced on device).
@@ -91,7 +92,34 @@ pub const Image = struct {
         self.* = out;
         return maximum;
     }
+
+    fn placeDeviceTower(self: *Image, needs: [29]?Twiddles) void {
+        const log = topLog(needs) orelse return;
+        const top = api.CircleTwiddle.forward.words(log);
+        const forward = self.take(.twiddles, top);
+        const inverse = self.take(.twiddles, top);
+        self.twiddles[log] = forward;
+        self.itwiddles[log] = inverse;
+        for (needs[0..log], 0..) |needed, l| if (needed != null) {
+            const n = api.CircleTwiddle.forward.words(@intCast(l));
+            if (n >= 64) {
+                self.twiddles[l] = .{ .region = .twiddles, .offset = forward.offset + top - n, .words = n };
+                self.itwiddles[l] = .{ .region = .twiddles, .offset = inverse.offset + top - n, .words = n };
+            } else {
+                self.twiddles[l] = self.take(.twiddles, n);
+                self.itwiddles[l] = self.take(.twiddles, n);
+            }
+        };
+    }
 };
+
+fn topLog(tables: [29]?Twiddles) ?u32 {
+    var maximum: ?u32 = null;
+    for (tables, 0..) |entry, log| if (entry != null) {
+        maximum = @intCast(log);
+    };
+    return maximum;
+}
 
 pub const RunKind = enum { ordinary, narrow, chain };
 pub const Run = struct { kind: RunKind, first_task: u32, task_count: u32, first_level: u32, level_count: u32 };
@@ -100,6 +128,10 @@ pub const Run = struct { kind: RunKind, first_task: u32, task_count: u32, first_
 /// flattened). Launch entry points are the ones Prepared resolved.
 pub const Assignment = struct {
     count: usize,
+    /// The finalized circuit still reads these trailing, constant-zero QM31 wires.
+    zero_variables: u32 = 0,
+    /// Copies of the immediately preceding 1+1 result, before the zero wires.
+    two_variables: u32 = 0,
     seeds: []const u32, // 5 words per seed
     tasks: []const u32, // 8 words per task
     indices: []const u32,
@@ -136,11 +168,13 @@ pub const Statics = struct {
     plan: Plan.ClassPlan,
     gather: [Plan.n_components][]const u32,
     gathered_fixed: []const u32,
-    main_logs: [Plan.main_columns]u32,
+    main_logs: [Plan.max_main_columns]u32,
     inter_logs: [Plan.inter_columns]u32,
     /// Every height the node transforms at (TC eval height, RC role heights,
     /// composition and commit heights), with its twiddle trees.
     tables: [29]?Twiddles = @splat(null),
+    /// In this mode non-null entries name heights only.
+    device_twiddles: bool = false,
     /// FIXED tree commit geometry (original-order logs = authority fixed_logs)
     /// and its sorted log table (class region). The raw FIXED evaluations are
     /// per node (`Staged.fixed_raw`): class statics outlive the node whose PP
@@ -155,6 +189,7 @@ pub const Statics = struct {
     /// WholePlan). Null: each node builds its own (the default path).
     class_plan: ?*anyopaque = null,
     pub fn table(self: *const Statics, log: u32) !Twiddles {
+        if (self.device_twiddles) return error.OuterTwiddlesAreDeviceResident;
         return (if (log < 29) self.tables[log] else null) orelse error.MissingOuterTwiddles;
     }
 };
@@ -240,14 +275,17 @@ pub const Staged = struct {
         }
     }
     pub fn twiddleRegionKey(self: *const Staged) [32]u8 {
-        if (self.shared_twiddle_log) |maximum| {
+        const top = if (self.statics.device_twiddles) topLog(self.statics.tables) else self.shared_twiddle_log;
+        if (top) |maximum| {
+            if (self.statics.device_twiddles and self.image.words[@intFromEnum(Region.twiddles)] == api.CircleTwiddle.both.words(maximum))
+                return @import("circle_twiddles.zig").pairKey(maximum);
             var id: [30]u8 = @splat(0);
             id[0] = @intCast(maximum + 1);
             // Large-height subsets share identical tower bytes. Only the
             // separately aligned small tables affect the remaining layout.
-            for (self.statics.tables, 0..) |table, log| if (table) |t| {
-                if (t.twiddles.len < 64) id[1 + log] = 1;
-            };
+            for (self.image.twiddles, 0..) |range, log| {
+                if (range.words != 0 and range.words < 64) id[1 + log] = 1;
+            }
             return regionKey("rv64/m8/outer-job/twiddles/v3-tower", &id, self.image.words[@intFromEnum(Region.twiddles)]);
         }
         var logs: [29]u8 = undefined;
@@ -255,7 +293,7 @@ pub const Staged = struct {
         return regionKey("rv64/m8/outer-job/twiddles/v2", &logs, self.image.words[@intFromEnum(Region.twiddles)]);
     }
     pub fn shareTwiddleTower(self: *Staged) !void {
-        if (self.shared_twiddle_log != null) return;
+        if (self.statics.device_twiddles or self.shared_twiddle_log != null) return;
         self.shared_twiddle_log = try self.image.shareTwiddleTower(self.statics.tables);
     }
     fn regionKey(tag: []const u8, id: []const u8, words: u64) [32]u8 {
@@ -287,28 +325,62 @@ pub const Staged = struct {
         i.indices = i.take(schedule, assignment.indices.len);
         if (assignment.needs_device_ends) i.chain_ends = i.take(schedule, assignment.ends.len);
         i.gathered_fixed = i.take(.class, statics.gathered_fixed.len);
-        i.main_logs = i.take(.class, Plan.main_columns);
+        i.main_logs = i.take(.class, statics.plan.main.logs.len);
         i.inter_logs = i.take(.class, Plan.inter_columns);
         i.fixed_logs = i.take(.class, statics.fixed_sorted_logs.len);
         if (expected_words != 0) i.expected = i.take(.node, expected_words);
-        for (statics.tables, 0..) |t, log| if (t) |tw| {
+        if (statics.device_twiddles) i.placeDeviceTower(statics.tables) else for (statics.tables, 0..) |t, log| if (t) |tw| {
             i.twiddles[log] = i.take(.twiddles, tw.twiddles.len);
             i.itwiddles[log] = i.take(.twiddles, tw.itwiddles.len);
         };
         return i;
     }
 
-    /// Packs `region` into `out` (job pinned memory of `image.words[region]`).
-    pub fn pack(self: *const Staged, region: Region, out: []u32) !void {
-        if (out.len < self.image.words[@intFromEnum(region)]) return error.OuterStagedImageTooSmall;
+    /// Fill only the largest pair and the independently aligned small tables.
+    pub fn fillDeviceTwiddles(self: *const Staged, s: *api.Stager, buffer: api.DeviceBuffer) !void {
+        const top = topLog(self.statics.tables) orelse return error.MissingOuterTwiddles;
+        for (self.image.twiddles, self.image.itwiddles, 0..) |fwd, inv, log| {
+            if (fwd.words == 0 or (log != top and fwd.words >= 64)) continue;
+            if (inv.offset == fwd.offset + fwd.words) {
+                const pair = try buffer.slice(@intCast(fwd.offset), @intCast(2 * fwd.words));
+                if (!try s.circleTwiddles(pair, @intCast(log), .both)) return error.MissingDeviceCircleTwiddles;
+            } else {
+                const f = try buffer.slice(@intCast(fwd.offset), @intCast(fwd.words));
+                const i = try buffer.slice(@intCast(inv.offset), @intCast(inv.words));
+                if (!try s.circleTwiddles(f, @intCast(log), .forward)) return error.MissingDeviceCircleTwiddles;
+                if (!try s.circleTwiddles(i, @intCast(log), .inverse)) return error.MissingDeviceCircleTwiddles;
+            }
+        }
+    }
+
+    pub fn stageRegion(self: *const Staged, s: *api.Stager, region: Region, resident: bool, require_warm: bool) !api.Persistent {
+        const words: usize = @intCast(self.image.words[@intFromEnum(region)]);
+        const buffer: api.Persistent = if (resident) try s.persistent(switch (region) {
+            .class => self.classRegionKey(),
+            .twiddles => self.twiddleRegionKey(),
+            else => return error.InvalidOuterStagingRegion,
+        }, @max(words, 1)) else .{ .buffer = try s.alloc(@max(words, 1)), .fresh = true };
+        if (!buffer.fresh) return buffer;
+        if (require_warm) return error.GpuNativeRecursionClassCold;
+        if (words != 0) {
+            if (region == .twiddles and self.statics.device_twiddles) {
+                try self.fillDeviceTwiddles(s, buffer.buffer);
+            } else {
+                const pinned = try s.pinned(words);
+                try self.pack(region, pinned);
+                try s.upload(buffer.buffer, pinned);
+            }
+        }
+        return buffer;
+    }
+
+    const Section = struct { Range, []const u32 };
+
+    pub fn sections(self: *const Staged) [13]Section {
         const i = self.image;
         const a = self.assignment;
         const s = self.statics;
-        for (s.tables, 0..) |t, log| if (t) |tw| if (region == .twiddles) {
-            @memcpy(out[@intCast(i.twiddles[log].offset)..][0..tw.twiddles.len], tw.twiddles);
-            @memcpy(out[@intCast(i.itwiddles[log].offset)..][0..tw.itwiddles.len], tw.itwiddles);
-        };
-        const sections = [_]struct { Range, []const u32 }{
+        return .{
             .{ i.rc_blob, s.rc_blob },
             .{ i.channel_seed, &self.checkpoint },
             .{ i.seeds, a.seeds },
@@ -318,12 +390,23 @@ pub const Staged = struct {
             .{ i.indices, a.indices },
             .{ i.chain_ends, if (a.needs_device_ends) a.ends else &.{} },
             .{ i.gathered_fixed, s.gathered_fixed },
-            .{ i.main_logs, &s.main_logs },
+            .{ i.main_logs, s.main_logs[0..s.plan.main.logs.len] },
             .{ i.inter_logs, &s.inter_logs },
             .{ i.fixed_logs, s.fixed_sorted_logs },
             .{ i.expected, self.expected },
         };
-        for (sections) |entry| {
+    }
+
+    /// Packs `region` into `out` (job pinned memory of `image.words[region]`).
+    pub fn pack(self: *const Staged, region: Region, out: []u32) !void {
+        if (out.len < self.image.words[@intFromEnum(region)]) return error.OuterStagedImageTooSmall;
+        if (region == .twiddles and self.statics.device_twiddles) return error.OuterTwiddlesAreDeviceResident;
+        const i = self.image;
+        if (region == .twiddles) for (self.statics.tables, 0..) |t, log| if (t) |tw| {
+            @memcpy(out[@intCast(i.twiddles[log].offset)..][0..tw.twiddles.len], tw.twiddles);
+            @memcpy(out[@intCast(i.itwiddles[log].offset)..][0..tw.itwiddles.len], tw.itwiddles);
+        };
+        for (self.sections()) |entry| {
             const r, const src = entry;
             if (r.region != region or r.words == 0) continue;
             if (r.words != src.len) return error.OuterStagedSectionMismatch;
@@ -342,6 +425,9 @@ pub const Bases = struct {
 
 test "image regions are disjoint, 256 B (64-word) aligned, and a leaf keeps its schedule node-local" {
     var statics: Statics = undefined;
+    statics.device_twiddles = false;
+    var main_logs: [Plan.main_columns]u32 = @splat(4);
+    statics.plan.main.logs = &main_logs;
     statics.gathered_fixed = &.{ 1, 2, 3 };
     statics.rc_blob = &.{};
     statics.fixed_sorted_logs = &.{};
@@ -367,6 +453,37 @@ test "image regions are disjoint, 256 B (64-word) aligned, and a leaf keeps its 
     try std.testing.expectEqual(@as(u64, 0), fold.tasks.offset);
     try std.testing.expectEqual(@as(u64, 8), fold.twiddles[5].words + fold.itwiddles[5].words);
     try std.testing.expectEqual(@as(u64, 64), fold.itwiddles[5].offset);
+}
+
+test "device twiddle towers share aligned suffixes and keep small transforms aligned" {
+    const t = std.testing;
+    var statics: Statics = undefined;
+    statics.device_twiddles = true;
+    statics.tables = @splat(null);
+    const required = Twiddles{ .twiddles = &.{}, .itwiddles = &.{} };
+    statics.tables[7] = required;
+    statics.tables[10] = required;
+    var staged: Staged = undefined;
+    staged.statics = &statics;
+    staged.shared_twiddle_log = null;
+    staged.image = .{};
+    staged.image.placeDeviceTower(statics.tables);
+    try t.expectEqual(@as(u64, 448), staged.image.twiddles[7].offset);
+    try t.expectEqual(@as(u64, 960), staged.image.itwiddles[7].offset);
+    try t.expectEqual(@as(u64, 64), staged.image.twiddles[7].words);
+    const pair_key = staged.twiddleRegionKey();
+    try t.expectEqual(@as(u64, 1024), staged.image.words[@intFromEnum(Region.twiddles)]);
+    statics.tables[5] = required;
+    staged.image = .{};
+    staged.image.placeDeviceTower(statics.tables);
+    try t.expectEqual(@as(u64, 1024), staged.image.twiddles[5].offset);
+    try t.expectEqual(@as(u64, 1088), staged.image.itwiddles[5].offset);
+    try t.expectEqual(@as(u64, 16), staged.image.itwiddles[5].words);
+    try t.expectEqual(@as(u64, 1152), staged.image.words[@intFromEnum(Region.twiddles)]);
+    try t.expect(!std.mem.eql(u8, &pair_key, &staged.twiddleRegionKey()));
+    try t.expectError(error.OuterTwiddlesAreDeviceResident, statics.table(5));
+    var words: [1152]u32 = undefined;
+    try t.expectError(error.OuterTwiddlesAreDeviceResident, staged.pack(.twiddles, &words));
 }
 
 test "moved proof ownership requires the identical allocator instance" {

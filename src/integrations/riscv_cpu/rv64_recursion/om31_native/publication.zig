@@ -41,13 +41,17 @@ test "recursion publication failure removes pending bytes without replacing rece
     directory.close();
 }
 
+pub fn leafName(buffer: []u8, ordinal: usize, count: usize) ![]const u8 {
+    return if (count == 1) std.fmt.bufPrint(buffer, "leaf-{d:0>6}.proof", .{ordinal}) else if (count == 3) std.fmt.bufPrint(buffer, "service-group-{d:0>6}.proof", .{ordinal}) else error.ServiceGroupMembership;
+}
+
 /// Metadata-only preflight occurs before the strict receiver constructs any
 /// verifier graph. Each later read still requires nonnull bytes, closing races
 /// with deletion without ever permitting a proving fallback.
 pub fn requireExisting(dir: std.fs.Dir, plan: @import("ready_dag.zig").Plan) !void {
     for (plan.nodes[0..plan.count], 0..) |node, id| {
         var buffer: [64]u8 = undefined;
-        const name = if (node.isLeaf()) try std.fmt.bufPrint(&buffer, "leaf-{d:0>6}.proof", .{node.first_leaf}) else try std.fmt.bufPrint(&buffer, "fold-{d:0>6}.proof", .{id});
+        const name = if (node.isLeaf()) try leafName(&buffer, node.first_leaf, node.leaf_count) else try std.fmt.bufPrint(&buffer, "fold-{d:0>6}.proof", .{id});
         try requireFile(dir, name);
     }
     try requireFile(dir, "root.proof");

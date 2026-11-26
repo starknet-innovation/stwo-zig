@@ -10,26 +10,23 @@ struct StwoRv64ManifestRun {
 };
 static_assert(sizeof(StwoRv64ManifestRun)==72, "manifest wire ABI");
 namespace {
-struct Sink {
-  uint32_t *out; uint64_t cap, at=0; bool bad=false;
-  __device__ void byte(uint32_t v) {
-    if (at>=cap) { bad=true; return; }
-    if ((at&3)==0) out[at>>2]=v&255;
-    else out[at>>2]|=(v&255)<<(8*(at&3));
-    ++at;
-  }
-};
+// All lanes walk the same small descriptor. Each field has a disjoint output
+// byte range, so aligned words can be copied in parallel without atomics.
 __global__ void encode(StwoRv64ManifestRun r) {
-  if (blockIdx.x || threadIdx.x) return;
-  r.encoded[0]=0;
-  // The preceding seal owns this verdict. Never erase a seal failure.
-  if (*r.verdict!=0) return;
+  __shared__ uint32_t sealed;
+  if (threadIdx.x == 0) {
+    r.encoded[0] = 0;
+    sealed = *r.verdict;
+  }
+  __syncthreads();
+  if (sealed != 0) return;
   const uint32_t *p=r.program;
   uint32_t detail=0;
   if (p[0]!=0x31574d47u || p[1]!=1 || p[2]!=r.program_words || p[6]!=r.exchange_words ||
       p[7]!=12 || uint64_t(p[8])!=12+4ull*p[3] || uint64_t(p[8])*4+p[5]>r.program_words*4 ||
       p[4]>(64u<<20) || p[4]>(r.encoded_words-1)*4 || p[9] || p[10] || p[11]) detail=2;
-  Sink sink{r.encoded+1,(r.encoded_words-1)*4};
+  uint64_t at = 0;
+  auto *dst = reinterpret_cast<uint8_t *>(r.encoded + 1);
   if (!detail) for (uint32_t i=0; i<p[3] && !detail; ++i) {
     const uint32_t *op=p+12+4ull*i;
     const uint32_t kind=op[0], off=op[1], n=op[2], flag=op[3];
@@ -47,11 +44,26 @@ __global__ void encode(StwoRv64ManifestRun r) {
         bytes=4ull+len;
       }
     }
-    for (uint64_t j=0; j<bytes; ++j) sink.byte(src[(byte_off+j)>>2]>>(8*((byte_off+j)&3)));
-    if (sink.bad || sink.at>p[4]) detail=4;
+    if (bytes > p[4] - at) { detail=4; break; }
+    if (((at | byte_off | bytes) & 3) == 0) {
+      for (uint64_t j = threadIdx.x; j < bytes / 4; j += blockDim.x)
+        r.encoded[1 + at / 4 + j] = src[byte_off / 4 + j];
+    } else {
+      const auto *from = reinterpret_cast<const uint8_t *>(src) + byte_off;
+      for (uint64_t j = threadIdx.x; j < bytes; j += blockDim.x)
+        dst[at + j] = from[j];
+    }
+    at += bytes;
   }
-  if (detail) *r.verdict=r.reject_code|detail;
-  else r.encoded[0]=uint32_t(sink.at);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    if (detail) *r.verdict = r.reject_code | detail;
+    else {
+      // The scalar writer zero-pads its last partial word.
+      for (uint64_t i = at; i % 4 != 0; ++i) dst[i] = 0;
+      r.encoded[0] = uint32_t(at);
+    }
+  }
 }
 }
 extern "C" int stwo_rv64_manifest_encode_v1_on(void *context,uint32_t lane,const StwoRv64ManifestRun *r) {
@@ -61,6 +73,6 @@ extern "C" int stwo_rv64_manifest_encode_v1_on(void *context,uint32_t lane,const
   stwo::cuda::rv64::RangeCustody<4> custody(context,lane);
   if (!custody.range(r->program,r->program_words,false) || !custody.range(r->exchange,r->exchange_words,false) ||
       !custody.range(r->encoded,r->encoded_words,true) || !custody.range(r->verdict,1,true)) return custody.status;
-  encode<<<1,1,0,custody.stream>>>(*r);
+  encode<<<1,256,0,custody.stream>>>(*r);
   return int(cudaPeekAtLastError());
 }

@@ -400,6 +400,13 @@ pub const Pipelined = struct {
         job.record.lane = lane;
         job.record.stamps.device_start = self.now();
         defer job.record.stamps.device_end = self.now();
+        const previous = Outer.Device.child_proof_starts;
+        defer Outer.Device.child_proof_starts = previous;
+        var leaf_start: u32 = undefined;
+        Outer.Device.child_proof_starts = if (job.leaf) |leaf| blk: {
+            leaf_start = leaf.child_proof_start orelse break :blk &.{};
+            break :blk (&leaf_start)[0..1];
+        } else job.fold.?.child_proof_starts[0..job.fold.?.child_proof_count];
         job.proved = try Outer.proveDevice(a, job.ctx(), &job.host.?, job.digest, @intCast(job.id), self.options.lanes[lane].factory);
         job.host.?.deinit(a);
         job.host = null;

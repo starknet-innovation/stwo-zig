@@ -170,9 +170,14 @@ pub fn inputsFromWorker(a: std.mem.Allocator, worker: *const CW.CpuWorker, pendi
 pub fn buildStage1(env: *const Env, in: Inputs, cl: *Class) !void {
     const a = env.a;
     const scope = NG.Scope{ .statement = in.statement, .fixed = in.fixed_root, .main = in.main_root, .ordinal = in.ordinal };
-    const fixed_cols = try a.alloc(DP.Column, cl.fixed_host.len);
+    const fixed_cols = try a.alloc(DP.Column, cl.fixed_shapes.len);
     defer a.free(fixed_cols);
-    for (fixed_cols, cl.fixed_host, cl.fixed_shapes) |*c, h, sh| c.* = .{ .log_size = sh.log_size, .coefficients = @as([*]const M, @ptrCast(h.ptr))[0..h.len] };
+    for (fixed_cols, cl.fixed_shapes, 0..) |*c, shape, i| {
+        c.* = if (cl.fixed_region_key != null) NP.placeholderColumn(shape.log_size) else .{
+            .log_size = shape.log_size,
+            .coefficients = @ptrCast(cl.fixed_host[i]),
+        };
+    }
     // MAIN as device placeholders (the request's MAIN is device-resident).
     const main_cols = try a.alloc(DP.Column, in.main_logs.len);
     defer a.free(main_cols);

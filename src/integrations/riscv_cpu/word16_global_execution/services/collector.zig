@@ -9,6 +9,7 @@ const S = A.crypto.secp256k1.word16_bridge;
 const BM = A.crypto.bulk_memory;
 const Sponge = @import("sponge_collector.zig");
 pub const SpongeShard = Sponge.Shard;
+pub const VariableObservation = Sponge.Observation;
 /// Admitted bulk-memory calls of one CPU proof (chronological) and the RAM
 /// predecessors of every touched data word, concatenated in call order.
 pub const BulkShard = struct {
@@ -62,11 +63,7 @@ pub const Advice = struct {
     /// Emptying the slot before freeing makes later owner cleanup idempotent.
     pub fn retireEvents(self: *const Advice, ordinal: usize) !usize {
         if (ordinal >= self.events.len) return error.InvalidCombinedOrdinal;
-        const events = self.events[ordinal];
-        const bytes = std.mem.sliceAsBytes(events).len;
-        self.events[ordinal] = &.{};
-        self.allocator.free(events);
-        return bytes;
+        return clearEvents(self.allocator, &self.events[ordinal]);
     }
     pub fn deinit(self: *Advice) void {
         const a = self.allocator;
@@ -90,6 +87,14 @@ pub const Advice = struct {
         a.free(self.terminal);
     }
 };
+fn clearEvents(a: std.mem.Allocator, owned_slice: *[]LS.native.Event) usize {
+    const values = owned_slice.*;
+    owned_slice.* = &.{};
+    const bytes = std.mem.sliceAsBytes(values).len;
+    a.free(values);
+    return bytes;
+}
+
 /// Append one packet, then release its tape. A failed append poisons this
 /// builder: discard it rather than retrying a partially updated RAM ledger.
 pub const Builder = struct {
@@ -115,6 +120,11 @@ pub const Builder = struct {
     /// the caller to free if the append fails before taking it. Its contents
     /// are fully overwritten, so outputs are identical to `append`.
     pub fn appendWithEvents(self: *Builder, native: *Native, tape: *const front.rv64.compact_tape.Tape, events: *?[]LS.native.Event) !void {
+        return self.appendObserved(native, tape, events, null);
+    }
+    /// Records payload-free service state from an execution trace. Ordinary
+    /// memory and fixed-size call tapes take the same route as CPU capture.
+    pub fn appendObserved(self: *Builder, native: *Native, tape: *const front.rv64.compact_tape.Tape, events: *?[]LS.native.Event, observed: ?VariableObservation) !void {
         if (self.failed or self.finished) return error.InvalidServiceCollectorPhase;
         errdefer self.failed = true;
         if (self.shards.items.len >= 65535) return error.InvalidCombinedServiceRoster;
@@ -123,7 +133,7 @@ pub const Builder = struct {
         const profiling = profileEnabled();
         first_touch_profile = profiling;
         const start = if (profiling) std.time.Instant.now() catch null else null;
-        const shard = try one(self.allocator, &self.ledger, native, tape, self.shards.items.len, if (profiling) &profile else null, events);
+        const shard = try one(self.allocator, &self.ledger, native, tape, self.shards.items.len, if (profiling) &profile else null, events, observed);
         self.shards.appendAssumeCapacity(shard);
         if (start) |t0| if (std.time.Instant.now()) |t1| profile.report(self.shards.items.len - 1, t1.since(t0), &self.ledger) else |_| {};
     }
@@ -140,6 +150,13 @@ pub const Builder = struct {
         if (self.shards.items.len == 0) return error.InvalidServiceCollectorPhase;
         return self.shards.items[self.shards.items.len - 1];
     }
+    /// The synchronous consumer has copied this shard's load/store records.
+    /// The ordered ledger and service truth inputs retain independent owners.
+    pub fn retireEvents(self: *Builder, ordinal: usize) !usize {
+        if (self.failed or self.finished or ordinal >= self.shards.items.len) return error.InvalidServiceCollectorPhase;
+        return clearEvents(self.allocator, &self.shards.items[ordinal].events);
+    }
+
     /// M8 two-phase ledger, phase 2 (ordered thread): merge a segment built
     /// off this thread by `prepareLocal`, touching only its first-touched
     /// addresses, then patch the placeholder predecessor clocks in its shard.
@@ -412,7 +429,7 @@ fn prefault(bytes: []u8) void {
     while (i < bytes.len) : (i += page) @as(*volatile u8, &bytes[i]).* = 0;
     @as(*volatile u8, &bytes[bytes.len - 1]).* = 0;
 }
-fn one(a: std.mem.Allocator, ledger: *Old.Ledger, native: *Native, tape: *const front.rv64.compact_tape.Tape, index: usize, profile: ?*Profile, prepared: *?[]LS.native.Event) !Shard {
+fn one(a: std.mem.Allocator, ledger: *Old.Ledger, native: *Native, tape: *const front.rv64.compact_tape.Tape, index: usize, profile: ?*Profile, prepared: *?[]LS.native.Event, observed: ?VariableObservation) !Shard {
     const cpu = native.cpu orelse return error.PreparedExecutionConsumed;
     if (cpu.capture_records_retired) return error.MissingPreparedMemoryRecords;
     // v3 is v2 plus SHA-256 and bulk memory; a v2 tape can never carry a v3 record.
@@ -557,7 +574,9 @@ fn one(a: std.mem.Allocator, ledger: *Old.Ledger, native: *Native, tape: *const 
                 rr[ri] = call;
                 ri += 1;
             } else if (v3 and rec.tag == Sponge.TAG) {
-                try sponge.replay(a, ledger, rec.pointer, cpu.epoch, rec.tick, get);
+                if (observed) |capture| try capture.begin(capture.context, rec.tick / stride - 1);
+                try sponge.replay(a, ledger, rec.pointer, cpu.epoch, rec.tick, get, observed);
+                if (observed) |capture| try capture.end(capture.context);
             } else if (v3 and TT.curveOpOfTag(rec.tag) != null) {
                 if (ui >= tape.curve_calls.items.len) return error.InvalidCombinedServiceOwner;
                 const captured = tape.curve_calls.items[ui];
@@ -573,7 +592,9 @@ fn one(a: std.mem.Allocator, ledger: *Old.Ledger, native: *Native, tape: *const 
                 curve_next[k] += 1;
                 ui += 1;
             } else if (v3 and isBulkTag(rec.tag)) {
-                try bulkCall(a, ledger, rec.pointer, rec.tag, cpu.epoch, rec.tick, &bulk_calls, &bulk_words);
+                if (observed) |capture| try capture.begin(capture.context, rec.tick / stride - 1);
+                try bulkCall(a, ledger, rec.pointer, rec.tag, cpu.epoch, rec.tick, &bulk_calls, &bulk_words, observed);
+                if (observed) |capture| try capture.end(capture.context);
             } else return error.UnqualifiedCombinedServiceTag;
             ci += 1;
         }
@@ -607,10 +628,10 @@ fn isBulkTag(tag: u64) bool {
 /// all) and writes the result -1/0/1 to packet word 3. Values come only from
 /// the ledger; BM.types.validateCall rejects aliasing, misalignment, bad
 /// lengths, missing rights and a wrong result before any ledger update.
-fn bulkCall(a: std.mem.Allocator, ledger: *Old.Ledger, pointer: u64, tag: u64, epoch: u16, tick: u24, calls: *std.ArrayList(BM.types.Call), words: *std.ArrayList(BM.types.Word)) !void {
+fn bulkCall(a: std.mem.Allocator, ledger: *Old.Ledger, pointer: u64, tag: u64, epoch: u16, tick: u24, calls: *std.ArrayList(BM.types.Call), words: *std.ArrayList(BM.types.Word), observed: ?VariableObservation) !void {
     if (tag == BM.types.JUMPDEST_TAG) {
         if (pointer & 7 != 0 or pointer > std.math.maxInt(u64) - 23) return error.InvalidCombinedServiceOwner;
-        return jumpdestCall(a, ledger, pointer, epoch, tick, calls, words);
+        return jumpdestCall(a, ledger, pointer, epoch, tick, calls, words, observed);
     }
     const op: BM.types.Op = switch (tag) {
         BM.types.MEMCPY_TAG => .copy,
@@ -656,22 +677,21 @@ fn bulkCall(a: std.mem.Allocator, ledger: *Old.Ledger, pointer: u64, tag: u64, e
     try BM.types.validateCall(call, body);
     for (0..packet_words) |k| {
         const value: u64 = if (k == 3) @bitCast(@as(i64, call.result)) else call.packet[k].value;
-        ledger.states.getPtr(pointer + 8 * k).?.* = .{ .value = value, .epoch = epoch, .tick = tick, .rights = call.packet[k].rights };
+        try bulkWord(ledger, observed, pointer + 8 * k, call.packet[k], epoch, tick, k == 3, value);
     }
     for (body, 0..) |w, j| {
-        const at = BM.types.State{ .value = 0, .epoch = epoch, .tick = tick, .rights = 0 };
         switch (op) {
-            .set => ledger.states.getPtr(call.dst + 8 * j).?.* = withValue(at, @as(u64, call.fill()) * 0x0101010101010101, w.dst.rights),
+            .set => try bulkWord(ledger, observed, call.dst + 8 * j, w.dst, epoch, tick, true, @as(u64, call.fill()) * 0x0101010101010101),
             .copy => if (call.shift() == 0) {
-                ledger.states.getPtr(call.word1 + 8 * j).?.* = withValue(at, w.src.value, w.src.rights);
-                ledger.states.getPtr(call.dst + 8 * j).?.* = withValue(at, w.src.value, w.dst.rights);
+                try bulkWord(ledger, observed, call.word1 + 8 * j, w.src, epoch, tick, false, w.src.value);
+                try bulkWord(ledger, observed, call.dst + 8 * j, w.dst, epoch, tick, true, w.src.value);
             } else {
-                ledger.states.getPtr(base + 8 * j).?.* = withValue(at, w.src.value, w.src.rights);
-                if (j != 0) ledger.states.getPtr(call.dst + 8 * (j - 1)).?.* = withValue(at, BM.types.shifted(body[j - 1].src.value, w.src.value, call.shift()), w.dst.rights);
+                try bulkWord(ledger, observed, base + 8 * j, w.src, epoch, tick, false, w.src.value);
+                if (j != 0) try bulkWord(ledger, observed, call.dst + 8 * (j - 1), w.dst, epoch, tick, true, BM.types.shifted(body[j - 1].src.value, w.src.value, call.shift()));
             },
             .cmp => {
-                ledger.states.getPtr(call.dst + 8 * j).?.* = withValue(at, w.dst.value, w.dst.rights);
-                ledger.states.getPtr(call.word1 + 8 * j).?.* = withValue(at, w.src.value, w.src.rights);
+                try bulkWord(ledger, observed, call.dst + 8 * j, w.dst, epoch, tick, false, w.dst.value);
+                try bulkWord(ledger, observed, call.word1 + 8 * j, w.src, epoch, tick, false, w.src.value);
             },
             .jumpdest => unreachable,
         }
@@ -682,7 +702,7 @@ fn bulkCall(a: std.mem.Allocator, ledger: *Old.Ledger, pointer: u64, tag: u64, e
 /// bitmap`; the code words are read and the bitmap words written with the
 /// canonical analysis of the ledger's code values. Entries: code word
 /// predecessors (`src`), then bitmap word predecessors (`dst`).
-fn jumpdestCall(a: std.mem.Allocator, ledger: *Old.Ledger, pointer: u64, epoch: u16, tick: u24, calls: *std.ArrayList(BM.types.Call), words: *std.ArrayList(BM.types.Word)) !void {
+fn jumpdestCall(a: std.mem.Allocator, ledger: *Old.Ledger, pointer: u64, epoch: u16, tick: u24, calls: *std.ArrayList(BM.types.Call), words: *std.ArrayList(BM.types.Word), observed: ?VariableObservation) !void {
     var call = BM.types.Call{ .op = .jumpdest, .pointer = pointer, .epoch = epoch, .tick = tick, .dst = undefined, .word1 = undefined, .len = undefined, .packet = @splat(.{ .value = 0, .rights = 0 }) };
     for (0..3) |k| call.packet[k] = try get(ledger, pointer + 8 * k);
     call.dst = call.packet[0].value;
@@ -698,21 +718,24 @@ fn jumpdestCall(a: std.mem.Allocator, ledger: *Old.Ledger, pointer: u64, epoch: 
     for (0..n) |j| words.appendAssumeCapacity(.{ .dst = .{ .value = 0, .rights = 0 }, .src = try get(ledger, call.dst +% 8 * j) });
     for (0..rows) |r| words.appendAssumeCapacity(.{ .dst = try get(ledger, call.word1 +% 8 * r) });
     try BM.types.validateCall(call, words.items[start..]);
-    const code = try a.alloc(u64, n);
-    defer a.free(code);
-    for (code, words.items[start..][0..n]) |*v, w| v.* = w.src.value;
-    const pending = try a.alloc(u8, rows);
-    defer a.free(pending);
-    const bitmap = try a.alloc(u64, rows);
+    const bitmap = try a.alloc(u64, if (observed == null) rows else 0);
     defer a.free(bitmap);
-    BM.types.analyzeWords(code, pending, bitmap);
-    for (0..3) |k| ledger.states.getPtr(pointer + 8 * k).?.* = .{ .value = call.packet[k].value, .epoch = epoch, .tick = tick, .rights = call.packet[k].rights };
-    for (words.items[start..][0..n], 0..) |w, j| ledger.states.getPtr(call.dst + 8 * j).?.* = .{ .value = w.src.value, .epoch = epoch, .tick = tick, .rights = w.src.rights };
-    for (words.items[start + n ..][0..rows], 0..) |w, r| ledger.states.getPtr(call.word1 + 8 * r).?.* = .{ .value = bitmap[r], .epoch = epoch, .tick = tick, .rights = w.dst.rights };
+    if (observed == null) {
+        const code = try a.alloc(u64, n);
+        defer a.free(code);
+        for (code, words.items[start..][0..n]) |*v, w| v.* = w.src.value;
+        const pending = try a.alloc(u8, rows);
+        defer a.free(pending);
+        BM.types.analyzeWords(code, pending, bitmap);
+    }
+    for (0..3) |k| try bulkWord(ledger, observed, pointer + 8 * k, call.packet[k], epoch, tick, false, call.packet[k].value);
+    for (words.items[start..][0..n], 0..) |w, j| try bulkWord(ledger, observed, call.dst + 8 * j, w.src, epoch, tick, false, w.src.value);
+    for (words.items[start + n ..][0..rows], 0..) |w, r| try bulkWord(ledger, observed, call.word1 + 8 * r, w.dst, epoch, tick, true, if (observed == null) bitmap[r] else null);
     calls.appendAssumeCapacity(call);
 }
-fn withValue(clock: BM.types.State, value: u64, rights: u2) BM.types.State {
-    return .{ .value = value, .epoch = clock.epoch, .tick = clock.tick, .rights = rights };
+fn bulkWord(ledger: *Old.Ledger, observed: ?VariableObservation, address: u64, before: BM.types.State, epoch: u16, tick: u24, write: bool, expected: ?u64) !void {
+    const value = if (observed) |capture| try capture.after(address, before.value, write, expected) else expected.?;
+    ledger.states.getPtr(address).?.* = .{ .value = value, .epoch = epoch, .tick = tick, .rights = before.rights };
 }
 fn owner(pointer: u64, tick: u24, stride: u32, tape: *const front.rv64.compact_tape.Tape, captured_pointer: u64, clock: u64) !void {
     if (pointer != captured_pointer or clock <= tape.initial_clock or clock - tape.initial_clock > tape.len or stride * (clock - tape.initial_clock) != tick) return error.InvalidCombinedServiceOwner;
@@ -794,52 +817,10 @@ pub fn prepareLocal(a: std.mem.Allocator, image: @import("../../word16_execution
         local_phase = false;
         local_start = null;
     }
-    const shard = try one(a, &ledger, native, tape, index, null, prepared);
+    const shard = try one(a, &ledger, native, tape, index, null, prepared, null);
     return .{ .index = index, .ledger = ledger, .shard = shard };
 }
 /// The little-endian u64 at `address` in a checkpoint image (absent pages
 /// read as zero, as an unallocated guest page does).
 const startWord = @import("collector_clock_patch.zig").startWord;
 const patchShard = @import("collector_clock_patch.zig").patchShard;
-
-test "M8 two-phase ledger: placeholder clocks patch every State field and nothing else" {
-    const a = std.testing.allocator;
-    const St = A.memory.closed_ram.types.State;
-    const global = [_]St{ .{ .value = 7, .epoch = 3, .tick = 40, .rights = 3 }, .{ .value = 9, .rights = 1 } };
-    const events = try a.alloc(LS.native.Event, 2);
-    events[0] = .{ .opcode = .LD, .immediate = 0, .a = 8, .epoch = 5, .tick = 4, .before = .{ .value = 7, .tick = 1, .rights = 3 }, .after = .{ .value = 7, .epoch = 5, .tick = 4, .rights = 3 } };
-    events[1] = .{ .opcode = .LD, .immediate = 0, .a = 8, .epoch = 5, .tick = 8, .before = events[0].after, .after = .{ .value = 7, .epoch = 5, .tick = 8, .rights = 3 } };
-    const keccak = try a.alloc(K.types.Call, 1);
-    keccak[0] = .{ .pointer = 0, .epoch = 5, .tick = 12, .before = @splat(0), .after = @splat(0), .predecessors = @splat(.{ .value = 9, .tick = 2, .rights = 1 }) };
-    keccak[0].predecessors[3] = .{ .value = 0, .rights = 0 };
-    const words = try a.alloc(BM.types.Word, 1);
-    words[0] = .{ .dst = .{ .value = 9, .tick = 2, .rights = 1 } };
-    const sponge_words = try a.alloc(St, 1);
-    sponge_words[0] = .{ .value = 7, .tick = 1, .rights = 3 };
-    var shard = Shard{ .events = events, .keccak = keccak, .secp = .{ try a.alloc(S.types.Call, 0), try a.alloc(S.types.Call, 0) }, .sha256 = try a.alloc(S.types.Call, 0), .arith256_mod = try a.alloc(S.types.Call, 0), .curves = undefined, .bulk = .{ .calls = try a.alloc(BM.types.Call, 0), .words = words }, .sponge = .{ .calls = try a.alloc(A.crypto.keccak_sponge.types.Call, 0), .words = sponge_words, .inputs = try a.alloc([25]u64, 0) } };
-    for (&shard.curves) |*c| c.* = try a.alloc(S.types.Call, 0);
-    defer shard.deinit(a);
-    patchShard(&shard, &global);
-    try std.testing.expectEqualDeep(St{ .value = 7, .epoch = 3, .tick = 40, .rights = 3 }, shard.events[0].before);
-    try std.testing.expectEqualDeep(St{ .value = 7, .epoch = 5, .tick = 4, .rights = 3 }, shard.events[1].before);
-    try std.testing.expectEqualDeep(St{ .value = 7, .epoch = 5, .tick = 8, .rights = 3 }, shard.events[1].after);
-    try std.testing.expectEqualDeep(St{ .value = 9, .epoch = 0, .tick = 0, .rights = 1 }, shard.keccak[0].predecessors[0]);
-    try std.testing.expectEqualDeep(St{ .value = 0, .rights = 0 }, shard.keccak[0].predecessors[3]);
-    try std.testing.expectEqualDeep(St{ .value = 9, .rights = 1 }, shard.bulk.words[0].dst);
-    try std.testing.expectEqualDeep(St{ .value = 0, .rights = 0 }, shard.bulk.words[0].src);
-    try std.testing.expectEqualDeep(St{ .value = 7, .epoch = 3, .tick = 40, .rights = 3 }, shard.sponge.words[0]);
-}
-test "M8 two-phase ledger: starting-image words, page-crossing and absent pages" {
-    const P: usize = front.rv64.memory.PAGE_SIZE;
-    var page0: [front.rv64.memory.PAGE_SIZE]u8 = @splat(0);
-    var page1: [front.rv64.memory.PAGE_SIZE]u8 = @splat(0);
-    std.mem.writeInt(u64, page0[16..24], 0x1122334455667788, .little);
-    page0[P - 2] = 0xaa;
-    page0[P - 1] = 0xbb;
-    page1[0] = 0xcc;
-    const entries = [_]front.rv64.checkpoint.Entry{ .{ .index = 4, .page = &page0 }, .{ .index = 5, .page = &page1 } };
-    const cp = Checkpoint{ .cpu = undefined, .counters = .{}, .pages = &entries, .written = &.{} };
-    try std.testing.expectEqual(@as(u64, 0x1122334455667788), startWord(&cp, 4 * P + 16));
-    try std.testing.expectEqual(@as(u64, 0xccbbaa), startWord(&cp, 5 * P - 2));
-    try std.testing.expectEqual(@as(u64, 0), startWord(&cp, 9 * P + 8));
-}

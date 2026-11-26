@@ -113,46 +113,7 @@ pub fn blake2sU32sFrom(
     n_bytes: usize,
 ) Error!HashValue(Var) {
     std.debug.assert(message.len >= std.math.divCeil(usize, n_bytes, 4) catch unreachable);
-    const n_blocks = @max(1, std.math.divCeil(usize, n_bytes, block_bytes) catch unreachable);
-    const total_words = n_blocks * words_per_block;
-
-    const zero_word = try wrappers.constU32(V, ctx, 0);
-    const padded = try ctx.scratch().alloc(U32Wrapper(Var), @max(total_words, message.len));
-    @memcpy(padded[0..message.len], message);
-    @memset(padded[message.len..], zero_word);
-
-    var h: [8]U32Wrapper(Var) = undefined;
-    for (&h, h_init) |*word, value| word.* = try wrappers.constU32(V, ctx, value);
-
-    for (0..n_blocks) |block_idx| {
-        const block = padded[block_idx * words_per_block ..][0..words_per_block];
-        const absorbed: u32 = @intCast(@min(n_bytes, (block_idx + 1) * block_bytes));
-        const t0: u32 = bytes_before +% absorbed;
-        const last = block_idx == n_blocks - 1;
-
-        var v: [16]U32Wrapper(Var) = undefined;
-        @memcpy(v[0..8], &h);
-        for (8..16) |i| {
-            var iv = blake.blake2s_iv[i - 8];
-            if (i == 12) iv ^= t0;
-            // `t1` is always 0, so word 13 is the plain IV.
-            if (i == 14 and last) iv ^= 0xFFFF_FFFF;
-            v[i] = try wrappers.constU32(V, ctx, iv);
-        }
-
-        for (BLAKE_SIGMA) |permutation| {
-            for (g_state_indices, 0..) |indices, g| {
-                const out = try blake.blakeGGate(V, ctx, v[indices[0]], v[indices[1]], v[indices[2]], v[indices[3]], block[permutation[2 * g]], block[permutation[2 * g + 1]]);
-                for (indices, out) |index, word| v[index] = word;
-            }
-        }
-
-        const prev_h = h;
-        for (&h, 0..) |*word, i| word.* = try blake.tripleXor(V, ctx, prev_h[i], v[i], v[i + 8]);
-    }
-
-    ctx.stats.blake_updates += n_blocks;
-    return .{ .words = h };
+    return blake.blake2sU32sFrom(V, ctx, h_init, bytes_before, message, n_bytes);
 }
 
 /// Blake2s of `prefix || bytes` on the host, for tests and conversions.

@@ -82,9 +82,9 @@ pub const VerifierKey = struct {
     max_evaluation_log_size: u32,
     fixed_root: [32]u8,
     identity: [32]u8,
+    mixed_plan_hash: ?u64,
 
     pub fn fromAuthority(key: *const Prove.Authority) !VerifierKey {
-        if (key.pp.mixed_arithmetic) return error.MixedArithmeticPortableKeyUnsupported;
         var out: VerifierKey = undefined;
         for (key.layout.entries, 0..) |entry, i| {
             out.column[i] = try columnIndex(entry.id);
@@ -97,6 +97,7 @@ pub const VerifierKey = struct {
         out.max_evaluation_log_size = @intCast(key.bound.max_evaluation_log_size);
         out.fixed_root = key.fixedRoot();
         out.identity = key.identity;
+        out.mixed_plan_hash = if (key.pp.mixed_arithmetic) key.bound.plan_hash else null;
         return out;
     }
     pub fn layout(self: *const VerifierKey) PPMod.ColumnLayout {
@@ -108,8 +109,10 @@ pub const VerifierKey = struct {
     /// the layout and root; a key whose recorded fields disagree is refused.
     pub fn authority(self: *const VerifierKey, a: std.mem.Allocator, stub: *PPMod.PreprocessedCircuit) !Prove.Authority {
         stub.* = stubOf(self.n_outputs);
+        stub.mixed_arithmetic = self.mixed_plan_hash != null;
         var key = try Prove.Authority.initVerifier(a, stub, self.layout(), self.fixed_root);
         errdefer key.deinit();
+        if (self.mixed_plan_hash) |plan| if (key.bound.plan_hash != plan) return error.VkTableBoundMismatch;
         if (!std.mem.eql(u8, &key.identity, &self.identity)) return error.VkTableIdentityMismatch;
         if (!std.mem.eql(u32, &key.logs.toArray(), &self.logs)) return error.VkTableLogsMismatch;
         if (key.bound.total_constraints != self.total_constraints or key.bound.max_evaluation_log_size != self.max_evaluation_log_size) return error.VkTableBoundMismatch;
@@ -180,6 +183,7 @@ pub fn foldClassKeyKForFamily(children: []const *const VerifierKey, hybrid: bool
     h.update(&bytes);
     if (hybrid) h.update(&@import("../outer_gkr/child_verifier.zig").CODE_ID);
     for (children) |key| {
+        if (key.mixed_plan_hash) |plan| Bridge.mixArithmeticClass(&h, plan);
         if (hybrid) {
             const a = std.heap.page_allocator;
             var stub: PPMod.PreprocessedCircuit = undefined;
@@ -315,6 +319,7 @@ pub const KeyJson = struct {
     max_evaluation_log_size: u32,
     fixed_root: []const u8,
     identity: []const u8,
+    mixed_plan_hash: ?u64 = null,
 };
 pub const EntryJson = struct { kind: []const u8, key: []const u8, label: []const u8 = "", vk: KeyJson };
 /// One receiver-derived native setup component: the VK-only setup artifact
@@ -424,6 +429,11 @@ pub const Table = struct {
             for ([_]u32{ entry.vk.n_outputs, entry.vk.total_constraints, entry.vk.max_evaluation_log_size }) |v| updateU32(&h, v);
             h.update(&entry.vk.fixed_root);
             h.update(&entry.vk.identity);
+            if (entry.vk.mixed_plan_hash) |plan| {
+                h.update("mixed-arithmetic\x00");
+                updateU32(&h, @truncate(plan));
+                updateU32(&h, @truncate(plan >> 32));
+            }
         }
         h.update("native\x00");
         var count: [8]u8 = undefined;
@@ -452,12 +462,12 @@ pub const Table = struct {
                 columns[2 * i] = hex[c >> 4];
                 columns[2 * i + 1] = hex[c & 15];
             }
-            out.* = .{ .kind = @tagName(entry.kind), .key = try hexAlloc(t, &entry.key), .label = entry.label, .vk = .{ .columns = columns, .log_sizes = &entry.vk.log_size, .logs = &entry.vk.logs, .n_outputs = entry.vk.n_outputs, .total_constraints = entry.vk.total_constraints, .max_evaluation_log_size = entry.vk.max_evaluation_log_size, .fixed_root = try hexAlloc(t, &entry.vk.fixed_root), .identity = try hexAlloc(t, &entry.vk.identity) } };
+            out.* = .{ .kind = @tagName(entry.kind), .key = try hexAlloc(t, &entry.key), .label = entry.label, .vk = .{ .columns = columns, .log_sizes = &entry.vk.log_size, .logs = &entry.vk.logs, .n_outputs = entry.vk.n_outputs, .total_constraints = entry.vk.total_constraints, .max_evaluation_log_size = entry.vk.max_evaluation_log_size, .fixed_root = try hexAlloc(t, &entry.vk.fixed_root), .identity = try hexAlloc(t, &entry.vk.identity), .mixed_plan_hash = entry.vk.mixed_plan_hash } };
         }
         const native = try t.alloc(NativeJson, self.native.items.len);
         for (native, self.native.items) |*out, entry| out.* = .{ .key = try hexAlloc(t, &entry.key), .artifact = try hexAlloc(t, entry.artifact) };
         const table_root = self.root();
-        return std.json.Stringify.valueAlloc(a, TableJson{ .header = self.header, .entries = entries, .native = native, .table_root = try hexAlloc(t, &table_root), .derive_ns = self.derive_ns, .derived_from = self.derived_from.items }, .{ .whitespace = .indent_1 });
+        return std.json.Stringify.valueAlloc(a, TableJson{ .header = self.header, .entries = entries, .native = native, .table_root = try hexAlloc(t, &table_root), .derive_ns = self.derive_ns, .derived_from = self.derived_from.items }, .{ .whitespace = .indent_1, .emit_null_optional_fields = false });
     }
     pub fn fromJson(a: std.mem.Allocator, bytes: []const u8) !Table {
         const parsed = try std.json.parseFromSlice(TableJson, a, bytes, .{});
@@ -482,6 +492,7 @@ pub const Table = struct {
             vk.max_evaluation_log_size = e.vk.max_evaluation_log_size;
             try hex32(&vk.fixed_root, e.vk.fixed_root);
             try hex32(&vk.identity, e.vk.identity);
+            vk.mixed_plan_hash = e.vk.mixed_plan_hash;
             var key: [32]u8 = undefined;
             try hex32(&key, e.key);
             if (!try self.put(kind, key, vk, e.label)) return error.DuplicateVkTableEntry;

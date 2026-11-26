@@ -13,7 +13,7 @@ const Wire = @import("../wire.zig");
 const Manifest = @import("manifest.zig");
 const Canon = @import("../native_schema/canonical.zig");
 const Rungs = @import("../native_schema/rungs.zig");
-const FixedSet = @import("fixed_authority_set.zig").Set;
+const FixedSets = @import("fixed_authority_set.zig");
 const W = @import("worker_protocol.zig");
 const Config = @import("stwo_core").pcs.ForField(@import("stwo_core").fields.om31.OM31).PcsConfig;
 
@@ -103,8 +103,12 @@ fn vk(family: Canon.Family, rung: u32, structure: [32]u8, fixed_root: [32]u8, bi
     }
     return (Canon.NativeVk{ .family = @intFromEnum(family), .rung = rung, .suite = zero, .fixed_identity = fixed_identity, .fixed_root = fixed_root, .profile_identity = profile_identity, .structure = structure }).hash();
 }
-pub fn assign(setups: []const *const R.CpuSetup, truths: []const R.Truth, requests: []const P.Request, first_ids: []const [T.FAMILIES]u32, workers: []Manifest.ExpectedWorker, config: Config, fixed: ?*const FixedSet) !void {
+pub fn assign(setups: []const *const R.CpuSetup, truths: []const R.Truth, requests: []const P.Request, first_ids: []const [T.FAMILIES]u32, workers: []Manifest.ExpectedWorker, config: Config, fixed: ?*const FixedSets.Set) !void {
     _ = config;
+    return assignHeaders(setups, truths, requests, first_ids, workers, if (fixed) |set| .{ .receiver = set } else null);
+}
+
+pub fn assignHeaders(setups: []const *const R.CpuSetup, truths: []const R.Truth, requests: []const P.Request, first_ids: []const [T.FAMILIES]u32, workers: []Manifest.ExpectedWorker, fixed: ?FixedSets.Headers) !void {
     const v = try version();
     const strict = v.strictRoster();
     if (strict and fixed == null) return error.NativeChainFixedAuthorityMissing;

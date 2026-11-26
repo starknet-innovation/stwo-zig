@@ -67,13 +67,9 @@ const Manifest = struct {
     immutable_device_bytes: u64 = 512 << 20,
 };
 
-fn env(name: []const u8) ?[]const u8 {
-    return std.posix.getenv(name);
-}
-fn envBytes(name: []const u8, default: usize) !usize {
-    const text = env(name) orelse return default;
-    return std.fmt.parseUnsigned(usize, text, 10) catch error.InvalidParityEnvironment;
-}
+const Harness = @import("rv64/parity/native_common.zig");
+const env = Harness.env;
+const envBytes = Harness.envBytes;
 fn rootWords(root: [32]u8) [8]u32 {
     var w: [8]u32 = undefined;
     for (&w, 0..) |*x, i| x.* = std.mem.readInt(u32, root[4 * i ..][0..4], .little);
@@ -200,24 +196,7 @@ const Digest = struct {
 // Post-hoc TruthJob runs
 // ---------------------------------------------------------------------------
 
-const Done = struct {
-    done: bool = false,
-    result: anyerror!void = {},
-    receipt: api.Receipt = .{},
-    fn call(raw: *anyopaque, c: api.Completion) void {
-        const d: *@This() = @ptrCast(@alignCast(raw));
-        d.receipt = c.receipt;
-        d.result = c.result;
-        @atomicStore(bool, &d.done, true, .release);
-    }
-};
-fn run(worker: *W.Worker, job: api.Job) !api.Receipt {
-    var done = Done{};
-    try worker.submit(job, .{ .ctx = &done, .done = Done.call });
-    while (!@atomicLoad(bool, &done.done, .acquire)) std.Thread.sleep(50 * std.time.ns_per_us);
-    try done.result;
-    return done.receipt;
-}
+const run = Harness.run;
 
 const Row = struct {
     ordinal: u32,
@@ -297,7 +276,7 @@ fn feltOf(w: []const u32) !O {
 fn resolveSeed(rec: *const Record, class: *const K.Class) !?struct { seed: [9]u32, binding: bool } {
     const local = rec.local orelse return null;
     const fixed = rec.fixed orelse return null;
-    const binding = K.Binding{ .identity = try K.fixedIdentity(fixed.columns, rec.config.fri_config.log_blowup_factor), .root = fixed.root, .profile = WP.candidateProfile(rec.config) };
+    const binding = K.Binding{ .identity = try K.fixedIdentityFor(rec.config, fixed.root, fixed.columns), .root = fixed.root, .profile = WP.candidateProfile(rec.config) };
     for ([_]?K.Binding{ null, binding }) |candidate| {
         const seed = K.seed(rec.config, rec.expected, candidate);
         var ch = WP.Channel.init();

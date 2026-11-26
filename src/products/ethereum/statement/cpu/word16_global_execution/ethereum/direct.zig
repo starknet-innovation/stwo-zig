@@ -87,7 +87,9 @@ pub const Stats = struct {
 pub const MAX_READY_TIMES = 32;
 /// Records each segment's ready instant into `Stats`, then forwards to the
 /// caller's hook (if any). Runs on the ordered owner's thread; report-only.
+const PackPool = @import("stwo_prover_engine").work_pool;
 const ReadyTap = struct {
+    pool: ?*PackPool.WorkPool,
     stats: *Stats,
     inner: ?Capture.Ready,
     fn terminalReady(raw: *anyopaque, cells: []const @import("ethereum_frontend_component").rv64_air.memory.closed_ram.types.Cell) void {
@@ -96,7 +98,11 @@ const ReadyTap = struct {
     }
     fn nativeSegment(raw: *anyopaque, index: usize, native: *const Native, shard: @import("stwo_riscv_cpu_integration").rv64_services_collector.Shard, at_ns: u64) void {
         const self: *ReadyTap = @ptrCast(@alignCast(raw));
-        if (self.inner) |hook| if (hook.native_segment) |invoke| invoke(hook.context, index, native, shard, at_ns);
+        if (self.inner) |hook| if (hook.native_segment) |invoke| {
+            var binding = if (self.pool) |pool| PackPool.ScopedPoolBinding.initIfNeeded(pool) catch null else null;
+            defer if (binding) |*scope| scope.deinit();
+            invoke(hook.context, index, native, shard, at_ns);
+        };
     }
     fn call(context: *anyopaque, index: usize, native: *const Native, events: []const @import("ethereum_frontend_component").rv64_air.memory.load_store_v2.native.Event, at_ns: u64) void {
         const self: *ReadyTap = @ptrCast(@alignCast(context));
@@ -404,7 +410,7 @@ pub const Started = struct {
             self.boot_ns = t.read();
         };
         const a = self.allocator;
-        const walk = try Walk.createWithOptions(a, self.walk_config, .{ .poseidon_initial_cache = false, .authority_provider = self.authority_provider });
+        const walk = try Walk.createForSource(a, self.walk_config, .{ .poseidon_initial_cache = false, .authority_provider = self.authority_provider }, self.segment_workers);
         errdefer walk.destroy();
         var source = try Segments.Source.init(a, walk, self.segment_workers);
         errdefer source.deinit();
@@ -495,7 +501,7 @@ fn run(a: std.mem.Allocator, image: *const Image.Owner, program: *const Program,
     // Queue cleanup below joins all readiness publishers first. Then cancel
     // their asynchronous readers BEFORE ordered.deinit frees captured values.
     errdefer if (ready) |hook| if (hook.cancel) |cancel| cancel(hook.context);
-    var tap = ReadyTap{ .stats = stats, .inner = ready };
+    var tap = ReadyTap{ .stats = stats, .inner = ready, .pool = if (ready != null and ready.?.seal_native) PackPool.currentScopedPool() else null };
     ordered.on_ready = .{ .context = &tap, .call = ReadyTap.call, .native_segment = ReadyTap.nativeSegment, .terminal_ready = ReadyTap.terminalReady, .seal_native = if (ready) |hook| hook.seal_native else false };
     var queue = Queue{};
     var consumer = Consumer{ .queue = &queue, .ordered = &ordered };

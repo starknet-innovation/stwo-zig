@@ -11,18 +11,37 @@
 #include "rv64/secp_witness.h"
 #endif
 static void exercise(const std::string&dir,uint32_t id){
- FixtureWords f(dir+"/case-"+std::to_string(id)+".bin");auto h=f.take(8);if(h[0]!=0x52565357||h[1]!=1||h[2]!=id||h[3]!=8||h[7]>4)throw std::runtime_error("secp fixture shape");
+ FixtureWords f(dir+"/case-"+std::to_string(id)+".bin");auto h=f.take(8);if(h[0]!=0x52565357||h[1]!=1||h[2]!=id||h[3]!=8)throw std::runtime_error("secp fixture shape");
  uint64_t n=1ull<<h[3];
 #ifdef STWO_RV64_CURVE_WITNESS
- const uint32_t packet_words[5]={32,16,32,48,40};uint64_t count=uint64_t(h[4])*packet_words[h[7]];
+ constexpr uint32_t packet_words[] = {32, 16, 32, 48, 40, 48, 24};
+ if (h[7] >= sizeof(packet_words) / sizeof(packet_words[0]))
+   throw std::runtime_error("curve fixture kind");
+ const uint64_t count = uint64_t(h[4]) * packet_words[h[7]];
 #else
- uint64_t count=uint64_t(h[4])*(h[7]?24:48);
+ if (h[7] > 1) throw std::runtime_error("secp fixture kind");
+ const uint64_t count = uint64_t(h[4]) * (h[7] ? 24 : 48);
 #endif
 auto inputs=f.take(count),expected=f.take(n*h[6]),counts=f.take(256);if(f.position!=f.data.size())throw std::runtime_error("secp trailing");
  Owner o(0);auto source=o.plane(std::max(uint64_t(1),count),1),main=o.plane(n,h[6]),hist=o.plane(256,1),status=o.plane(1,1);if(count)o.upload(source,inputs);o.upload(status,{0});CHECK(stwo_exec_context_sync(o.ctx));
  StwoRv64SecpWitness j{source.words,main.words,hist.words,status.words,count,n*h[6],h[4],h[5],h[3],h[7]};CHECK(stwo_rv64_secp_witness_on(o.ctx,1,&j));CHECK(stwo_exec_context_sync(o.ctx));if(o.read(status)[0])throw std::runtime_error("secp status "+std::to_string(o.read(status)[0]));fixture_equal("secp wholeMAIN",o.read(main),expected);fixture_equal("secp BYTE",o.read(hist),counts);
 #ifdef STWO_RV64_CURVE_WITNESS
- if(h[4] && (h[7]==0||h[7]==1||h[7]==4)){auto invalid=inputs;if(h[7]==0)std::copy_n(invalid.begin(),8,invalid.begin()+16);else if(h[7]==1)std::fill_n(invalid.begin()+8,8,0);else invalid[24]&=~1u;o.upload(source,invalid);o.upload(status,{0});CHECK(stwo_exec_context_sync(o.ctx));CHECK(stwo_rv64_secp_witness_on(o.ctx,1,&j));CHECK(stwo_exec_context_sync(o.ctx));if(!o.read(status)[0])throw std::runtime_error("curve domain accepted");}
+ if (h[4] && h[7] != 2 && h[7] != 3) {
+   auto invalid = inputs;
+   const uint32_t field_words = h[7] < 4 ? 8 : 12;
+   if (h[7] == 0 || h[7] == 5)
+     std::copy_n(invalid.begin(), field_words, invalid.begin() + 2 * field_words);
+   else if (h[7] == 1 || h[7] == 6)
+     std::fill_n(invalid.begin() + field_words, field_words, 0);
+   else
+     invalid[24] &= ~1u;
+   o.upload(source, invalid);
+   o.upload(status, {0});
+   CHECK(stwo_exec_context_sync(o.ctx));
+   CHECK(stwo_rv64_secp_witness_on(o.ctx, 1, &j));
+   CHECK(stwo_exec_context_sync(o.ctx));
+   if (!o.read(status)[0]) throw std::runtime_error("curve domain accepted");
+ }
 #endif
 auto bad=j;bad.kind=99;if(!stwo_rv64_secp_witness_on(o.ctx,1,&bad))throw std::runtime_error("secp kind accepted");bad=j;bad.calls=1u<<j.log;if(!stwo_rv64_secp_witness_on(o.ctx,1,&bad))throw std::runtime_error("secp absent padding accepted");bad=j;bad.main=source.words;if(!stwo_rv64_secp_witness_on(o.ctx,1,&bad))throw std::runtime_error("secp source alias accepted");bad=j;bad.input_words++;if(!stwo_rv64_secp_witness_on(o.ctx,1,&bad))throw std::runtime_error("secp input width accepted");bad=j;bad.first_id=0;if(!stwo_rv64_secp_witness_on(o.ctx,1,&bad))throw std::runtime_error("secp zero first id accepted");std::printf("SECP_WITNESS case=%u calls=%u kind=%u native_main_and_histogram_parity=true\n",id,h[4],h[7]);o.close();}
 #elif defined(STWO_RV64_KECCAK_WITNESS)
@@ -94,6 +113,29 @@ static void exercise(const std::string &directory, uint32_t id) {
   fixture_equal("CPU ROM multiplicities", o.read(counts_rom), cr);
   fixture_equal("CPU U8-pair multiplicities", o.read(pairs), cp);
   if (o.read(status)[0]) throw std::runtime_error("valid CPU metadata rejected");
+  // Skipping the unused byte histogram must keep the authenticated data
+  // identical, including the padding multiplicities in the pair ledger.
+  if (id == 1) {
+    o.upload(counts16, std::vector<uint32_t>(65536));
+    o.upload(counts_rom, std::vector<uint32_t>(32));
+    o.upload(pairs, std::vector<uint32_t>(65536));
+    CHECK(stwo_exec_context_sync(o.ctx));
+    auto missing = j;
+    missing.counts8 = nullptr;
+    missing.pair_counts = nullptr;
+    if (stwo_rv64_cpu_witness_on(o.ctx, 1, &missing) != int(cudaErrorInvalidValue))
+      throw std::runtime_error("missing byte histogram accepted without pair coverage");
+    auto paired = j;
+    paired.counts8 = nullptr;
+    CHECK(stwo_rv64_cpu_witness_on(o.ctx, 1, &paired));
+    CHECK(stwo_exec_context_sync(o.ctx));
+    fixture_equal("paired MAIN", o.read(main), expected);
+    fixture_equal("paired U16 multiplicities", o.read(counts16), c16);
+    fixture_equal("paired ROM multiplicities", o.read(counts_rom), cr);
+    fixture_equal("paired U8-pair multiplicities", o.read(pairs), cp);
+    fixture_equal("unused byte buffer", o.read(counts8), c8);
+    if (o.read(status)[0]) throw std::runtime_error("valid paired CPU metadata rejected");
+  }
   if (id == 1) {
     auto bad = metadata;
     bad[10] = 1; // row zero, rs1 tick 1, previous clock must be strictly less.
@@ -121,7 +163,7 @@ int main(int argc, char **argv) {
   try {
     if (argc < 2 || argc > 3) throw std::runtime_error("expected fixture directory [large]");
 #ifdef STWO_RV64_CURVE_WITNESS
-    for(uint32_t i=0;i<15;++i)exercise(argv[1],i);
+    for (uint32_t i = 0; i < 21; ++i) exercise(argv[1], i);
 #else
     for (uint32_t i = 0; i < (argc == 3 ? 4u : 3u); ++i) exercise(argv[1], i);
 #endif

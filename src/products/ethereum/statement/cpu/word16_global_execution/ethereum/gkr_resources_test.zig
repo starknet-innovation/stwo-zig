@@ -195,3 +195,80 @@ test "fresh receiver never admits persisted producer setup roots" {
     try requireIndependentReceiverSetup(false);
     try std.testing.expectError(error.PersistedSetupCacheForbiddenForReceiver, requireIndependentReceiverSetup(true));
 }
+
+test "candidate CPU setup derives the same fixed authority directly from the image" {
+    const a = std.testing.allocator;
+    const CPU = @import("stwo_riscv_cpu_integration");
+    const F = CPU.rv64_gkr_fixed_authority;
+    const Set = CPU.rv64_gkr_fixed_authority_set.Set;
+    const Setup = CPU.rv64_services_roster.CpuSetup;
+    var fixture = try @import("terminal_fixture.zig").Fixture.init(a, .honest);
+    defer fixture.deinit();
+    const config = Candidate.config();
+    var classic = try Setup.initWithAuthority(a, &fixture.image.authority, .{ .cpu_log = 5 }, .{});
+    defer classic.deinit();
+    var direct = try Setup.initCandidateWithAuthority(a, &fixture.image.authority, .{ .cpu_log = 5 }, .{}, classic.key.suite, null);
+    defer direct.deinit();
+    try direct.releaseFixedWitness();
+    var cache = try F.Fixed.Cache.init(a, 1 << 29);
+    defer cache.deinit();
+    var reduced = try F.Binding.acquire(&cache, &direct.key, config);
+    defer reduced.deinit();
+    var committed = try F.Binding.acquire(&cache, &classic.key, config);
+    defer committed.deinit();
+    try std.testing.expect(direct.key.root_only);
+    try std.testing.expectEqual(committed.fixed_identity, reduced.fixed_identity);
+    try std.testing.expectEqual(committed.root(), reduced.root());
+    try std.testing.expectError(error.CommittedFixedSource, classic.key.retireIdentityCoefficients());
+    try direct.key.retireIdentityCoefficients();
+    try direct.key.retireIdentityCoefficients();
+    try std.testing.expect(direct.key.tree.coefficients == null);
+    try std.testing.expect(reduced.lease.key.tree.coefficients != null);
+    try std.testing.expectError(error.FixedSetupIdentityMismatch, Set.initWithPreparedCpus(a, &cache, &.{&classic}, &.{&reduced}, &.{}, config));
+    var retained = try Set.initWithPreparedCpus(a, &cache, &.{&direct}, &.{&reduced}, &.{}, config);
+    defer retained.deinit();
+    try std.testing.expectEqual(@as(usize, 0), retained.source_validations);
+    try retained.require(&.{&direct}, &.{}, config);
+}
+
+test "bounded device counts select the same split providers and block-owned RAM boundaries" {
+    const Plan = @import("plan.zig");
+    var calls: @FieldType(Plan.CpuCensus, "calls") = @splat(0);
+    calls[0] = 5;
+    var c = Plan.CpuCensus{
+        .cpu_log = 8,
+        .jalr_log = 5,
+        .alu = 70,
+        .binary = 0,
+        .shift = 0,
+        .zbb = 0,
+        .division = 0,
+        .multiplication = 1,
+        .ls = 75,
+        .dword = 70,
+        .calls = calls,
+        .bulk = .{ .jump_calls = 1, .jump_rows = 2 },
+        .sponge = .{ .calls = 1, .perms = 2 },
+    };
+    const layout = Plan.CpuLayout.forGkrProfile(.ethereum_services_v3);
+    const first = try Plan.cpuForCensus(c, 0, 2, 65, layout);
+    const last = try Plan.cpuForCensus(c, 1, 2, 65, layout);
+    try std.testing.expectEqual(@as(u32, 6), first.geometry.alu_log);
+    try std.testing.expectEqual(@as(?u32, 5), first.geometry.alu_tail_log);
+    try std.testing.expectEqual(@as(u32, 5), first.geometry.ls_log);
+    try std.testing.expectEqual(@as(?u32, 6), first.bridges.ls_dword);
+    try std.testing.expectEqual(@as(?u32, 5), first.bridges.ls_dword_tail);
+    try std.testing.expectEqual(@as(?u32, 7), first.bridges.keccak);
+    try std.testing.expectEqual(@as(?u32, 5), first.bridges.bulk.jscan);
+    try std.testing.expectEqual(@as(?u32, 5), first.bridges.sponge.perm);
+    try std.testing.expect(first.geometry.omit_empty_division);
+    try std.testing.expectEqual(@as(?u32, 7), first.geometry.initial_log);
+    try std.testing.expectEqual(@as(?u32, 5), first.geometry.terminal_log);
+    try std.testing.expectEqual(@as(?u32, 5), last.geometry.initial_log);
+    try std.testing.expectEqual(@as(?u32, 7), last.geometry.terminal_log);
+    c.dword = c.ls + 1;
+    try std.testing.expectError(error.InvalidCombinedServiceCount, Plan.cpuForCensus(c, 0, 2, 65, layout));
+    c.dword = 0;
+    c.calls[0] = std.math.maxInt(u32);
+    try std.testing.expectError(error.EthereumInstanceCapacityExceeded, Plan.cpuForCensus(c, 0, 2, 65, layout));
+}

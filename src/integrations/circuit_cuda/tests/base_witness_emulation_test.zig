@@ -238,3 +238,30 @@ test "circuit CUDA base row emulation equals CPU witness and complete table coun
         for (oracle) |slice| @memset(@constCast(slice), 0);
     }
 }
+
+test "circuit CUDA mixed arithmetic gathers addend columns and checks their address" {
+    const rows = 16;
+    var output: [16][rows]u32 = @splat(@splat(0));
+    var output_ptrs: [16][*]u32 = undefined;
+    for (&output_ptrs, &output) |*ptr, *col| ptr.* = col;
+    var fixed: [7][rows]u32 = @splat(@splat(0));
+    var fixed_ptrs: [7][*]const u32 = undefined;
+    for (&fixed_ptrs, &fixed) |*ptr, *col| ptr.* = col;
+    for (3..7) |i| @memset(&fixed[i], @intCast(i - 3));
+    const values = [_]u32{ 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33, 40, 41, 42, 43 };
+    var count: [1]u32 = .{0};
+    const counts: [base.count_lengths.len][*]u32 = @splat(&count);
+    var status: u32 = 0;
+    try std.testing.expectEqual(@as(c_int, 0), stwo_circuit_base_witness_emulate(1, &values, 4, rows, 14, &fixed_ptrs, 7, &output_ptrs, 16, &counts, counts.len, &status));
+    try std.testing.expectEqual(@as(u32, 0), status);
+    for (0..4) |i| {
+        try std.testing.expectEqualSlices(u32, &@as([rows]u32, @splat(values[i])), &output[12 + i]);
+        try std.testing.expectEqual(values[4 + i], output[i][0]);
+        try std.testing.expectEqual(@as(u32, 0), output[i][14]);
+        try std.testing.expectEqual(values[8 + i], output[4 + i][14]);
+        try std.testing.expectEqual(values[12 + i], output[8 + i][15]);
+    }
+    fixed[3][rows - 1] = 4;
+    try std.testing.expectEqual(@as(c_int, 0), stwo_circuit_base_witness_emulate(1, &values, 4, rows, 14, &fixed_ptrs, 7, &output_ptrs, 16, &counts, counts.len, &status));
+    try std.testing.expectEqual(@as(u32, 1), status);
+}

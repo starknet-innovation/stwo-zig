@@ -8,7 +8,13 @@ const Config = @import("native_class_build.zig").Config;
 const DP = CPU.rv64_device_pcs;
 const Env = @import("native_class_build.zig").Env;
 const FirstIds = @import("native_class_build.zig").FirstIds;
+const Program = CPU.rv64_program.Program;
+const Metadata = CPU.rv64_program.Metadata;
+const Pack = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_pack_capture;
+const Jobs = @import("stwo_riscv_cuda_integration").rv64.execution.jobs;
+const FixedSeed = Jobs.native_fixed_seed;
 const G = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.gpu_native;
+const Guest = @import("stwo_riscv_cuda_integration").rv64.execution.runtime.guest_execution;
 const Inputs = @import("native_class_build.zig").Inputs;
 const ND = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_device;
 const ProductCPU = @import("ethereum_cpu_component");
@@ -16,7 +22,6 @@ const Request = @import("native_class_build.zig").Request;
 const S1 = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_device_stage1;
 const S2 = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_device_stage2;
 const Setup = @import("native_class_build.zig").Setup;
-const WP = CPU.rv64_gkr_worker_protocol;
 const addReplicas = @import("native_class_build.zig").addReplicas;
 const build = @import("native_class_build.zig").build;
 const placeholderPending = @import("native_class_inputs.zig").placeholderPending;
@@ -27,68 +32,135 @@ const stubSource = @import("native_class_inputs.zig").stubSource;
 pub const Capture = ProductCPU.rv64_ethereum_capture;
 pub const Plan = ProductCPU.rv64_ethereum_plan;
 pub const Image = ProductCPU.rv64_expected_image;
-pub const Keys = ProductCPU.rv64_ethereum_keys.Owner;
 pub const FixedAuthority = CPU.rv64_gkr_fixed_authority;
-pub const FixedSet = CPU.rv64_gkr_fixed_authority_set.Set;
 pub const Coordinator = CPU.rv64_gkr_coordinator;
 pub const Execution = CPU.rv64_gkr_execution;
 pub const LocalRoster = CPU.rv64_gkr_local_roster;
 pub const Suite = CPU.rv64_pcs_suite.Suite;
 pub const RequestConfig = ProductCPU.rv64_ethereum_request.Config;
+const GuestInventory = @import("guest_inventory.zig");
+const Cell = GuestInventory.Cell;
+const FixedSetup = @import("native_fixed_device.zig");
+pub const FixedDevice = FixedSetup.Device;
+const EarlySetup = FixedSetup.EarlySetup;
 
 /// One block's install-time inventory: gkr_main's declarations (+ canonical
 /// rungs) and request views (requestView / routeDword / assignSpongeIds,
 /// first ids), sequentially; then per segment, in the parallel class build,
-/// its setup keys and FIXED authority (`prepare`: Keys over the one
-/// declaration + FixedSet over the one setup, as early_segments.zig builds
-/// them per segment). Truths are not needed for the native classes.
+/// its source polynomials and candidate FIXED authority. The CPU leaf's
+/// statement binds the candidate key. Service truth keys are built separately.
 pub const Inventory = struct {
     a: std.mem.Allocator,
     config: Config,
+    envelope: CPU.rv64_gkr_fixed_authority_set.Envelope,
     image: *const Image.Owner,
+    program_identity: [32]u8,
     decls: []Decl,
     fixed_cache: FixedAuthority.Fixed.Cache,
+    fixed_device: ?*FixedDevice = null,
+    early: ?*EarlySetup = null,
+    metadata: *const Metadata.Cache,
     requests: []Request,
+    total_steps: u64,
+    final_pc: u64,
+    final_registers: [32]u64,
     first_ids: []FirstIds,
     segs: []Seg,
 
-    pub const Decl = std.meta.Child(@typeInfo(@typeInfo(@TypeOf(Plan.cpus)).@"fn".return_type.?).error_union.payload);
+    pub const Decl = GuestInventory.Declaration;
     pub const Seg = struct {
-        keys: ?Keys = null,
-        fixed: ?FixedSet = null,
+        setup: ?Setup = null,
+        fixed: ?FixedAuthority.Binding = null,
+        device_key: ?FixedAuthority.ProducerKey = null,
+        device_region: ?FixedSeed.Sealed = null,
+        expected: ?CPU.rv64_gkr_manifest.ExpectedWorker = null,
+        /// JUMPDEST observes code words as well as bitmap rows. Keep the
+        /// exact device projection count after releasing the install capture.
+        guest_bulk_words: u32 = 0,
         /// Host wall of this segment's keys + FIXED authority [M].
         setup_ns: u64 = 0,
+        start_step: u64 = 0,
+        resident_counts: ?Pack.ResidentCounts = null,
+        guest_layout: ?Guest.CompactLoan.Layout = null,
     };
 
-    pub fn init(a: std.mem.Allocator, capture: G.CaptureEnd, config: Config, fixed_setup_bytes: usize) !*Inventory {
-        const owner: *const Capture.Owner = @ptrCast(@alignCast(capture.owner));
+    pub fn init(a: std.mem.Allocator, capture: G.CaptureEnd, config: Config, fixed_setup_bytes: usize, metadata: *const Metadata.Cache, fixed_device: ?*FixedDevice) !*Inventory {
+        const owner: ?*const Capture.Owner = if (capture.owner) |raw| @ptrCast(@alignCast(raw)) else null;
+        const discovery = capture.guest_discovery;
+        if ((owner == null) == (discovery == null)) return error.GpuNativeWarmCaptureRequired;
+        if (discovery != null and fixed_device == null) return error.GpuNativeFixedSeedUnavailable;
+        const n = capture.segments;
+        if (n == 0 or n > 256) return error.GnShapeInventoryShape;
+        if (owner) |host| {
+            if (host.native.items.len != n) return error.GnShapeInventoryShape;
+        } else if (discovery.?.segments.len != n) return error.GnShapeInventoryShape;
         const image: *const Image.Owner = @ptrCast(@alignCast(capture.image));
         const rconfig: *const RequestConfig = @ptrCast(@alignCast(capture.config));
+        // Populate the immutable entry cache before preparing multiple
+        // candidate keys concurrently. The raw views remain image-owned.
+        var program = try Program.initCaptureWithAuthorityAndMetadataCache(a, &image.authority, metadata);
+        const program_identity = program.identity;
+        program.deinit();
         const layout = Plan.CpuLayout.forGkrProfile(rconfig.execution_profile);
-        const cpu = try Plan.cpus(a, owner, layout);
+        const cpu = if (owner) |host| try Plan.cpus(a, host, layout) else try a.alloc(Decl, n);
         errdefer a.free(cpu);
         const strict = (try CPU.rv64_native_policy.current()).strictRoster();
-        const canon_flag = false;
-        if (strict or canon_flag) {
+        if (owner != null and strict) {
             const classes = try a.alloc(Plan.CanonClass, cpu.len);
             defer a.free(classes);
-            try Plan.canonicalCpusMode(owner, layout, cpu, CPU.rv64_native_rungs, classes, strict);
+            try Plan.canonicalCpusMode(owner.?, layout, cpu, CPU.rv64_native_rungs, classes, strict);
         }
-        const n = owner.native.items.len;
-        if (n != cpu.len or n != capture.segments) return error.GnShapeInventoryShape;
+        if (n == 0 or n != cpu.len or n != capture.segments) return error.GnShapeInventoryShape;
+        const initial = if (owner) |host| try a.dupe(Cell, host.advice.initial) else try GuestInventory.copyBoundary(a, discovery.?.initial, true);
+        errdefer a.free(initial);
+        const terminal = if (owner) |host| try a.dupe(Cell, host.advice.terminal) else try GuestInventory.copyBoundary(a, discovery.?.terminal, false);
+        errdefer a.free(terminal);
+        if (discovery != null and initial.len != terminal.len) return error.GnShapeInventoryShape;
+        const end = if (discovery) |d| d.segments[n - 1].window.terminal else Guest.State{ .pc = owner.?.final_pc, .regs = owner.?.final_registers, .retired = owner.?.total_steps };
         const self = try a.create(Inventory);
         errdefer a.destroy(self);
-        self.* = .{ .a = a, .config = config, .image = image, .decls = cpu, .fixed_cache = undefined, .requests = &.{}, .first_ids = &.{}, .segs = &.{} };
+        const envelope = try CPU.rv64_gkr_fixed_authority_set.Envelope.forRequest(image.max_prefix_steps, CPU.rv64_gkr_worker_protocol.candidateProfile(config));
+        self.* = .{ .a = a, .config = config, .envelope = envelope, .image = image, .program_identity = program_identity, .decls = cpu, .total_steps = end.retired, .final_pc = end.pc, .final_registers = end.regs, .fixed_cache = undefined, .fixed_device = if (discovery != null) fixed_device else null, .metadata = metadata, .requests = &.{}, .first_ids = &.{}, .segs = &.{} };
         self.fixed_cache = try FixedAuthority.Fixed.Cache.init(a, fixed_setup_bytes);
         errdefer self.fixed_cache.deinit();
         self.requests = try a.alloc(Request, n);
         errdefer a.free(self.requests);
-        // The declaration's bridges ARE the setup's (early_segments.take
-        // requires {geometry, bridges} equal), so routing needs no keys.
-        for (self.requests, 0..) |*r, i| {
-            r.* = try Coordinator.requestView(owner.native.items, &owner.advice, i);
-            try Coordinator.routeDword(r, cpu[i].bridges, owner.advice.events[i]);
+        self.segs = try a.alloc(Seg, n);
+        errdefer a.free(self.segs);
+        // Small blocks keep the independent early-setup policy. Long blocks
+        // already have all counted windows here, before any key is selected.
+        const group_locally = discovery != null and !strict and n >= 16;
+        const censuses = try a.alloc(Plan.CpuCensus, if (group_locally) n else 0);
+        defer a.free(censuses);
+        var at: u64 = 0;
+        for (self.requests, self.segs, cpu, 0..) |*r, *seg, *decl, i| {
+            seg.* = .{ .start_step = at };
+            if (owner) |host| {
+                r.* = try Coordinator.requestView(host.native.items, &host.advice, i);
+                try Coordinator.routeDword(r, decl.bridges, host.advice.events[i]);
+                seg.guest_bulk_words = @intCast(host.advice.bulk[i].words.len);
+            } else {
+                const source = &discovery.?.segments[i];
+                const projected = try GuestInventory.plan(source, layout, .{ .ordinal = i, .count = n, .first_step = at, .touched = initial.len, .strict = strict });
+                if (group_locally) censuses[i] = projected.census;
+                r.* = projected.request;
+                decl.* = projected.declaration;
+                seg.resident_counts = projected.families;
+                seg.guest_layout = projected.loans;
+                seg.guest_bulk_words = source.memory.bulk.words;
+            }
+            at = try std.math.add(u64, at, r.base.cpu.steps);
         }
+        if (group_locally) {
+            const groups = try Plan.shareCurrentCpuClasses(a, cpu, censuses, layout);
+            for (self.segs, cpu, discovery.?.segments, self.requests) |*seg, decl, window, r| {
+                seg.resident_counts = try Pack.ResidentCounts.fromCensus(decl.geometry, r.base.cpu.steps, &window.families);
+            }
+            std.debug.print("GPU_CURRENT_CPU_COHORT windows={d} envelopes={d}\n", .{ n, groups });
+        }
+        if (at != self.total_steps) return error.GnShapeInventoryShape;
+        self.requests[0].base.memory.initial = initial;
+        self.requests[n - 1].base.memory.terminal = terminal;
         try Coordinator.assignSpongeIds(self.requests);
         self.first_ids = try a.alloc(FirstIds, n);
         errdefer a.free(self.first_ids);
@@ -98,41 +170,85 @@ pub const Inventory = struct {
             for (next, f) |id, *out| out.* = std.math.cast(u32, id) orelse return error.GlobalGkrManifestOrdinal;
             for (&next, r.calls) |*id, calls| id.* = try std.math.add(u64, id.*, calls);
         }
-        self.segs = try a.alloc(Seg, n);
-        @memset(self.segs, .{});
+        if (discovery != null) {
+            _ = try ProductCPU.rv64_ethereum_receiver.expectedFromRequests(image, program_identity, self.requests, rconfig.max_steps, rconfig.batch_steps, true);
+            for (initial, terminal) |first, last| {
+                const epoch = last.state.epoch;
+                if (first.address != last.address or first.state.rights != last.state.rights or epoch == 0 or epoch > n)
+                    return error.InvalidGuestRamAuthority;
+                try @import("guest_inventory.zig").validateTerminalTick(cpu[epoch - 1].geometry.cpu_log, self.requests[epoch - 1].base.cpu.steps, last.state.tick);
+            }
+        }
         return self;
     }
+
     /// Segment `i`'s setup keys and FIXED authority (thread safe across
     /// segments: the FIXED cache is internally locked).
     pub fn prepare(self: *Inventory, i: usize) !void {
         const seg = &self.segs[i];
-        if (seg.fixed != null) return;
+        if (seg.expected != null) return;
         var t = try std.time.Timer.start();
-        seg.keys = try Keys.initWithSuiteAndCaches(self.a, self.image, self.decls[i .. i + 1], &.{}, true, Suite.experimentalFold4(), .{});
+        const decl = self.decls[i];
+        const prepared = if (self.early) |early| early.take(i, decl) else null;
+        seg.setup = prepared orelse if (self.fixed_device) |device|
+            try FixedSetup.prepareCpu(self.a, &self.image.authority, self.program_identity, decl, self.metadata, &device.tables.host)
+        else
+            try Setup.initCandidateWithAuthority(self.a, &self.image.authority, decl.geometry, decl.bridges, Suite.experimentalFold4(), self.metadata);
         errdefer {
-            seg.keys.?.deinit();
-            seg.keys = null;
+            seg.setup.?.deinit();
+            seg.setup = null;
         }
-        seg.fixed = try FixedSet.init(self.a, &self.fixed_cache, seg.keys.?.cpus, seg.keys.?.truths, self.config);
+        const key = &seg.setup.?.key;
+        if (self.fixed_device) |device| {
+            const region = blk: {
+                const columns = try self.setup(i).fixedColumns(self.a);
+                defer self.a.free(columns);
+                const descriptor: FixedAuthority.Fixed.CommitmentDescriptor = .{ .log_blowup = self.config.fri_config.log_blowup_factor };
+                break :blk try device.sealEvaluations(self.a, columns, descriptor, key.root, null);
+            };
+            const producer = try FixedAuthority.ProducerKey.fromDeviceRoot(key, self.config, region.root);
+            try seg.setup.?.releaseFixedWitness();
+            seg.expected = try Execution.localCpuExpectedForEnvelope(self.envelope, self.a, self.setup(i), self.requests[i], @intCast(i), self.first_ids[i], self.config, producer.header);
+            seg.device_region = region;
+            seg.device_key = producer;
+        } else {
+            try seg.setup.?.releaseFixedWitness();
+            seg.fixed = try FixedAuthority.Binding.acquire(&self.fixed_cache, key, self.config);
+            errdefer {
+                seg.fixed.?.deinit();
+                seg.fixed = null;
+            }
+            // The lease owns the fixed coefficients. Keep only the descriptor
+            // the live inventory uses to authenticate that lease.
+            try key.retireIdentityCoefficients();
+            seg.expected = try Execution.localCpuExpectedForEnvelope(self.envelope, self.a, self.setup(i), self.requests[i], @intCast(i), self.first_ids[i], self.config, self.binding(i).header());
+        }
         seg.setup_ns = t.read();
     }
     pub fn setup(self: *const Inventory, i: usize) *const Setup {
-        return self.segs[i].keys.?.cpus[0];
+        return &self.segs[i].setup.?;
     }
     pub fn binding(self: *const Inventory, i: usize) *const FixedAuthority.Binding {
-        return self.segs[i].fixed.?.at(0);
+        return &self.segs[i].fixed.?;
+    }
+    pub fn header(self: *const Inventory, i: usize) FixedAuthority.ProducerHeader {
+        return if (self.segs[i].device_key) |key| key.header else self.binding(i).header();
     }
     pub fn deinit(self: *Inventory) void {
         const a = self.a;
         for (self.segs) |*seg| {
+            if (seg.expected) |expected| a.free(expected.local_instances.?);
             if (seg.fixed) |*f| f.deinit();
-            if (seg.keys) |*k| k.deinit();
+            if (seg.setup) |*setup_value| setup_value.deinit();
         }
         a.free(self.segs);
         a.free(self.first_ids);
+        a.free(self.requests[0].base.memory.initial);
+        a.free(self.requests[self.requests.len - 1].base.memory.terminal);
         a.free(self.requests);
         self.fixed_cache.deinit();
         a.free(self.decls);
+        if (self.early) |early| early.destroy();
         a.destroy(self);
     }
     pub fn count(self: *const Inventory) usize {
@@ -140,38 +256,44 @@ pub const Inventory = struct {
     }
 };
 
-/// Build segment `i` of an inventory (FIXED via the authority binding into a
-/// throwaway scheme, exactly CpuWorker.prepareMain's append).
+/// Build segment `i` from the sealed candidate FIXED lease.
 pub fn buildFromInventory(env: *const Env, inv: *Inventory, i: usize) !*Class {
+    if (!std.meta.eql(env.config, inv.config)) return error.EarlyCpuInventoryMismatch;
     const a = env.a;
     try inv.prepare(i);
     const setup = inv.setup(i);
-    const binding = inv.binding(i);
-    var scheme = try WP.Prover.init(a, env.config);
-    defer scheme.deinit(a);
-    scheme.setCompactPolynomialStorage(1);
-    const expected = try Execution.localCpuExpected(a, setup, inv.requests[i], @intCast(i), inv.first_ids[i], env.config, binding);
-    defer a.free(expected.local_instances.?);
-    var ch = binding.begin(env.config, expected);
-    try binding.append(a, &setup.key, expected.fixed, &scheme, &ch);
-    const coefficients = scheme.trees.items[0].coefficients orelse return error.DeviceGkrCoefficientsRequired;
-    const fixed = try a.alloc(DP.Column, coefficients.len);
+    const seg = &inv.segs[i];
+    const expected = seg.expected.?;
+    const fixed = if (seg.device_key) |device| cols: {
+        try device.require(&setup.key, env.config);
+        const log_blowup = setup.key.suite.config().fri_config.log_blowup_factor;
+        const fixed = try a.alloc(DP.Column, setup.key.tree.columns.len);
+        for (setup.key.tree.columns, fixed) |column, *out| out.* = .{ .log_size = column.log_size - log_blowup, .coefficients = &.{} };
+        break :cols fixed;
+    } else cols: {
+        const binding = inv.binding(i);
+        try binding.require(&setup.key, env.config);
+        const coefficients = binding.lease.key.tree.coefficients orelse return error.DeviceGkrCoefficientsRequired;
+        const fixed = try a.alloc(DP.Column, coefficients.len);
+        for (coefficients, fixed) |c, *out| out.* = .{ .log_size = c.logSize(), .coefficients = c.coefficients() };
+        break :cols fixed;
+    };
     defer a.free(fixed);
-    for (coefficients, fixed) |c, *d| d.* = .{ .log_size = c.logSize(), .coefficients = c.coefficients() };
     const main_logs = try setup.logs(a, 1);
     defer a.free(main_logs);
-    const instances = try LocalRoster.fromSetup(a, setup);
-    defer a.free(instances);
+    const instances = expected.local_instances.?;
     var native = stubSource(setup, inv.requests[i]);
     var pending = try placeholderPending(a, instances);
     defer pending.deinit(a);
     const in = Inputs{
+        .envelope = inv.envelope,
         .ordinal = @intCast(i),
         .setup = setup,
         .request = inv.requests[i],
         .first = inv.first_ids[i],
         .fixed = fixed,
         .fixed_root = expected.fixed,
+        .fixed_region_key = if (seg.device_region) |region| region.key else null,
         .main_logs = main_logs,
         .instances = instances,
         .native = &native,
@@ -181,6 +303,7 @@ pub fn buildFromInventory(env: *const Env, inv: *Inventory, i: usize) !*Class {
     const cl = try build(env, in);
     errdefer cl.deinit();
     try addReplicas(env, in, cl, env.framing_instances -| 1);
+    if (seg.device_key != null) try seg.setup.?.key.retireIdentityCoefficients();
     return cl;
 }
 
@@ -221,7 +344,10 @@ pub const Builder = struct {
     /// Parallel segment class builds (0 = one thread per segment, max 64).
     build_threads: usize = 0,
     fixed_setup_bytes: usize = 4 << 30,
+    metadata: ?Metadata.Cache = null,
+    fixed_device: ?*FixedDevice = null,
     mutex: std.Thread.Mutex = .{},
+    early: ?*EarlySetup = null,
     classes: std.AutoArrayHashMapUnmanaged(G.ClassKey, *Class) = .empty,
     /// Serialises whole block builds (install and miss path): one block's
     /// inventory, class build and registration at a time.
@@ -235,12 +361,12 @@ pub const Builder = struct {
     /// closed with GnShapeMissWarmNotBound (the build is still receipted).
     miss_cache: ?*G.ClassCache = null,
     miss_devices: u32 = 0,
-    /// GPU-native capture binding borrows setup/public views between
-    /// requests. The corresponding warm Capture.Owner must outlive Builder.
+    /// GPU-native request binding borrows these admitted public inputs.
     retain_inventories: bool = false,
     inventories: std.AutoHashMapUnmanaged(u64, *Inventory) = .empty,
 
     pub fn deinit(self: *Builder) void {
+        if (self.early) |early| early.destroy();
         var inventories = self.inventories.valueIterator();
         while (inventories.next()) |inv| inv.*.deinit();
         self.inventories.deinit(self.a);
@@ -253,6 +379,7 @@ pub const Builder = struct {
         self.blocks.deinit(self.a);
         for (self.classes.values()) |c| c.deinit();
         self.classes.deinit(self.a);
+        if (self.metadata) |*cache| cache.deinit();
     }
 
     /// ND.Native.shape_hooks of this builder.
@@ -311,9 +438,16 @@ pub const Builder = struct {
         var timer = try std.time.Timer.start();
         if (self.knownBlock(wb.block)) |b| return b;
         self.env.framing_instances = @max(1, if (self.factory != null) self.framing_instances else 1);
-        const inv = try Inventory.init(self.a, wb.capture, self.env.config, self.fixed_setup_bytes);
+        if (self.metadata == null) self.metadata = try Metadata.Cache.init(self.a, 64 << 20);
+        const inv = try Inventory.init(self.a, wb.capture, self.env.config, self.fixed_setup_bytes, &self.metadata.?, self.fixed_device);
         var keep_inventory = false;
         defer if (!keep_inventory) inv.deinit();
+        if (self.early) |early| {
+            if (early.authority != &inv.image.authority or !std.mem.eql(u8, &early.identity, &inv.program_identity) or inv.fixed_device == null)
+                return error.EarlyCpuInventoryMismatch;
+            inv.early = early;
+            self.early = null;
+        }
         const inventory_ns = timer.read();
         const n = inv.count();
         const keys = try self.a.alloc(G.ClassKey, n);
@@ -349,6 +483,7 @@ pub const Builder = struct {
         const classes_ns = timer.read() - inventory_ns;
         errdefer for (slots) |sl| if (sl.cl) |c| c.deinit();
         for (slots) |sl| if (sl.err) |err| return err;
+        if (inv.early) |early| early.report(wb.block);
         var fresh: std.ArrayListUnmanaged(*Class) = .empty;
         defer fresh.deinit(self.a);
         for (0..n) |i| {
@@ -362,6 +497,7 @@ pub const Builder = struct {
             self.mutex.lock();
             defer self.mutex.unlock();
             if (self.classes.get(cl.key)) |old| {
+                if (!std.mem.eql(u8, &old.fixedKey(), &cl.fixedKey())) return error.GpuNativeClassKeyMismatch;
                 cl.deinit();
                 owned = false;
                 // Known but not fully registered (an earlier build of a block
@@ -382,11 +518,12 @@ pub const Builder = struct {
         const rec = BlockRecord{ .block = wb.block, .keys = keys, .rows = rows, .public_inputs = public_inputs, .build_ns = timer.read(), .inventory_ns = inventory_ns, .classes_ns = classes_ns, .threads = @intCast(threads), .miss = miss, .new_classes = @intCast(fresh.items.len), .register_ns = warm_ns };
         self.mutex.lock();
         defer self.mutex.unlock();
+        try self.blocks.ensureUnusedCapacity(self.a, 1);
         if (self.retain_inventories) {
             try self.inventories.put(self.a, wb.block, inv);
             keep_inventory = true;
         }
-        try self.blocks.append(self.a, rec);
+        self.blocks.appendAssumeCapacity(rec);
         if (miss) {
             self.misses += 1;
             self.missed_classes += fresh.items.len;

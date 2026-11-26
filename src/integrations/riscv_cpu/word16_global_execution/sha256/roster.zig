@@ -21,6 +21,9 @@ pub const TruthSetup = struct {
         return initWithSuite(a, log, Key.Suite.production());
     }
     pub fn initWithSuite(a: std.mem.Allocator, log: u32, suite: Key.Suite) !TruthSetup {
+        return initWithFixedMode(a, log, suite, .committed);
+    }
+    pub fn initWithFixedMode(a: std.mem.Allocator, log: u32, suite: Key.Suite, mode: Key.FixedMode) !TruthSetup {
         try suite.validate();
         if (log > MAX_LOG) return error.Sha256TruthGeometryBudget;
         const fixed = try H.trace.fixed(a, log);
@@ -28,7 +31,7 @@ pub const TruthSetup = struct {
         var self = TruthSetup{ .allocator = a, .log = log, .fixed = fixed, .key = undefined };
         const cols = try self.fixedColumns(a);
         defer a.free(cols);
-        self.key = try Key.sealWithSuite(a, cols, suite);
+        self.key = try Key.prepare(a, cols, suite, mode);
         return self;
     }
     pub fn deinit(self: *TruthSetup) void {

@@ -33,11 +33,16 @@ pub fn truthMass(truth: R.Truth) !Manifest.Mass {
 }
 
 pub fn truthStatement(truth: R.Truth, config: W.PcsConfig, execution: [32]u8) ![32]u8 {
+    if (truth.key().producer_only) return error.FixedSetupRootMismatch;
+    return truthStatementFromSourceRoot(truth, config, execution, truth.key().root);
+}
+
+pub fn truthStatementFromSourceRoot(truth: R.Truth, config: W.PcsConfig, execution: [32]u8, source_root: [32]u8) ![32]u8 {
     var ch = W.Channel.init();
     config.mixInto(&ch);
     ch.mixU32s(&.{ 0x54574f31, 1, 8, @intFromEnum(truth.family()), truth.first(), truth.count() });
     W.digest(&ch, execution);
-    W.digest(&ch, truth.key().root);
+    W.digest(&ch, source_root);
     switch (truth) {
         .keccak => |t| {
             ch.mixU32s(&.{t.setup.log});

@@ -71,7 +71,12 @@ pub const Shape = struct {
         }
     }
     pub fn validate(self: Shape) !void {
-        if (self.native_proofs == 0 or self.native_proofs > Policy.MAX_PROOFS or self.max_trace_log < 5 or self.max_trace_log > Policy.MAX_TRACE_LOG or self.max_public_boundary_log < 5 or self.max_public_boundary_log > Policy.MAX_PUBLIC_BOUNDARY_LOG or self.max_columns == 0 or self.max_columns > Policy.MAX_COLUMNS or self.max_constraints == 0 or self.max_constraints > Policy.MAX_CONSTRAINTS or self.max_samples_per_column > Policy.MAX_SAMPLES_PER_COLUMN or self.max_air_degree > Policy.MAX_AIR_DEGREE or self.max_local_instances > Policy.MAX_LOCAL_INSTANCES or self.max_tuple_arity > Policy.MAX_TUPLE_ARITY or self.max_gkr_variables > Policy.MAX_GKR_VARIABLES) return error.CandidateSourceShapeExceeded;
+        return self.validateFor(.admitted);
+    }
+    // Only deriveForEnvelope has established the role of every physical column.
+    fn validateFor(self: Shape, envelope: Scope.Envelope) !void {
+        const max_trace: u32 = if (envelope == .compact_wide) A.word16_execution.layout.MAX_LOG else Policy.MAX_TRACE_LOG;
+        if (self.native_proofs == 0 or self.native_proofs > Policy.MAX_PROOFS or self.max_trace_log < 5 or self.max_trace_log > max_trace or self.max_public_boundary_log < 5 or self.max_public_boundary_log > Policy.MAX_PUBLIC_BOUNDARY_LOG or self.max_columns == 0 or self.max_columns > Policy.MAX_COLUMNS or self.max_constraints == 0 or self.max_constraints > Policy.MAX_CONSTRAINTS or self.max_samples_per_column > Policy.MAX_SAMPLES_PER_COLUMN or self.max_air_degree > Policy.MAX_AIR_DEGREE or self.max_local_instances > Policy.MAX_LOCAL_INSTANCES or self.max_tuple_arity > Policy.MAX_TUPLE_ARITY or self.max_gkr_variables > Policy.MAX_GKR_VARIABLES) return error.CandidateSourceShapeExceeded;
     }
 };
 pub const ConditionalDegrees = struct {
@@ -148,7 +153,9 @@ fn addCpuRole(scope: *CpuScope, origin: Frame.Origin, log: u32) !void {
 }
 pub fn addCpuRoleMode(scope: *CpuScope, origin: Frame.Origin, log: u32, pairs: bool) !void {
     const count = try rows(log);
-    const fractions = switch (origin) {
+    const wide_cpu = origin == .core and origin.core == .cpu and log == 23;
+    if (wide_cpu and pairs) return error.InvalidCpuPairGeometry;
+    const fractions = if (wide_cpu) Q.WIDE_CPU else switch (origin) {
         .bulk => |kind| Q.BULK[@intFromEnum(kind)],
         .dword => Q.DWORD,
         .sponge => |kind| Q.SPONGE[@intFromEnum(kind)],
@@ -196,14 +203,15 @@ pub fn addCpuRoleMode(scope: *CpuScope, origin: Frame.Origin, log: u32, pairs: b
         }
     }
 }
-fn includeRole(shape: *Shape, origin: Frame.Origin, log: u32, descriptor: Meta.Descriptor, columns: *usize, constraints: *usize, instances: *usize) !void {
+fn includeRole(shape: *Shape, envelope: Scope.Envelope, origin: Frame.Origin, log: u32, descriptor: Meta.Descriptor, columns: *usize, constraints: *usize, instances: *usize) !void {
     try shape.includeCells(log, descriptor.widths);
     for (descriptor.widths) |width| columns.* = try std.math.add(usize, columns.*, width);
     constraints.* = try std.math.add(usize, constraints.*, descriptor.constraints);
     if (origin == .core and (origin.core == .initial or origin.core == .terminal)) {
         shape.max_public_boundary_log = @max(shape.max_public_boundary_log, log);
     } else {
-        if (log > Policy.MAX_TRACE_LOG) return error.CandidateSourceShapeExceeded;
+        const wide_cpu = envelope == .compact_wide and origin == .core and origin.core == .cpu and log == A.word16_execution.layout.MAX_LOG;
+        if (log > Policy.MAX_TRACE_LOG and !wide_cpu) return error.CandidateSourceShapeExceeded;
         shape.max_trace_log = @max(shape.max_trace_log, log);
     }
     shape.max_samples_per_column = @max(shape.max_samples_per_column, descriptor.max_samples);
@@ -239,6 +247,12 @@ pub fn validateInventory(cpu: usize, truth: usize) !usize {
     return count;
 }
 pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDeclaration, truth: []const Wire.TruthDeclaration, requests: []const P.Request) !Report {
+    return deriveForEnvelope(.admitted, a, program_log, cpu, truth, requests);
+}
+
+/// Source accounting only. Production callers retain the admitted envelope until
+/// the recursive receiver authenticates the candidate identity and field bounds.
+pub fn deriveForEnvelope(envelope: Scope.Envelope, a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDeclaration, truth: []const Wire.TruthDeclaration, requests: []const P.Request) !Report {
     const count = try validateInventory(cpu.len, truth.len);
     if (requests.len != cpu.len) return error.CandidateSourceShapeExceeded;
     _ = try rows(program_log);
@@ -252,10 +266,10 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
     var degrees = ConditionalDegrees{};
     for (cpu, requests, cpus, 0..) |declaration, request, *scope, ordinal| {
         // Explicit supported scope; unknown v3 families/layouts cannot enter these bounds.
-        try Scope.declaration(declaration);
+        try envelope.validateGeometry(declaration.geometry);
+        try Scope.bridges(declaration.bridges);
         try Scope.request(request);
         try P.bulkCounts(request.bulk);
-        try declaration.geometry.validate();
         _ = try A.word16_execution.types.inputs(request.base.cpu, request.base.epoch, declaration.geometry.cpu_log);
         _ = try declaration.geometry.lsCounts(request.base.memory.ls_count);
         if (request.base.memory.initial.len >= try rows(declaration.geometry.initialLog()) or request.base.memory.terminal.len >= try rows(declaration.geometry.terminalLog())) return error.CandidateSourceCountExceeded;
@@ -269,29 +283,12 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
         for (Geometry.shapesForProgramLog(program_log, declaration.geometry)) |part| {
             if (!part.present()) continue;
             const origin = Frame.Origin{ .core = part.role };
-            var descriptor = try Meta.forOrigin(origin);
-            if (declaration.geometry.cpu_u8_pairs) switch (part.role) {
-                .cpu => {
-                    descriptor.local_terms = 14;
-                    if (declaration.geometry.cpu_compact_decode) {
-                        // Compact decode MAIN (37 columns, compact residuals);
-                        // the same 14 local terms, relations and arities.
-                        const compact = A.main_only.authority.shape(.cpu_compact);
-                        descriptor.widths[1] = compact.main;
-                        descriptor.constraints = @import("role.zig").constraintCount(.cpu_compact, origin);
-                    }
-                },
-                .and_table => {
-                    descriptor.local_terms = 2;
-                    descriptor.widths[1] = 2;
-                },
-                else => {},
-            };
+            var descriptor = try Meta.forGeometry(origin, declaration.geometry);
             if (descriptor.widths[0] > part.widths[0] or descriptor.widths[1] != part.widths[1]) return error.CandidateSourceRoleLayoutMismatch;
             // Source keys retain legacy fixed columns, including columns no
             // longer read by MAIN-only roles. Count their commitment cost too.
             descriptor.widths[0] = part.widths[0];
-            try includeRole(&shape, origin, part.log, descriptor, &columns, &constraints, &instances);
+            try includeRole(&shape, envelope, origin, part.log, descriptor, &columns, &constraints, &instances);
             try addCpuRoleMode(scope, origin, part.log, declaration.geometry.cpu_u8_pairs);
             try globalSlots(&global_slots, origin, part.log);
         }
@@ -302,7 +299,7 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
             if (optional) |log| {
                 if (family == .keccak) _ = try A.crypto.keccak.word16_bridge.types.validateGeometry(calls, first_id, log) else _ = try A.crypto.secp256k1.word16_bridge.types.validateGeometry(Types.bridgeKind(family), calls, first_id, log);
                 const origin = Frame.Origin{ .bridge = family };
-                try includeRole(&shape, origin, log, try Meta.forOrigin(origin), &columns, &constraints, &instances);
+                try includeRole(&shape, envelope, origin, log, try Meta.forOrigin(origin), &columns, &constraints, &instances);
                 try addCpuRole(scope, origin, log);
                 try globalSlots(&global_slots, origin, log);
             }
@@ -314,7 +311,7 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
             if (optional) |log| {
                 _ = try A.crypto.bulk_memory.types.validateGeometry(kind, active, log);
                 const origin = Frame.Origin{ .bulk = kind };
-                try includeRole(&shape, origin, log, try Meta.forOrigin(origin), &columns, &constraints, &instances);
+                try includeRole(&shape, envelope, origin, log, try Meta.forOrigin(origin), &columns, &constraints, &instances);
                 try addCpuRole(scope, origin, log);
                 try globalSlots(&global_slots, origin, log);
             }
@@ -326,7 +323,7 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
             if (optional) |log| {
                 _ = try A.crypto.keccak_sponge.types.validateGeometry(kind, active, log);
                 const origin = Frame.Origin{ .sponge = kind };
-                try includeRole(&shape, origin, log, try Meta.forOrigin(origin), &columns, &constraints, &instances);
+                try includeRole(&shape, envelope, origin, log, try Meta.forOrigin(origin), &columns, &constraints, &instances);
                 try addCpuRole(scope, origin, log);
                 try globalSlots(&global_slots, origin, log);
             }
@@ -335,7 +332,7 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
         for (0..Types.DWORD_INSTANCES) |i| if (declaration.bridges.dwordLog(i)) |log| {
             if (dword_counts[i] >= try rows(log)) return error.CandidateSourceCountExceeded;
             const origin = Frame.Origin{ .dword = @intCast(i) };
-            try includeRole(&shape, origin, log, try Meta.forOrigin(origin), &columns, &constraints, &instances);
+            try includeRole(&shape, envelope, origin, log, try Meta.forOrigin(origin), &columns, &constraints, &instances);
             try addCpuRole(scope, origin, log);
             try globalSlots(&global_slots, origin, log);
         };
@@ -368,6 +365,7 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
             }
             var cols: usize = 0;
             for (descriptor.widths()) |width| cols = try std.math.add(usize, cols, width);
+            if (descriptor.log_size > Policy.MAX_TRACE_LOG) return error.CandidateSourceShapeExceeded;
             shape.max_trace_log = @max(shape.max_trace_log, descriptor.log_size);
             shape.max_air_degree = @max(shape.max_air_degree, descriptor.maxDegree());
             shape.max_samples_per_column = @max(shape.max_samples_per_column, descriptor.maxSamples());
@@ -386,6 +384,7 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
             try shape.includeCells(part.log_size, part.widths());
             for (part.widths()) |width| columns = try std.math.add(usize, columns, width);
             constraints = try std.math.add(usize, constraints, part.nConstraints());
+            if (part.log_size > Policy.MAX_TRACE_LOG) return error.CandidateSourceShapeExceeded;
             shape.max_trace_log = @max(shape.max_trace_log, part.log_size);
             shape.max_air_degree = @max(shape.max_air_degree, part.maxDegree());
             shape.max_samples_per_column = @max(shape.max_samples_per_column, part.maxSamples());
@@ -441,7 +440,7 @@ pub fn derive(a: std.mem.Allocator, program_log: u32, cpu: []const Wire.CpuDecla
         try degrees.addGlobal(.{ .arity = arity, .denominator_slots = slots });
         if (slots != 0) shape.max_tuple_arity = @max(shape.max_tuple_arity, arity);
     }
-    try shape.validate();
+    try shape.validateFor(envelope);
     // Necessary lookup-only budget; all omitted protocol terms remain explicit
     // false qualifications in Report, never a whole-protocol certificate.
     try degrees.requireLookupOnlyBits(Policy.TARGET_BITS);
@@ -477,4 +476,18 @@ test "public boundary log23 source summary needs typed boundary provenance" {
     try shape.validate();
     shape.max_public_boundary_log = 24;
     try std.testing.expectError(error.CandidateSourceShapeExceeded, shape.validate());
+}
+
+test "wide execution CPU source charges six U16 consumers per physical row" {
+    var scope = emptyCpu();
+    try addCpuRoleMode(&scope, .{ .core = .cpu }, 23, false);
+    const n: u64 = 1 << 23;
+    try std.testing.expectEqual(6 * n, scope.relations[@intFromEnum(F.Relation.range16)].unit_consumer_mass);
+    try std.testing.expectEqual(0, scope.relations[@intFromEnum(F.Relation.range8)].denominator_slots);
+    try std.testing.expectEqual(0, scope.relations[@intFromEnum(F.Relation.byte_pair)].denominator_slots);
+    try std.testing.expectEqual(3 * n, scope.relations[@intFromEnum(F.Relation.register)].unit_positive_mass);
+    try std.testing.expectEqual(3 * n, scope.relations[@intFromEnum(F.Relation.register)].unit_negative_mass);
+    const before = scope;
+    try std.testing.expectError(error.InvalidCpuPairGeometry, addCpuRoleMode(&scope, .{ .core = .cpu }, 23, true));
+    try std.testing.expectEqualDeep(before, scope);
 }

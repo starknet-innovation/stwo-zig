@@ -54,6 +54,8 @@ pub const Worker = struct {
     arena_buffer: ?[*]u32 = null,
     slots: [3]Slot = @splat(.{}),
     persistent_map: std.AutoHashMapUnmanaged([32]u8, api.DeviceBuffer) = .empty,
+    /// Immutable buffers carried into the current class epoch but not claimed.
+    carried_persistent: std.ArrayListUnmanaged([32]u8) = .empty,
     /// Buffers of failed fills: possibly still targeted by in-flight copies, freed at shutdown.
     retired: std.ArrayListUnmanaged(api.DeviceBuffer) = .empty,
     /// Pinned slot buffers replaced by lazy growth, freed when the pipeline is
@@ -298,11 +300,16 @@ pub const Worker = struct {
             // Released retained regions are freed here, on the worker thread.
             self.drainRetained();
             const idle = staged == null and running == null;
-            // Park/unpark run only with an empty pipeline (park drains first).
-            if (idle) if (self.takeControl()) |c| {
-                self.serviceControl(c);
-                continue;
-            };
+            if (idle) {
+                // Completed jobs have settled their uploads and device work.
+                // The next serial job can stage into the entire arena.
+                self.arena.staged = .{ 0, 0 };
+                // Park/unpark run only with an empty pipeline.
+                if (self.takeControl()) |c| {
+                    self.serviceControl(c);
+                    continue;
+                }
+            }
             const next = self.take(idle);
             if (next == null and idle) {
                 if (self.isClosing()) break;
@@ -373,6 +380,10 @@ pub const Worker = struct {
     /// park). `same_base` / `arenaEpoch` tell graph caches whether device
     /// addresses they captured are still valid. Any thread.
     pub const unpark = @import("worker_control_phase.zig").unpark;
+    pub const replaceClassEpoch = @import("worker_control_phase.zig").replaceClassEpoch;
+    pub const unparkForSetup = @import("worker_control_phase.zig").unparkForSetup;
+    pub const claimCarried = @import("worker_control_phase.zig").claimCarried;
+    pub const releaseUnclaimed = @import("worker_control_phase.zig").releaseUnclaimed;
 
     pub const isParked = @import("worker_control_phase.zig").isParked;
 
@@ -459,13 +470,30 @@ pub const Worker = struct {
             @memcpy(copy, src);
             break :blk copy;
         };
+        try self.orderStaging(slot);
+        try O.check(self.ops.exec.copy_async(dst.ptr, source.ptr, source.len * 4, @intFromEnum(O.CopyKind.h2d), self.h2d_stream));
+        slot.uploads = true;
+    }
+
+    pub fn stageCircleTwiddles(self: *Worker, dst: api.DeviceBuffer, log: u32, direction: api.CircleTwiddle) !bool {
+        const generate = self.ops.exec.circle_twiddles orelse return false;
+        const slot = self.staging orelse return error.StagerOutsidePhaseOne;
+        if (log < 2 or log > 28 or dst.words != direction.words(log) or !self.isPersistent(dst, dst.words))
+            return error.UploadOutsideJobMemory;
+        try self.orderStaging(slot);
+        // Stage settlement waits for enqueued copies and retires fresh
+        // persistent entries from jobs that fail to populate them.
+        slot.uploads = true;
+        try O.check(generate(self.context, dst.ptr, log, @intFromEnum(direction), self.h2d_stream));
+        return true;
+    }
+
+    fn orderStaging(self: *Worker, slot: *Slot) !void {
         if (!slot.h2d_ordered) {
             // The previous enqueued job may still use this side of the arena.
             if (self.last_enqueued) |prior| try O.check(self.ops.exec.stream_wait(self.h2d_stream, prior.done_event.?));
             slot.h2d_ordered = true;
         }
-        try O.check(self.ops.exec.copy_async(dst.ptr, source.ptr, source.len * 4, @intFromEnum(O.CopyKind.h2d), self.h2d_stream));
-        slot.uploads = true;
     }
 
     fn isPersistent(self: *Worker, dst: api.DeviceBuffer, words: usize) bool {
@@ -502,6 +530,8 @@ pub const Worker = struct {
         slot.persistent_words += words;
         if (self.persistent_map.get(key)) |b| {
             if (b.words != words) return error.PersistentGeometryMismatch;
+            const carried = @import("worker_control_phase.zig");
+            _ = carried.unmarkCarried(self, key);
             return .{ .buffer = b, .fresh = false };
         }
         if (self.warm_persistent_only) return error.PersistentClassNotWarmed;
@@ -662,6 +692,8 @@ pub const Worker = struct {
     /// over it (stream-ordered: every earlier job on this exec stream is
     /// before it). The base is the same in both phases.
     pub const installPlanArena = @import("worker_execution_phase.zig").installPlanArena;
+    pub const admitSetupArena = @import("worker_control_phase.zig").admitSetupArena;
+    pub const admitInstallArena = @import("worker_control_phase.zig").admitInstallArena;
 
     /// Teardown (worker thread, every batch finished or quiesced): free the
     /// plan block and leave the worker parked (no arena; `unpark` may

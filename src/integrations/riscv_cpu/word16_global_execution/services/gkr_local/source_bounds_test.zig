@@ -36,6 +36,26 @@ test "source admission derives geometry and signed/support bounds without constr
         .{ .family = .add, .first_id = 1, .calls = 1, .logs = .{ try layout.logSize(.product, program.get(.add), 1), try layout.logSize(.linear, program.get(.add), 1) } },
         .{ .family = .double, .first_id = 1, .calls = 1, .logs = .{ try layout.logSize(.product, program.get(.double), 1), try layout.logSize(.linear, program.get(.double), 1) } },
     };
+    {
+        const Envelope = @import("service_scope.zig").Envelope;
+        const profile = @import("../../../word16_execution/om31_security_candidate.zig").Profile.conjectured128_b2_q108_p20_fold4;
+        try std.testing.expect(!std.mem.eql(u8, &Envelope.compact_wide.identity(profile), &Envelope.admitted.identity(profile)));
+        var wide = cpu;
+        wide[0].geometry.cpu_log = 23;
+        wide[0].geometry.cpu_compact_decode = true;
+        wide[0].geometry.cpu_fused_tail = true;
+        var wide_requests = requests;
+        wide_requests[0].base.cpu.steps = (1 << 23) - 1;
+        var expanded = try Bounds.deriveForEnvelope(.compact_wide, a, captured.program.log_size, &wide, &truth, &wide_requests);
+        defer expanded.deinit();
+        try std.testing.expectEqual(23, expanded.shape.max_trace_log);
+        try std.testing.expect(expanded.cpu_scopes[0].relations[@intFromEnum(Relation.range16)].unit_consumer_mass >= 6 * @as(u64, 1 << 23));
+        try std.testing.expectError(error.CandidateSourceShapeExceeded, expanded.shape.validate());
+        try std.testing.expectError(error.InvalidCpuCompactGeometry, Bounds.derive(a, captured.program.log_size, &wide, &truth, &wide_requests));
+        try std.testing.expectError(error.CandidateSourceShapeExceeded, Bounds.deriveForEnvelope(.compact_wide, a, 23, &wide, &truth, &wide_requests));
+        wide[0].geometry.cpu_compact_decode = false;
+        try std.testing.expectError(error.InvalidLocalGkrGeometry, Bounds.deriveForEnvelope(.compact_wide, a, captured.program.log_size, &wide, &truth, &wide_requests));
+    }
     var report = try Bounds.derive(a, captured.program.log_size, &cpu, &truth, &requests);
     defer report.deinit();
     try std.testing.expectEqualStrings(Bounds.ACCOUNTING_PROFILE, report.accounting_profile);

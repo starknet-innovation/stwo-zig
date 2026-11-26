@@ -12,7 +12,7 @@
 //!
 //!   stage   - upload the raw FIXED evaluations (sorted commit layout), the
 //!             sorted log table and the eval-height twiddles;
-//!   enqueue - outer_trace_commit (B2N -> LDE -> Merkle), root -> slab;
+//!   enqueue - interpolate in place or into a handoff, commit, root -> slab;
 //!   finish  - read the root.
 const std = @import("std");
 const api = @import("api.zig");
@@ -21,6 +21,7 @@ const K = @import("outer_kernels.zig");
 const TC = @import("outer_trace_commit.zig");
 const Packed = @import("outer_packed_class.zig");
 const Graphs = @import("outer_graph_cache.zig");
+const Circle = @import("circle_twiddles.zig");
 
 pub const root_index: u32 = 0x4649_5852; // "FIXR"
 
@@ -30,8 +31,9 @@ pub const Inputs = struct {
     raw: ?[]const []const u32,
     /// TC.sortedLogs(plan) (plan.order.len words).
     sorted_logs: []const u32,
-    twiddles: []const u32,
-    itwiddles: []const u32,
+    twiddles: []const u32 = &.{},
+    itwiddles: []const u32 = &.{},
+    device_twiddles: bool = false,
 };
 
 pub const Handoff = struct { key: [32]u8, words: usize };
@@ -40,7 +42,7 @@ pub const FixedJob = struct {
     in: Inputs,
     kernels: *const K.Kernels,
     layout: api.ProofLayout = .{},
-    evaluations: [*]const u32 = undefined,
+    evaluations: [*]u32 = undefined,
     packed_input: ?Packed.Staged = null,
     logs: [*]const u32 = undefined,
     twiddles: [*]const u32 = undefined,
@@ -64,10 +66,12 @@ pub const FixedJob = struct {
     outcome: Graphs.Outcome = .direct,
     /// Optional stream timing hook (outer_job.Timing shape), outside capture.
     timing: ?K.Timing = null,
+    stream: ?TC.Stream = null,
 
     pub fn init(in: Inputs, kernels: *const K.Kernels) !FixedJob {
         if (in.sorted_logs.len != in.plan.order.len) return error.InvalidOuterFixedGather;
         if (in.raw) |raw| if (raw.len != in.plan.offsets.len) return error.InvalidOuterFixedGather;
+        if (in.device_twiddles and (in.twiddles.len != 0 or in.itwiddles.len != 0)) return error.InvalidOuterTwiddles;
         var out = FixedJob{ .in = in, .kernels = kernels };
         _ = try out.layout.add(.opaque_words, root_index, 8);
         if (in.raw == null) _ = try out.layout.add(.opaque_words, Packed.field_index, 1);
@@ -75,6 +79,17 @@ pub const FixedJob = struct {
     }
     pub fn job(self: *FixedJob) api.Job {
         return api.Job.from(FixedJob, self);
+    }
+    pub fn boundScratch(self: *FixedJob, a: std.mem.Allocator) !void {
+        if (self.stream != null) return;
+        if (!try TC.streamSelected(self.kernels)) return;
+        var stream = try TC.Stream.init(a, self.in.plan, try TC.streamChunkWords(), self.kernels.mixed_compact != null);
+        if (stream.scratchWords(false) < self.commitWords()) {
+            self.stream = stream;
+        } else stream.deinit(a);
+    }
+    pub fn deinit(self: *FixedJob, a: std.mem.Allocator) void {
+        if (self.stream) |*stream| stream.deinit(a);
     }
     pub fn classKey(self: *FixedJob) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
@@ -87,13 +102,24 @@ pub const FixedJob = struct {
     }
     fn stagedWords(self: *const FixedJob) u64 {
         const p = self.in.plan;
-        return (if (self.in.raw != null) g(p.coefficient_words) else 0) + g(self.in.sorted_logs.len) + g(self.in.twiddles.len) + g(self.in.itwiddles.len);
+        const twiddles = if (self.in.device_twiddles) 0 else g(self.in.twiddles.len) + g(self.in.itwiddles.len);
+        return (if (self.in.raw != null) g(p.coefficient_words) else 0) + g(self.in.sorted_logs.len) + twiddles;
+    }
+    pub fn persistentWords(self: *const FixedJob) usize {
+        const tower = if (self.in.device_twiddles) api.CircleTwiddle.both.words(self.in.plan.eval_log) else 0;
+        return tower + if (self.handoff) |region| region.words else 0;
+    }
+    fn commitWords(self: *const FixedJob) u64 {
+        if (self.stream) |*stream| return stream.scratchWords(false);
+        const p = self.in.plan;
+        return g(p.tree_words + p.prefix_words) + g(p.evaluation_words);
     }
     pub fn footprint(self: *FixedJob) api.Footprint {
         const p = self.in.plan;
-        // Staged inputs + coefficients + tree/prefix + the LDE scratch TC
-        // allocates and frees inside (one evaluation image).
-        const device = self.stagedWords() + g(p.coefficient_words) + g(p.tree_words + p.prefix_words) + g(p.evaluation_words);
+        // The staged source is overwritten by the interpolation unless the
+        // job has a persistent handoff. A packed source is owned and budgeted
+        // by the enclosing warm job.
+        const device = self.stagedWords() + self.commitWords();
         return .{ .device_words = @intCast(device), .staged_words = @intCast(self.stagedWords()), .slab_words = self.layout.words, .pinned_words = @intCast((if (self.in.raw != null) p.coefficient_words else 0) + self.in.sorted_logs.len + self.in.twiddles.len + self.in.itwiddles.len) };
     }
     fn upload(s: *api.Stager, words: []const u32) ![*]const u32 {
@@ -121,8 +147,16 @@ pub const FixedJob = struct {
             self.evaluations = d.ptr;
         }
         self.logs = try upload(s, self.in.sorted_logs);
-        self.twiddles = try upload(s, self.in.twiddles);
-        self.itwiddles = try upload(s, self.in.itwiddles);
+        if (self.in.device_twiddles) {
+            const n = api.CircleTwiddle.both.words(p.eval_log);
+            const tower = try s.persistent(Circle.pairKey(p.eval_log), n);
+            if (tower.fresh and !try s.circleTwiddles(tower.buffer, p.eval_log, .both)) return error.MissingDeviceCircleTwiddles;
+            self.twiddles = tower.buffer.ptr;
+            self.itwiddles = tower.buffer.ptr + n / 2;
+        } else {
+            self.twiddles = try upload(s, self.in.twiddles);
+            self.itwiddles = try upload(s, self.in.itwiddles);
+        }
         if (self.handoff) |h| if (h.words >= p.coefficient_words) {
             // Contents are always rewritten, fresh or not. A region that
             // cannot be acquired (device memory) leaves the arena path.
@@ -165,11 +199,10 @@ pub const FixedJob = struct {
         }
         var view = View{ .e = e };
         var device = K.Device{ .ctx = e.ctx(), .stream = e.stream(), .impl = &view, .vtable = &View.vtable, .kernels = self.kernels };
-        // Tree below the coefficients' LIFO scratch (TC frees its LDE inside).
-        // Outputs outside the body; the commit's own scratch is LIFO inside
-        // it, so a discarded capture leaves the window as it was (re-runnable).
-        const tree = try device.alloc(@intCast(p.tree_words + p.prefix_words));
-        const coefficients: K.Buffer = if (self.handoff_buffer) |b| .{ .ptr = b.ptr, .words = b.words } else try device.alloc(@intCast(p.coefficient_words));
+        // The full commit's tree lives outside graph capture. A streamed
+        // root-only commit allocates and frees its banks inside the body.
+        const tree = if (self.stream == null) try device.alloc(@intCast(p.tree_words + p.prefix_words)) else null;
+        const coefficients = if (self.handoff_buffer) |b| b.ptr else self.evaluations;
         var body = Body{ .job = self, .device = &device, .tree = tree, .coefficients = coefficients, .out = out.ptr };
         if (self.timing) |t| t.mark(t.ctx, false, e.stream());
         defer if (self.timing) |t| t.mark(t.ctx, true, e.stream());
@@ -186,22 +219,28 @@ pub const FixedJob = struct {
     const Body = struct {
         job: *FixedJob,
         device: *K.Device,
-        tree: K.Buffer,
-        coefficients: K.Buffer,
+        tree: ?K.Buffer,
+        coefficients: [*]u32,
         out: [*]u32,
         last: u32 = 0,
         pub fn enqueue(self: *Body) !u32 {
             const j = self.job;
             const before = self.device.counters.total();
             defer self.last = self.device.counters.total() - before;
-            try TC.enqueue(self.device, j.in.plan, .{ .evaluations = j.evaluations, .coefficients = self.coefficients.ptr, .tree = self.tree, .statics = .{
+            const statics: TC.Statics = .{
                 .sorted_logs = j.logs,
                 .twiddles = j.twiddles,
-                .twiddle_words = @intCast(j.in.twiddles.len),
+                .twiddle_words = @intCast(if (j.in.device_twiddles) api.CircleTwiddle.forward.words(j.in.plan.eval_log) else j.in.twiddles.len),
                 .itwiddles = j.itwiddles,
-                .itwiddle_words = @intCast(j.in.itwiddles.len),
-            } });
-            try self.device.copy(self.out, TC.rootPointer(j.in.plan, self.tree), 8);
+                .itwiddle_words = @intCast(if (j.in.device_twiddles) api.CircleTwiddle.inverse.words(j.in.plan.eval_log) else j.in.itwiddles.len),
+            };
+            if (j.stream) |*stream| {
+                try TC.enqueueStreamed(self.device, j.in.plan, stream, .{ .evaluations = j.evaluations, .coefficients = self.coefficients, .root_out = self.out, .statics = statics });
+            } else {
+                const tree = self.tree orelse return error.OuterTreeBufferTooSmall;
+                try TC.enqueue(self.device, j.in.plan, .{ .evaluations = j.evaluations, .coefficients = self.coefficients, .tree = tree, .statics = statics });
+                try self.device.copy(self.out, TC.rootPointer(j.in.plan, tree), 8);
+            }
             return self.device.counters.total() - before;
         }
         pub fn reset(_: *Body) void {}
@@ -239,10 +278,21 @@ test "cold FIXED accepts only a successful device decode and budgets its residen
     var resident = try FixedJob.init(external, &dummy);
     const h = host.footprint();
     const r = resident.footprint();
+    try t.expectEqual(host.stagedWords() + host.commitWords(), h.device_words);
+    try t.expectEqual(resident.stagedWords() + resident.commitWords(), r.device_words);
     try t.expectEqual(plan.coefficient_words, h.pinned_words - r.pinned_words);
     try t.expectEqual(FixedJob.g(plan.coefficient_words), h.staged_words - r.staged_words);
     try t.expectEqual(h.staged_words - r.staged_words, h.device_words - r.device_words);
     try t.expectEqual(h.slab_words + 1, r.slab_words);
+    var device = external;
+    device.twiddles = &.{};
+    device.itwiddles = &.{};
+    device.device_twiddles = true;
+    var device_job = try FixedJob.init(device, &dummy);
+    try t.expectEqual(@as(usize, 1) << @intCast(plan.eval_log), device_job.persistentWords());
+    const d = device_job.footprint();
+    try t.expectEqual(@as(usize, 2), r.pinned_words - d.pinned_words);
+    try t.expectEqual(2 * FixedJob.g(1), r.staged_words - d.staged_words);
     var words: [9]u32 = @splat(17);
     const view = api.SlabView{ .layout = &resident.layout, .words = &words, .receipt = .{} };
     words[8] = api.gpu_native.Verdict.accepted;
@@ -253,4 +303,37 @@ test "cold FIXED accepts only a successful device decode and budgets its residen
         try t.expectError(error.PackedClassDecodeFailed, resident.finish(view));
         try t.expect(resident.root == null);
     }
+}
+
+test "root-only FIXED selects bounded scratch for a wide commitment" {
+    const t = std.testing;
+    const Fake = struct {
+        fn layer(_: *const anyopaque, _: u32, _: *anyopaque, _: *anyopaque) callconv(.c) c_int {
+            unreachable;
+        }
+        fn mixed(_: u32, _: u32, _: [*]const @import("../abi.zig").MixedSegment, _: u32, _: u32, _: ?*const anyopaque, _: ?*anyopaque, _: ?*anyopaque, _: *anyopaque) callconv(.c) c_int {
+            unreachable;
+        }
+    };
+    const logs: [256]u32 = @splat(18);
+    var plan = try Plan.TreePlan.init(t.allocator, &logs, 1);
+    defer plan.deinit(t.allocator);
+    var kernels: K.Kernels = undefined;
+    kernels.layer = null;
+    kernels.mixed_compact = null;
+    kernels.mixed_seeded = null;
+    var job = try FixedJob.init(.{ .plan = &plan, .raw = null, .sorted_logs = &logs, .device_twiddles = true }, &kernels);
+    defer job.deinit(t.allocator);
+    const full = job.footprint();
+    try job.boundScratch(t.allocator);
+    try t.expect(job.stream == null);
+    kernels.layer = Fake.layer;
+    kernels.mixed_seeded = Fake.mixed;
+    try job.boundScratch(t.allocator);
+    try t.expect(job.stream != null);
+    const bounded = job.footprint();
+    try t.expect(bounded.device_words < full.device_words);
+    try t.expectEqual(full.staged_words, bounded.staged_words);
+    try t.expectEqual(full.pinned_words, bounded.pinned_words);
+    try t.expectEqual(full.slab_words, bounded.slab_words);
 }

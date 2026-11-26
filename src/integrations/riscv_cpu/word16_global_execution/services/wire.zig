@@ -320,6 +320,9 @@ pub fn validate(m: Metadata, limits: Limits) !void {
 /// declaration/request/proof fields; no dummy Q claims or producer
 /// security/profile authority are introduced for a wide proof.
 pub fn validateDeclarations(cpus: anytype, truths: anytype, memory_words: u32, limits: Limits) !void {
+    return validateDeclarationsFor(.classic, cpus, truths, memory_words, limits);
+}
+pub fn validateDeclarationsFor(projection: Geo.Projection, cpus: anytype, truths: anytype, memory_words: u32, limits: Limits) !void {
     if (cpus.len == 0 or cpus.len > limits.max_cpus or truths.len > limits.max_truths or cpus.len > 65535 or truths.len > 65535 - cpus.len) return error.InvalidServicesWireRoster;
     if (memory_words > limits.max_memory_words or memory_words >= 1 << 23) return error.InvalidMemorySidecarCount;
     var totals: [T.FAMILIES]u64 = @splat(0);
@@ -330,7 +333,7 @@ pub fn validateDeclarations(cpus: anytype, truths: anytype, memory_words: u32, l
     var ram: u64 = 2 * @as(u64, memory_words);
     for (cpus, 0..) |cpu, index| {
         const g = cpu.declaration.geometry;
-        try g.validate();
+        try projection.validate(g);
         try cpu.request.cpu.validate(g.cpu_log);
         if (cpu.request.epoch != index + 1 or cpu.request.memory_epoch != cpu.request.epoch or cpu.request.division_requests > cpu.request.cpu.steps or @as(u64, cpu.request.multiplication_requests) > 2 * @as(u64, cpu.request.cpu.steps) or serviceCalls(cpu.request) > cpu.request.cpu.steps) return error.InvalidServicesWireRequest;
         const calls = cpu.request.all();

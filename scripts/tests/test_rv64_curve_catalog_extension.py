@@ -30,4 +30,11 @@ class Extension(unittest.TestCase):
         for base, fresh in [(catalogue(7), catalogue(15)), (catalogue(10), catalogue(12)), (catalogue(10)+"int x;", catalogue(15))]:
             with self.assertRaises(ValueError): m.extend_catalog(base, fresh)
 
+    def test_full_curve_roster_extends_legacy_catalogue(self):
+        out = m.extend_catalog(catalogue(15), catalogue(m.TRUTH_ROLE_COUNT, 99), first_new_role=15)
+        for i in range(15):
+            self.assertIn(f"{{truth_parts_{i},{i+1}u}}", out)
+        for i in range(15, m.TRUTH_ROLE_COUNT):
+            self.assertIn(f"{{truth_parts_{i},{i+100}u}}", out)
+
 if __name__ == "__main__": unittest.main()

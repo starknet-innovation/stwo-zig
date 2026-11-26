@@ -18,6 +18,40 @@ pub const Suite = @import("pcs_suite.zig").Suite;
 pub const NativeCache = @import("fixed_native_cache.zig");
 pub const ProgramMetadata = @import("program_metadata.zig");
 pub const ImmutableCaches = struct { native: ?*const NativeCache.Cache = null, program: ?*const ProgramMetadata.Cache = null };
+
+/// Immutable providers that have the same physical columns in every layout.
+/// A service can own one copy while its setup keys borrow the evaluations.
+pub const FixedTables = struct {
+    allocator: std.mem.Allocator,
+    boundary: []M,
+    range16: []M,
+    range8: []M,
+    selection: []M,
+    shift: B.shift_word_packed_experiment.table.Setup,
+    and_: air.providers.tables.Setup,
+
+    pub fn init(a: std.mem.Allocator) !FixedTables {
+        const boundary = try W.fixed.boundary(a);
+        errdefer a.free(boundary);
+        const range16 = try W.fixed.range(a, 16);
+        errdefer a.free(range16);
+        const range8 = try W.fixed.range(a, 8);
+        errdefer a.free(range8);
+        const selection = try selectionFixed(a);
+        errdefer a.free(selection);
+        var shift = try B.shift_word_packed_experiment.table.Setup.init(a);
+        errdefer shift.deinit();
+        return .{ .allocator = a, .boundary = boundary, .range16 = range16, .range8 = range8, .selection = selection, .shift = shift, .and_ = try air.providers.tables.Setup.init(a, .byte_and) };
+    }
+
+    pub fn deinit(self: *FixedTables) void {
+        self.and_.deinit();
+        self.shift.deinit();
+        for ([_][]M{ self.boundary, self.range16, self.range8, self.selection }) |words| self.allocator.free(words);
+        self.* = undefined;
+    }
+};
+
 pub const Materials = struct {
     suite: Suite = Suite.production(),
     allocator: std.mem.Allocator,
@@ -25,7 +59,6 @@ pub const Materials = struct {
     fixed_retired: bool = false,
     program: Program,
     cpu_fixed: []M,
-    boundary_fixed: []M,
     alu_fixed: []M,
     alu_tail_fixed: []M,
     binary_fixed: []M,
@@ -35,15 +68,12 @@ pub const Materials = struct {
     jalr_fixed: []M,
     division_fixed: []M,
     multiplication_fixed: []M,
-    range16_fixed: []M,
-    range8_fixed: []M,
     ls_fixed: []M,
     ls_tail_fixed: []M,
     memory_boundary_fixed: []M,
     memory_terminal_fixed: ?[]M = null,
-    selection_fixed: []M,
-    shift_table: B.shift_word_packed_experiment.table.Setup,
-    and_table: air.providers.tables.Setup,
+    tables: FixedTables,
+    owns_tables: bool,
     pub fn init(a: std.mem.Allocator, expected: air.program.setup.Program, geometry: Geometry) !Materials {
         return initWithSuite(a, expected, geometry, Suite.production());
     }
@@ -57,7 +87,7 @@ pub const Materials = struct {
         try geometry.validate();
         var program = try Program.initWithProfile(a, expected, profile);
         errdefer program.deinit();
-        return fromProgram(a, program, geometry, suite);
+        return fromProgram(a, program, geometry, suite, null);
     }
     pub fn initWithAuthority(a: std.mem.Allocator, authority: *const Full.ProgramAuthority, geometry: Geometry) !Materials {
         return initWithAuthorityAndSuite(a, authority, geometry, Suite.production());
@@ -66,18 +96,29 @@ pub const Materials = struct {
         return initWithAuthorityAndSuiteAndMetadataCache(a, authority, geometry, suite, null);
     }
     pub fn initWithAuthorityAndSuiteAndMetadataCache(a: std.mem.Allocator, authority: *const Full.ProgramAuthority, geometry: Geometry, suite: Suite, cache: ?*const ProgramMetadata.Cache) !Materials {
+        return initWithAuthorityAndFixedTables(a, authority, geometry, suite, cache, null);
+    }
+    pub fn initWithAuthorityAndFixedTables(a: std.mem.Allocator, authority: *const Full.ProgramAuthority, geometry: Geometry, suite: Suite, cache: ?*const ProgramMetadata.Cache, tables: ?*const FixedTables) !Materials {
         try suite.validate();
         try geometry.validate();
-        var program = if (cache) |owner| try Program.initWithAuthorityAndMetadataCache(a, authority, owner) else try Program.initWithAuthority(a, authority);
-        errdefer program.deinit();
-        return fromProgram(a, program, geometry, suite);
+        return materializeFixedTables(a, authority, geometry, suite, cache, tables);
     }
-    fn fromProgram(a: std.mem.Allocator, program: Program, geometry: Geometry, suite: Suite) !Materials {
+    /// Independent of interaction columns. The roster still has to admit the
+    /// projection before a prover or receiver can use the resulting FIXED key.
+    pub fn initMainProjectionWithFixedTables(a: std.mem.Allocator, authority: *const Full.ProgramAuthority, geometry: Geometry, suite: Suite, cache: ?*const ProgramMetadata.Cache, tables: ?*const FixedTables) !Materials {
+        try suite.validate();
+        try geometry.validateMainProjection();
+        return materializeFixedTables(a, authority, geometry, suite, cache, tables);
+    }
+    fn materializeFixedTables(a: std.mem.Allocator, authority: *const Full.ProgramAuthority, geometry: Geometry, suite: Suite, cache: ?*const ProgramMetadata.Cache, tables: ?*const FixedTables) !Materials {
+        var program = try Program.initFixedWithAuthority(a, authority, cache, geometry.cpu_compact_decode);
+        errdefer program.deinit();
+        return fromProgram(a, program, geometry, suite, tables);
+    }
+    fn fromProgram(a: std.mem.Allocator, program: Program, geometry: Geometry, suite: Suite, tables: ?*const FixedTables) !Materials {
         if (program.compact and !geometry.cpu_compact_decode) return error.InvalidCpuCompactGeometry;
         const cpu = try W.fixed.cpu(a, geometry.cpu_log);
         errdefer a.free(cpu);
-        const boundary = try W.fixed.boundary(a);
-        errdefer a.free(boundary);
         const alu = try B.alu_experiment.source.fixedForLog(a, geometry.alu_log);
         errdefer a.free(alu);
         const alu_tail = if (geometry.alu_tail_log) |log| try B.alu_experiment.source.fixedForLog(a, log) else try a.alloc(M, 0);
@@ -96,10 +137,6 @@ pub const Materials = struct {
         errdefer a.free(division);
         const multiplication = try air.arithmetic.multiplication.trace.fixedColumnsForLog(a, geometry.multiplication_log);
         errdefer a.free(multiplication);
-        const range16 = try W.fixed.range(a, 16);
-        errdefer a.free(range16);
-        const range8 = try W.fixed.range(a, 8);
-        errdefer a.free(range8);
         const ls = try air.memory.load_store_v2.source.fixed(a, geometry.ls_log);
         errdefer a.free(ls);
         const ls_tail = if (geometry.ls_tail_log) |log| try air.memory.load_store_v2.source.fixed(a, log) else try a.alloc(M, 0);
@@ -108,17 +145,13 @@ pub const Materials = struct {
         errdefer a.free(memory_boundary);
         const memory_terminal = if (geometry.initialLog() != geometry.terminalLog()) try air.memory.load_store_v2.boundary_source.fixed(a, geometry.terminalLog()) else null;
         errdefer if (memory_terminal) |data| a.free(data);
-        const selection = try selectionFixed(a);
-        errdefer a.free(selection);
-        var shifts = try B.shift_word_packed_experiment.table.Setup.init(a);
-        errdefer shifts.deinit();
-        var and_ = try air.providers.tables.Setup.init(a, .byte_and);
-        errdefer and_.deinit();
+        var providers = if (tables) |borrowed| borrowed.* else try FixedTables.init(a);
+        errdefer if (tables == null) providers.deinit();
         // Last fallible step: on failure the caller's program copy is intact
         // (makeCompact allocates the compact ROM before freeing the legacy one).
         var bound = program;
         if (geometry.cpu_compact_decode) try bound.makeCompact();
-        return .{ .allocator = a, .suite = suite, .geometry = geometry, .program = bound, .cpu_fixed = cpu, .boundary_fixed = boundary, .alu_fixed = alu, .alu_tail_fixed = alu_tail, .binary_fixed = binary, .binary_tail_fixed = binary_tail, .shift_fixed = shift, .shift_tail_fixed = shift_tail, .jalr_fixed = jalr, .division_fixed = division, .multiplication_fixed = multiplication, .range16_fixed = range16, .range8_fixed = range8, .ls_fixed = ls, .ls_tail_fixed = ls_tail, .memory_boundary_fixed = memory_boundary, .memory_terminal_fixed = memory_terminal, .selection_fixed = selection, .shift_table = shifts, .and_table = and_ };
+        return .{ .allocator = a, .suite = suite, .geometry = geometry, .program = bound, .cpu_fixed = cpu, .alu_fixed = alu, .alu_tail_fixed = alu_tail, .binary_fixed = binary, .binary_tail_fixed = binary_tail, .shift_fixed = shift, .shift_tail_fixed = shift_tail, .jalr_fixed = jalr, .division_fixed = division, .multiplication_fixed = multiplication, .ls_fixed = ls, .ls_tail_fixed = ls_tail, .memory_boundary_fixed = memory_boundary, .memory_terminal_fixed = memory_terminal, .tables = providers, .owns_tables = tables == null };
     }
     /// Retire only original matrices not used by native request generators.
     /// All phase/shape checks precede mutation; the sealed key stays unchanged.
@@ -138,9 +171,8 @@ pub const Materials = struct {
     }
     pub fn deinit(self: *Materials) void {
         if (self.memory_terminal_fixed) |data| self.allocator.free(data);
-        self.and_table.deinit();
-        self.shift_table.deinit();
-        for ([_][]M{ self.cpu_fixed, self.boundary_fixed, self.alu_fixed, self.alu_tail_fixed, self.binary_fixed, self.binary_tail_fixed, self.shift_fixed, self.shift_tail_fixed, self.jalr_fixed, self.division_fixed, self.multiplication_fixed, self.range16_fixed, self.range8_fixed, self.ls_fixed, self.ls_tail_fixed, self.memory_boundary_fixed, self.selection_fixed }) |fixed| self.allocator.free(fixed);
+        if (self.owns_tables) self.tables.deinit();
+        for ([_][]M{ self.cpu_fixed, self.alu_fixed, self.alu_tail_fixed, self.binary_fixed, self.binary_tail_fixed, self.shift_fixed, self.shift_tail_fixed, self.jalr_fixed, self.division_fixed, self.multiplication_fixed, self.ls_fixed, self.ls_tail_fixed, self.memory_boundary_fixed }) |fixed| self.allocator.free(fixed);
         self.program.deinit();
         self.* = undefined;
     }
@@ -171,7 +203,7 @@ pub const Materials = struct {
             const data: []const M = switch (s.role) {
                 .cpu => self.cpu_fixed,
                 .rom => self.program.fixed,
-                .boundary => self.boundary_fixed,
+                .boundary => self.tables.boundary,
                 .alu => self.alu_fixed,
                 .alu_tail => self.alu_tail_fixed,
                 .binary => self.binary_fixed,
@@ -181,15 +213,15 @@ pub const Materials = struct {
                 .jalr => self.jalr_fixed,
                 .division => self.division_fixed,
                 .multiplication => self.multiplication_fixed,
-                .shift_table => self.shift_table.fixed,
-                .and_table => self.and_table.fixed,
-                .range16 => self.range16_fixed,
-                .range8 => self.range8_fixed,
+                .shift_table => self.tables.shift.fixed,
+                .and_table => self.tables.and_.fixed,
+                .range16 => self.tables.range16,
+                .range8 => self.tables.range8,
                 .ls => self.ls_fixed,
                 .ls_tail => self.ls_tail_fixed,
                 .initial => self.memory_boundary_fixed,
                 .terminal => self.memory_terminal_fixed orelse self.memory_boundary_fixed,
-                .selection => self.selection_fixed,
+                .selection => self.tables.selection,
             };
             try @import("../word16/cpu_materials.zig").fillColumns(out[s.offsets[0]..][0..s.widths[0]], data, s.log);
         }
@@ -240,7 +272,7 @@ pub const Setup = struct {
             owned.deinit();
             return err;
         };
-        var materials = Materials.fromProgram(a, program, geometry, suite) catch |err| {
+        var materials = Materials.fromProgram(a, program, geometry, suite, null) catch |err| {
             var owned = program;
             owned.deinit();
             return err;
@@ -309,3 +341,32 @@ pub const Setup = struct {
         self.* = undefined;
     }
 };
+
+test "shared immutable providers preserve every fixed column and outlive setup teardown" {
+    const t = std.testing;
+    const a = t.allocator;
+    var authority = try Full.ProgramAuthority.init(a, .{ .base = 4096, .words = &.{0x00700093} }, .ethereum_services_v2);
+    defer authority.deinit();
+    var tables = try FixedTables.init(a);
+    defer tables.deinit();
+    const suite = Suite.experimentalFold4();
+    for ([_]Geometry{ .{ .cpu_log = 5 }, .{ .cpu_log = 6, .alu_log = 6, .ls_log = 6 } }) |geometry| {
+        var owned = try Materials.initWithAuthorityAndSuiteAndMetadataCache(a, &authority, geometry, suite, null);
+        defer owned.deinit();
+        var shared = try Materials.initWithAuthorityAndFixedTables(a, &authority, geometry, suite, null, &tables);
+        defer shared.deinit();
+        try t.expectEqual(tables.shift.fixed.ptr, shared.tables.shift.fixed.ptr);
+        try t.expectEqual(tables.range16.ptr, shared.tables.range16.ptr);
+        const expected = try owned.fixedColumns(a);
+        defer a.free(expected);
+        const actual = try shared.fixedColumns(a);
+        defer a.free(actual);
+        try t.expectEqual(expected.len, actual.len);
+        for (expected, actual) |x, y| {
+            try t.expectEqual(x.log_size, y.log_size);
+            try t.expectEqualSlices(M, x.values, y.values);
+        }
+        try shared.releaseFixedWitness();
+        try t.expectError(error.ExecutionFixedWitnessRetired, shared.fixedColumns(a));
+    }
+}

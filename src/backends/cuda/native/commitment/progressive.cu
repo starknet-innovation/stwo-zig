@@ -361,8 +361,24 @@ __global__ void contiguous_leaf_kernel(
 
 // A bounded launch descriptor replaces the full-domain progressive state
 // slab. Descriptors travel as kernel arguments; no upload or scratch is used.
+struct MixedColumns {
+    const uint32_t *columns;
+    size_t stride_words;
+    uint32_t column_count, lift_log;
+};
+
 struct MixedInputs {
-    MixedSegment segments[kMaxMixedSegments];
+    MixedColumns segments[kMaxMixedSegments];
+    uint32_t seed_lift;
+
+    void set(uint32_t i, MixedSegment segment, uint32_t columns, uint32_t size) {
+        // Both sizes have passed the power-of-two and containment checks.
+        segments[i] = {segment.columns, segment.stride_words, columns,
+                       uint32_t(__builtin_ctz(size) - __builtin_ctz(segment.source_size))};
+    }
+    void set_seed_lift(uint32_t size, uint32_t seed_size) {
+        seed_lift = seed_size ? __builtin_ctz(size) - __builtin_ctz(seed_size) : 0;
+    }
 };
 static_assert(sizeof(MixedSegment) == 32);
 static_assert(sizeof(MixedInputs) + 32 < 4096);
@@ -395,7 +411,7 @@ __global__ void mixed_leaf_kernel(uint32_t size, uint32_t count,
             // k * seed_size + r, so every warp load is one coalesced run.
             const uint32_t *words_in = reinterpret_cast<const uint32_t *>(seed);
             const uint32_t seed_row =
-                lifted_column_index(row, __ffs(size / seed_size) - 1);
+                lifted_column_index(row, inputs.seed_lift);
 #pragma unroll
             for (uint32_t k = 0; k < 8; ++k)
                 initial.hash[k] = words_in[size_t(k) * seed_size + seed_row];
@@ -405,7 +421,7 @@ __global__ void mixed_leaf_kernel(uint32_t size, uint32_t count,
                     initial.pending[k] =
                         words_in[size_t(8 + k) * seed_size + seed_row];
         } else {
-            initial = seed[lifted_column_index(row, __ffs(size / seed_size) - 1)];
+            initial = seed[lifted_column_index(row, inputs.seed_lift)];
         }
     } else {
         initialize_leaf_for<Prefixed>(initial.hash);
@@ -413,23 +429,14 @@ __global__ void mixed_leaf_kernel(uint32_t size, uint32_t count,
     STWO_LOAD_PROGRESSIVE(initial);
     uint64_t compressed_bytes = (Prefixed ? kDomainPrefixBytes : 0) +
         static_cast<uint64_t>(absorbed_before - pending) * 4;
-    uint64_t words = absorbed_before;
-    for (uint32_t segment = 0; segment < count; ++segment) {
-        const MixedSegment input = inputs.segments[segment];
-        const uint32_t ratio_log = __ffs(size / input.source_size) - 1;
-        const uint32_t source_row = lifted_column_index(row, ratio_log);
-        const uint32_t columns = input.capacity_words / input.stride_words;
-        uint32_t column = 0;
-        for (; column < columns; ++column) {
-            if (pending == 16) {
-                compressed_bytes += 64;
-                STWO_COMPRESS_PROGRESSIVE(compressed_bytes, 0);
-                pending = 0;
-            }
-            // A complete non-final block can be absorbed directly into the
-            // register state. Keep the final block pending for Blake2s's
-            // distinct final-compression flag.
-            if (pending == 0 && columns - column > 16) {
+    // All rows absorb the same widths. Keep a cursor at the next word and
+    // share the unrolled BLAKE2s compressor across data, prefix and final blocks.
+    uint32_t segment = 0, column = 0;
+    for (;;) {
+        while (segment < count && pending < 16) {
+            const MixedColumns input = inputs.segments[segment];
+            const uint32_t source_row = lifted_column_index(row, input.lift_log);
+            if (!pending && input.column_count - column >= 16) {
 #define STWO_MIXED_WORD(index) input.columns[                    \
                 static_cast<size_t>(column + index) *            \
                     input.stride_words + source_row]
@@ -450,41 +457,66 @@ __global__ void mixed_leaf_kernel(uint32_t size, uint32_t count,
                 p14 = STWO_MIXED_WORD(14);
                 p15 = STWO_MIXED_WORD(15);
 #undef STWO_MIXED_WORD
-                compressed_bytes += 64;
-                STWO_COMPRESS_PROGRESSIVE(compressed_bytes, 0);
-                column += 15;
-                continue;
+                pending = 16;
+                column += 16;
+            } else {
+                while (column < input.column_count && pending < 16) {
+                    const uint32_t word = input.columns[
+                        static_cast<size_t>(column) * input.stride_words + source_row];
+                    switch (pending++) {
+                        case 0: p0 = word; break;
+                        case 1: p1 = word; break;
+                        case 2: p2 = word; break;
+                        case 3: p3 = word; break;
+                        case 4: p4 = word; break;
+                        case 5: p5 = word; break;
+                        case 6: p6 = word; break;
+                        case 7: p7 = word; break;
+                        case 8: p8 = word; break;
+                        case 9: p9 = word; break;
+                        case 10: p10 = word; break;
+                        case 11: p11 = word; break;
+                        case 12: p12 = word; break;
+                        case 13: p13 = word; break;
+                        case 14: p14 = word; break;
+                        default: p15 = word; break;
+                    }
+                    ++column;
+                }
             }
-            const uint32_t word = input.columns[
-                static_cast<size_t>(column) * input.stride_words + source_row];
-            switch (pending++) {
-                case 0: p0 = word; break;
-                case 1: p1 = word; break;
-                case 2: p2 = word; break;
-                case 3: p3 = word; break;
-                case 4: p4 = word; break;
-                case 5: p5 = word; break;
-                case 6: p6 = word; break;
-                case 7: p7 = word; break;
-                case 8: p8 = word; break;
-                case 9: p9 = word; break;
-                case 10: p10 = word; break;
-                case 11: p11 = word; break;
-                case 12: p12 = word; break;
-                case 13: p13 = word; break;
-                case 14: p14 = word; break;
-                default: p15 = word; break;
+            if (column == input.column_count) {
+                column = 0;
+                ++segment;
             }
         }
-        words += columns;
+        const bool done = segment == count;
+        const bool final = done && result;
+        if (done && prefix && (!Eager || pending < 16)) break;
+        if (final && pending < 16) {
+            if (pending < 1) p0 = 0;
+            if (pending < 2) p1 = 0;
+            if (pending < 3) p2 = 0;
+            if (pending < 4) p3 = 0;
+            if (pending < 5) p4 = 0;
+            if (pending < 6) p5 = 0;
+            if (pending < 7) p6 = 0;
+            if (pending < 8) p7 = 0;
+            if (pending < 9) p8 = 0;
+            if (pending < 10) p9 = 0;
+            if (pending < 11) p10 = 0;
+            if (pending < 12) p11 = 0;
+            if (pending < 13) p12 = 0;
+            if (pending < 14) p13 = 0;
+            if (pending < 15) p14 = 0;
+            p15 = 0;
+        }
+        compressed_bytes += uint64_t(pending) * sizeof(uint32_t);
+        STWO_COMPRESS_PROGRESSIVE(compressed_bytes, final ? 0xffffffffu : 0);
+        pending = 0;
+        if (done) break;
     }
     if (prefix != nullptr) {
         if constexpr (Eager) {
-            if (pending == 16) {
-                compressed_bytes += 64;
-                STWO_COMPRESS_PROGRESSIVE(compressed_bytes, 0);
-                pending = 0;
-            }
             // Word-major (SoA) eager prefix, stride = size rows (coalesced).
             uint32_t *words_out = reinterpret_cast<uint32_t *>(prefix);
 #define STWO_EAGER_WORD(k, value) words_out[size_t(k) * size + row] = value
@@ -509,24 +541,6 @@ __global__ void mixed_leaf_kernel(uint32_t size, uint32_t count,
         }
         return;
     }
-    if (pending < 1) p0 = 0;
-    if (pending < 2) p1 = 0;
-    if (pending < 3) p2 = 0;
-    if (pending < 4) p3 = 0;
-    if (pending < 5) p4 = 0;
-    if (pending < 6) p5 = 0;
-    if (pending < 7) p6 = 0;
-    if (pending < 8) p7 = 0;
-    if (pending < 9) p8 = 0;
-    if (pending < 10) p9 = 0;
-    if (pending < 11) p10 = 0;
-    if (pending < 12) p11 = 0;
-    if (pending < 13) p12 = 0;
-    if (pending < 14) p13 = 0;
-    if (pending < 15) p14 = 0;
-    if (pending < 16) p15 = 0;
-    STWO_COMPRESS_PROGRESSIVE((Prefixed ? kDomainPrefixBytes : 0) + words * 4,
-                              0xffffffffu);
     result[row] = {{h0,h1,h2,h3,h4,h5,h6,h7}};
 }
 
@@ -848,12 +862,13 @@ static int mixed_seeded_on(uint32_t size, uint32_t count,
             return static_cast<int>(cudaErrorInvalidValue);
         words += columns;
         if (words > UINT32_MAX) return static_cast<int>(cudaErrorInvalidValue);
-        inputs.segments[i] = input;
+        inputs.set(i, input, columns, size);
     }
     // An eager seed holds no deferred full block, so the call that consumes
     // it must absorb at least one word before finalizing.
     if (Eager && seed != nullptr && words == absorbed_before)
         return static_cast<int>(cudaErrorInvalidValue);
+    inputs.set_seed_lift(size, seed_size);
     mixed_leaf_kernel<Prefixed, Eager><<<blocks_for(size), kBlockSize, 0,
         reinterpret_cast<cudaStream_t>(stream)>>>(size, count, inputs, absorbed_before, seed_size, seed, prefix, result);
     return static_cast<int>(cudaPeekAtLastError());
@@ -932,7 +947,7 @@ extern "C" int stwo_blake2s_mixed_seeded_eager_compact_on(
             return int(cudaErrorInvalidValue);
         words += columns;
         if (words > UINT32_MAX) return int(cudaErrorInvalidValue);
-        inputs.segments[i] = s;
+        inputs.set(i, s, columns, size);
     }
     DeviceRange previous{}, output_range{};
     const uint64_t needed_output = uint64_t(size) *
@@ -955,6 +970,7 @@ extern "C" int stwo_blake2s_mixed_seeded_eager_compact_on(
     }
     for (uint32_t i = 0; i < count; ++i)
         if (ranges_overlap(sources[i], output_range)) return int(cudaErrorInvalidValue);
+    inputs.set_seed_lift(size, seed_size);
     mixed_leaf_kernel<true, true><<<blocks_for(size), kBlockSize, 0,
         reinterpret_cast<cudaStream_t>(stream)>>>(size, count, inputs,
         absorbed_before, seed_size, reinterpret_cast<const ProgressiveState *>(seed),

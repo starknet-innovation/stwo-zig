@@ -1,27 +1,5 @@
-//! `combined-serve` entry under STWO_RV64_M8_GPU_NATIVE=1 (driver): the GE
-//! direct capture as the service's CaptureSource, the real device factories,
-//! and the GPU-native service (driver_serve.zig).
-//!
-//! The capture is the request path's only CPU compute (H1) and it streams:
-//! the ordered owner's per-segment readiness hook (`Capture.Ready.call` +
-//! `.native_segment`) hands each finished segment to Stream.Feed, which packs
-//! it through the native factory into pinned ring chunks and seals it, so
-//! that segment's Stage1 stages and enqueues while the capture continues.
-//! Per block, the request config, expected image and capture program are
-//! built ONCE at install (they are immutable inputs of every capture).
-//!
-//! Requests use the GPU-native driver. Installation still constructs legacy
-//! authorities/classes through Host.installRecursion and the class builder;
-//! their construction cost and ownership are separate from served requests.
-//!
-//! Factories: driver_bind.Binding (S1 Registry + S2 Factory into
-//! native_device.Native, truth_factory as the two-stage truths, outer_device
-//! for nodes). The install sequence binds capture shape, request inputs,
-//! recursion shape and node ops before Service.install warms classes and
-//! reserves resources. Missing registrations fail explicitly; no served
-//! request falls back to legacy proving.
+//! Install and serve native and recursive GPU proof classes for Ethereum block requests.
 const std = @import("std");
-const ProductCPU = @import("ethereum_cpu_component");
 const CPU = @import("stwo_riscv_cpu_integration");
 const engine = @import("stwo_prover_engine");
 const G = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.gpu_native;
@@ -29,301 +7,19 @@ const O = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.ops;
 const W = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.worker;
 const R = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.driver.request;
 const S = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.driver_serve;
-const C = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.driver.capture;
 const mod = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.runtime;
 const B = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.driver_bind;
 const NCB = @import("native_class_build.zig");
+const EarlySetup = @import("native_fixed_device.zig").EarlySetup;
 const NGl = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_global;
 const NP = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_pcs;
+const RootCache = @import("recursion_fixed_roots.zig").RootCache;
+const RC = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.recursion_classes;
 const Sources = @import("stwo_riscv_cuda_integration").rv64.execution.source.gkr_sources;
 const CaptureBinding = @import("../native_capture_bind.zig");
 const RequestInputs = @import("../native_request_inputs.zig");
-
-const Request = ProductCPU.rv64_ethereum_request;
-const Image = ProductCPU.rv64_expected_image;
-const Program = CPU.rv64_program.Program;
-const Metadata = CPU.rv64_program_metadata;
-const Direct = ProductCPU.rv64_ethereum_direct;
-const Capture = ProductCPU.rv64_ethereum_capture;
-const CaptureOptions = ProductCPU.rv64_ethereum_capture_options.Options;
-const Plan = ProductCPU.rv64_ethereum_plan;
-
-// Hook parameter types, taken from the GE Ready contract itself.
-const CallFn = @typeInfo(@FieldType(Capture.Ready, "call")).pointer.child;
-const Native = @typeInfo(@typeInfo(CallFn).@"fn".params[2].type.?).pointer.child;
-const Events = @typeInfo(CallFn).@"fn".params[3].type.?;
-const SegmentFn = @typeInfo(@typeInfo(@FieldType(Capture.Ready, "native_segment")).optional.child).pointer.child;
-const Shard = @typeInfo(SegmentFn).@"fn".params[3].type.?;
-
-const ManifestBlock = struct { request: []const u8, jobs: []const u8 = "-", prefix_count: u32 = 0, expected_cpu_segments: usize = 0 };
-const Manifest = struct {
-    schema: []const u8,
-    profile: []const u8 = "d2_native_b4_q54_p20_fold4",
-    blocks: std.json.ArrayHashMap(ManifestBlock),
-    execution_order: []const u64,
-    resources: std.json.Value,
-};
-
-/// Worker stack of the capture work pool (the legacy receiver budget's
-/// WORKER_STACK_BYTES, 1 MiB).
-const pool_stack_bytes: usize = 1 << 20;
-
-pub const Source = struct {
-    a: std.mem.Allocator,
-    blocks: []Block,
-    metadata: Metadata.Cache,
-    options: CaptureOptions,
-    /// Service constants of the native class builder (manifest).
-    profile: CPU.rv64_om31_security_candidate.Profile,
-    gkr_bytes: usize,
-    fixed_setup_bytes: usize,
-    inputs_options: RequestInputs.Options = .{},
-    /// One capture work pool per in-flight request (TLS-bound on its capture
-    /// thread) plus one for install-time warm captures.
-    pools: [3]*engine.work_pool.WorkPool,
-    pool_busy: [2]bool = .{ false, false },
-    mutex: std.Thread.Mutex = .{},
-
-    const Block = struct {
-        number: u64,
-        config: std.json.Parsed(Request.Config),
-        image: Image.Owner,
-        program: Program,
-        warm: ?Capture.Owner = null,
-    };
-
-    pub fn init(a: std.mem.Allocator, manifest_path: []const u8) !*Source {
-        const raw = try std.fs.cwd().readFileAlloc(a, manifest_path, 1 << 20);
-        defer a.free(raw);
-        var parsed = try std.json.parseFromSlice(Manifest, a, raw, .{ .ignore_unknown_fields = true });
-        defer parsed.deinit();
-        const m = parsed.value;
-        if (!std.mem.eql(u8, m.schema, "rv64-ethereum-basket-inputs/v1") or m.execution_order.len == 0) return error.InvalidResidentBatchManifest;
-        var options = CaptureOptions{};
-        if (m.resources == .object) if (m.resources.object.get("capture_options")) |v| {
-            const o = try std.json.parseFromValue(CaptureOptions, a, v, .{ .ignore_unknown_fields = true });
-            defer o.deinit();
-            options = o.value;
-        };
-        try options.validate();
-        const self = try a.create(Source);
-        errdefer a.destroy(self);
-        self.* = .{ .a = a, .blocks = &.{}, .metadata = try Metadata.Cache.init(a, 64 << 20), .options = options, .pools = undefined, .profile = try CPU.rv64_om31_security_candidate.Profile.parse(m.profile), .gkr_bytes = resourceUsize(m.resources, "gkr_bytes") orelse return error.GpuNativeManifestNoGkrBytes, .fixed_setup_bytes = resourceUsize(m.resources, "fixed_setup_bytes") orelse (4 << 30) };
-        errdefer self.metadata.deinit();
-        self.inputs_options = try RequestInputs.Options.fromResources(m.resources);
-        var unique: std.ArrayListUnmanaged(u64) = .empty;
-        defer unique.deinit(a);
-        for (m.execution_order) |b| if (std.mem.indexOfScalar(u64, unique.items, b) == null) try unique.append(a, b);
-        const blocks = try a.alloc(Block, unique.items.len);
-        var made: usize = 0;
-        errdefer {
-            for (blocks[0..made]) |*b| freeBlock(b);
-            a.free(blocks);
-        }
-        var workers: usize = 1;
-        for (unique.items, blocks) |number, *b| {
-            var name: [24]u8 = undefined;
-            const item = m.blocks.map.get(try std.fmt.bufPrint(&name, "{d}", .{number})) orelse return error.MissingResidentBatchBlock;
-            // GPU-native requests are complete direct executions.
-            if (item.prefix_count != 0 or !std.mem.eql(u8, item.jobs, "-")) return error.CombinedRequiresCompleteDirectExecution;
-            const text = try std.fs.cwd().readFileAlloc(a, item.request, 16384);
-            defer a.free(text);
-            // alloc_always: the config's strings (elf/input/output paths) must
-            // not borrow `text`, which is freed below while the block (and its
-            // warm and per-request captures) keeps the config.
-            var config = try std.json.parseFromSlice(Request.Config, a, text, .{ .allocate = .alloc_always });
-            errdefer config.deinit();
-            // The capture writes its artifacts under output_directory (the
-            // legacy resident path creates it before its first request).
-            if (config.value.output_directory.len != 0) try std.fs.cwd().makePath(config.value.output_directory);
-            var image = try Image.Owner.init(a, config.value);
-            errdefer image.deinit();
-            var program = try Program.initCaptureWithAuthorityAndMetadataCache(a, &image.authority, &self.metadata);
-            errdefer program.deinit();
-            // The capture's AUIPC/JAL FUNCTION facts depend on the decode layout.
-            if (Plan.CpuLayout.forGkrProfile(config.value.execution_profile).compact_decode) try program.makeCompact();
-            workers = @max(workers, try Request.effectiveWorkers(config.value));
-            b.* = .{ .number = number, .config = config, .image = image, .program = program };
-            made += 1;
-        }
-        self.blocks = blocks;
-        var pools_made: usize = 0;
-        errdefer for (self.pools[0..pools_made]) |p| {
-            p.deinit();
-            a.destroy(p);
-        };
-        for (&self.pools) |*p| {
-            p.* = try a.create(engine.work_pool.WorkPool);
-            p.*.initInPlaceWithOptions(.{ .worker_count = workers, .stack_size = pool_stack_bytes, .backing_allocator = a }) catch |err| {
-                a.destroy(p.*);
-                return err;
-            };
-            pools_made += 1;
-        }
-        return self;
-    }
-    fn freeBlock(b: *Block) void {
-        if (b.warm) |*w| w.deinit();
-        b.program.deinit();
-        b.image.deinit();
-        b.config.deinit();
-    }
-    pub fn deinit(self: *Source) void {
-        for (self.blocks) |*b| freeBlock(b);
-        self.a.free(self.blocks);
-        for (self.pools) |p| {
-            p.deinit();
-            self.a.destroy(p);
-        }
-        self.metadata.deinit();
-        self.a.destroy(self);
-    }
-    pub fn blockNumbers(self: *const Source, a: std.mem.Allocator) ![]u64 {
-        const out = try a.alloc(u64, self.blocks.len);
-        for (self.blocks, out) |b, *o| o.* = b.number;
-        return out;
-    }
-    fn find(self: *Source, number: u64) !*Block {
-        for (self.blocks) |*b| if (b.number == number) return b;
-        return error.MissingResidentBatchBlock;
-    }
-
-    pub fn source(self: *Source) S.CaptureSource {
-        return .{ .ctx = self, .vtable = &vtable };
-    }
-    const vtable = S.CaptureSource.VTable{ .warm = warm, .release_warm = releaseWarm, .start = start, .join = join };
-    fn of(raw: *anyopaque) *Source {
-        return @ptrCast(@alignCast(raw));
-    }
-
-    /// Run one capture of `b` on the calling thread (`ready` = streaming hook).
-    fn captureBlock(self: *Source, b: *Block, ready: ?Capture.Ready) !Capture.Owner {
-        var stats: Direct.Stats = .{};
-        const started = Direct.Started.startWithAuthority(self.a, b.config.value, 0, self.options.execution_workers, null) catch |err| {
-            std.debug.print("GPU_M8_GN_BIND capture_stage=start block={d} error={s}\n", .{ b.number, @errorName(err) });
-            return err;
-        };
-        defer started.deinit(&stats);
-        started.ready = ready;
-        return started.capture(&b.image, &b.program, self.options.max_inflight_packets, &stats) catch |err| {
-            std.debug.print("GPU_M8_GN_BIND capture_stage=capture block={d} error={s}\n", .{ b.number, @errorName(err) });
-            return err;
-        };
-    }
-    fn endOf(b: *Block, owner: *const Capture.Owner) G.CaptureEnd {
-        return .{ .segments = @intCast(owner.native.items.len), .owner = owner, .image = &b.image, .program = &b.program, .config = &b.config.value };
-    }
-
-    fn warm(raw: *anyopaque, number: u64) anyerror!G.CaptureEnd {
-        const self = of(raw);
-        const b = try self.find(number);
-        if (b.warm) |*w| w.deinit();
-        b.warm = null;
-        var binding = try engine.work_pool.ScopedPoolBinding.init(self.pools[2]);
-        defer binding.deinit();
-        b.warm = self.captureBlock(b, null) catch |err| {
-            std.debug.print("GPU_M8_GN_BIND warm_capture_failed block={d} error={s}\n", .{ number, @errorName(err) });
-            return err;
-        };
-        std.debug.print("GPU_M8_GN_BIND warm_capture block={d} segments={d}\n", .{ number, b.warm.?.native.items.len });
-        return endOf(b, &b.warm.?);
-    }
-    fn releaseWarm(raw: *anyopaque, number: u64) void {
-        // CaptureBinding's install inventory borrows boundary RAM and setup
-        // views. Source owns the warm capture until service teardown.
-        _ = raw;
-        _ = number;
-    }
-
-    /// One request's capture thread and its streaming hook state.
-    const Run = struct {
-        src: *Source,
-        block: *Block,
-        stream: *C.Stream,
-        feed: C.Feed,
-        pool: usize,
-        owner: ?Capture.Owner = null,
-        thread: std.Thread = undefined,
-        /// Events of the segment `call` just reported (consumed by the
-        /// `native_segment` that follows it on the same thread).
-        events: ?Events = null,
-        events_index: usize = 0,
-
-        fn readyCall(ctx: *anyopaque, index: usize, _: *const Native, events: Events, _: u64) void {
-            const run: *Run = @ptrCast(@alignCast(ctx));
-            run.events = events;
-            run.events_index = index;
-        }
-        fn readySegment(ctx: *anyopaque, index: usize, native: *const Native, shard: Shard, at_ns: u64) void {
-            const run: *Run = @ptrCast(@alignCast(ctx));
-            if (run.events == null or run.events_index != index) {
-                run.feed.abort(error.GpuNativeCaptureEventsMissing);
-                return;
-            }
-            const events = run.events.?;
-            var shard_copy = shard;
-            // Errors already failed the stream (every unreleased Stage1 and
-            // the end gate fail closed); the capture runs to its end.
-            run.feed.segment(.{ .segment = @intCast(index), .native = native, .events = @ptrCast(&events), .shard = @ptrCast(&shard_copy), .at_ns = at_ns }) catch {};
-            run.events = null;
-        }
-        fn readyCancel(ctx: *anyopaque) void {
-            const run: *Run = @ptrCast(@alignCast(ctx));
-            run.feed.abort(error.GpuNativeCaptureCancelled);
-        }
-        fn main(run: *Run) void {
-            const src = run.src;
-            var binding = engine.work_pool.ScopedPoolBinding.init(src.pools[run.pool]) catch |err| return run.feed.finish(err);
-            defer binding.deinit();
-            const ready = Capture.Ready{ .context = run, .call = readyCall, .native_segment = readySegment, .cancel = readyCancel, .seal_native = true };
-            run.owner = src.captureBlock(run.block, ready) catch |err| return run.feed.finish(err);
-            run.feed.end(endOf(run.block, &run.owner.?)) catch {};
-            run.feed.finish(null);
-        }
-    };
-
-    fn start(raw: *anyopaque, number: u64, stream: *C.Stream) anyerror!*anyopaque {
-        const self = of(raw);
-        const b = try self.find(number);
-        const pool: usize = blk: {
-            self.mutex.lock();
-            defer self.mutex.unlock();
-            for (&self.pool_busy, 0..) |*busy, i| if (!busy.*) {
-                busy.* = true;
-                break :blk i;
-            };
-            return error.GpuNativePipelineFull;
-        };
-        errdefer self.freePool(pool);
-        const run = try self.a.create(Run);
-        errdefer self.a.destroy(run);
-        run.* = .{ .src = self, .block = b, .stream = stream, .feed = stream.feed(), .pool = pool };
-        run.thread = try std.Thread.spawn(.{}, Run.main, .{run});
-        return run;
-    }
-    fn freePool(self: *Source, pool: usize) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        self.pool_busy[pool] = false;
-    }
-    fn join(raw: *anyopaque, handle: *anyopaque) void {
-        const self = of(raw);
-        const run: *Run = @ptrCast(@alignCast(handle));
-        run.thread.join();
-        if (run.owner) |*o| o.deinit();
-        self.freePool(run.pool);
-        self.a.destroy(run);
-    }
-};
-
-fn resourceUsize(resources: std.json.Value, name: []const u8) ?usize {
-    if (resources != .object) return null;
-    const v = resources.object.get(name) orelse return null;
-    return switch (v) {
-        .integer => |i| if (i < 0) null else @intCast(i),
-        else => null,
-    };
-}
+const Roms = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_pack.Roms;
+pub const Source = @import("guest_capture_source.zig").Source;
 
 fn envUnsigned(name: []const u8, default: u64) !u64 {
     const v = std.posix.getenv(name) orelse return default;
@@ -354,15 +50,13 @@ pub fn serve(a: std.mem.Allocator, library: []const u8, manifest_path: []const u
     var device_budget = try @import("stwo_riscv_cuda_integration").rv64.execution.runtime.resident_router.Config.fromEnv(a);
     defer device_budget.deinit(a);
     if (!std.process.hasEnvVarConstant("STWO_RV64_GPU_DEVICE_CAPS")) @memset(device_budget.caps, 28 << 30);
-    // Build real immutable recursion classes before native workers carve the
-    // device pool. Its cold proof construction is counted in init_ns.
-    const recursion_classes = try Host.installRecursion(a, &libs, library, manifest_path, spool);
+    const source = try Source.init(a, manifest_path, &libs, config.devices[0..config.device_count]);
+    defer source.deinit();
+    const setup_mode: S.Service.SetupMode = if (source.guest == null) .example_proof else .device_geometry;
+    try source.startGuest();
     var workers: [G.max_devices]*W.Worker = undefined;
     var made: usize = 0;
-    defer {
-        recursion_classes.deinit();
-        for (workers[0..made]) |w| w.destroy();
-    }
+    defer for (workers[0..made]) |w| w.destroy();
     // [M component] truth-reuse-1 preserves all seven real-block truth
     // proofs with a lower scratch high-water. Keep opt-in for request gates.
     const reuse = try envUnsigned("STWO_RV64_M8_GPU_NATIVE_REUSE", 0);
@@ -374,20 +68,12 @@ pub fn serve(a: std.mem.Allocator, library: []const u8, manifest_path: []const u
         workers[made] = try W.Worker.create(a, &libs.ops, .{ .device = d, .arena_words = 1 << 16, .pinned_slot_words = (8 << 30) / 4, .pinned_lazy = true, .plan_from_env = false, .reuse_frees = reuse == 1 });
         made += 1;
     }
-    const source = try Source.init(a, manifest_path);
-    defer source.deinit();
-    const blocks = try source.blockNumbers(a);
-    defer a.free(blocks);
-    // The real device factories (gn-bind: driver_bind.zig).
     const Chain = CPU.rv64_gkr_chain;
-    const identity: [32]u8 = Chain.versionIdentity(try Chain.version()) catch |err| blk: {
+    const version = try Chain.version();
+    const identity: [32]u8 = Chain.versionIdentity(version) catch |err| blk: {
         std.debug.print("GPU_M8_GN_BIND identity=none error={s} (flat native policy: no chain IV)\n", .{@errorName(err)});
         break :blk @splat(0);
     };
-    var fallback_state = Fallbacks{ .truths = @intCast(5) };
-    const binding = try B.Binding.init(a, &libs, workers[0..made], .{ .identity = identity }, fallback_state.hooks());
-    defer binding.deinit();
-    // gn-shape: the install-time native class builder (shape + class_of_block).
     var catalogue = try Sources.Catalogue.init(a);
     defer catalogue.deinit();
     var gcatalogue = NGl.Catalogue.init(a, &libs.base);
@@ -396,35 +82,7 @@ pub fn serve(a: std.mem.Allocator, library: []const u8, manifest_path: []const u
     const host = try Host.HostArtifacts.init(a);
     defer host.deinit(a);
     const Version = *const fn () callconv(.c) u32;
-    const wide = if (libs.base.lookup(Version, "stwo_rv64_pcs_request_version")) |version| version() >= 3 else false;
-    var builder = NCB.Builder{
-        .a = a,
-        .env = .{ .a = a, .catalogue = &catalogue, .gcatalogue = &gcatalogue, .gmutex = &gmutex, .psym = try NP.Symbols.load(&libs.addon), .composition = Host.of(&host.context), .wide = wide, .config = CPU.rv64_om31_security_candidate.configFor(source.profile), .byte_cap = source.gkr_bytes },
-        .registry = &binding.registry,
-        .factory = &binding.stage2,
-        .framing_instances = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_device_stage2.Factory.instances_per_device * made,
-        .fixed_setup_bytes = source.fixed_setup_bytes,
-    };
-    defer builder.deinit();
-    var capture_binding = CaptureBinding.Binding.init(a, &builder, &binding.registry);
-    defer capture_binding.deinit();
-    // lint:install-begin — bind the install-time pinned ROM allocator.
-    capture_binding.roms.pinned = .{ .alloc = libs.ops.wait.host_alloc, .free = libs.ops.wait.host_free };
-    // lint:install-end
-    var request_inputs = RequestInputs.Binding{ .a = a, .native = &builder, .binding = binding, .base = &libs.base, .options = source.inputs_options, .recursion_classes = recursion_classes, .profile = source.profile };
-    defer request_inputs.deinit();
-    binding.fallback.ctx = &request_inputs;
-    binding.fallback.recursion_shape = RequestInputs.Binding.shape;
-    binding.bindShape(capture_binding.shapeHooks());
-    binding.bindCapture(capture_binding.captureHooks());
-    binding.bindInputs(request_inputs.hooks());
-    binding.bindNodeOps(&libs, peer);
-    {
-        var text: std.Io.Writer.Allocating = .init(a);
-        defer text.deinit();
-        try binding.report(&text.writer);
-        std.debug.print("GPU_M8_GN_BIND binding={s}\n", .{text.written()});
-    }
+    const wide = if (libs.base.lookup(Version, "stwo_rv64_pcs_request_version")) |abi| abi() >= 3 else false;
     // Bind each configured budget to its physical worker; installation also
     // limits it to the measured allocatable memory of that device.
     var caps: [G.max_devices]u64 = undefined;
@@ -433,11 +91,11 @@ pub fn serve(a: std.mem.Allocator, library: []const u8, manifest_path: []const u
     } else return error.GpuNativeCapacityShape;
     const rc = R.Config{
         .capacity_words = caps[0..made],
-        .max_segments = 64,
+        .max_segments = @import("guest_capture_source.zig").max_segments,
         // Admission follows the Ethereum bundle envelope. The exchange reserves
         // only the actual, independently registered truth roster for this service.
         .max_truths = (CPU.rv64_gkr_bundle_wire.Limits{}).max_truths,
-        .exchange_partials = (try Chain.version()) != .flat,
+        .exchange_partials = version != .flat,
         .pool_current = libs.base.lookup(*const fn (*anyopaque, *usize, *usize) callconv(.c) c_int, "stwo_exec_context_pool_current"),
         .fixed_pool = if (std.posix.getenv("STWO_RV64_DEVICE_ARENA")) |v| !std.mem.eql(u8, v, "0") else true,
         .prewarm_resources = (try envUnsigned("STWO_RV64_M9_CLASS_PACKED_INGRESS", 0)) == 1,
@@ -447,17 +105,192 @@ pub fn serve(a: std.mem.Allocator, library: []const u8, manifest_path: []const u
         .graph_exec_words = (512 << 20) / 4,
         .batch_pinned_words = default_batch_pinned_bytes / 4,
     };
-    const ring = S.RingConfig{ .buffers = default_ring_buffers, .words = default_ring_bytes / 4 };
-    const svc = S.Service.install(a, &libs.ops, &peer, workers[0..made], binding.nativeFactory(), binding.recursionFactory(), source.source(), blocks, rc, ring) catch |err| {
-        std.debug.print("GPU_M8_GN_BIND install_failed error={s}\n", .{@errorName(err)});
-        binding.reportStage1();
-        return err;
+    var roms = Roms.init(a);
+    defer roms.deinit();
+    // lint:install-begin
+    roms.pinned = .{ .alloc = libs.ops.wait.host_alloc, .free = libs.ops.wait.host_free };
+    // lint:install-end
+    var truth_setups = if (setup_mode == .device_geometry) try RequestInputs.TruthSetups.init(a, @min(source.fixed_setup_bytes, 256 << 20)) else null;
+    defer if (truth_setups) |*setups| setups.deinit();
+    var fixed_roots: RootCache = .{};
+    var installer = Installer{
+        .a = a,
+        .roms = &roms,
+        .libs = &libs,
+        .peer = &peer,
+        .workers = workers[0..made],
+        .source = source,
+        .config = rc,
+        .env = .{ .a = a, .catalogue = &catalogue, .gcatalogue = &gcatalogue, .gmutex = &gmutex, .psym = try NP.Symbols.load(&libs.addon), .composition = host.composition(), .wide = wide, .config = CPU.rv64_om31_security_candidate.configFor(source.profile), .byte_cap = source.gkr_bytes },
+        .identity = identity,
+        .installRecursion = Host.installRecursion,
+        .fixed_roots = &fixed_roots,
+        .library = library,
+        .manifest = manifest_path,
+        .spool = spool,
+        .mode = setup_mode,
+        .truth_setups = if (truth_setups) |*setups| setups else null,
     };
-    binding.reportStage1();
-    svc.hooks = .{ .ctx = binding, .publishing = publishing, .ended = ended };
-    defer svc.deinit();
-    try S.serveSpool(svc, spool, timer.read());
+    defer if (installer.active) |epoch| epoch.deinit(source, a);
+    if (source.guest != null) {
+        try S.serveSpoolWith(a, spool, timer.read(), .{
+            .ctx = &installer,
+            .resolve = Installer.admit,
+            .mode = setup_mode,
+        });
+    } else {
+        const blocks = try source.blockNumbers(a);
+        defer a.free(blocks);
+        installer.active = try installer.install(blocks);
+        try S.serveSpool(installer.active.?.service, spool, timer.read());
+    }
 }
+
+const FixedDevice = std.meta.Child(@typeInfo(@FieldType(NCB.Builder, "fixed_device")).optional.child);
+
+const Epoch = struct {
+    service: *S.Service,
+    recursion: RC.Classes,
+    binding: *B.Binding,
+    fixed_device: ?FixedDevice,
+    builder: NCB.Builder,
+    capture: CaptureBinding.Binding,
+    inputs: RequestInputs.Binding,
+    capacities: [G.max_devices]u64 = undefined,
+    replay: R.Config.Reclaimable = undefined,
+
+    fn deinit(self: *Epoch, source: *Source, a: std.mem.Allocator) void {
+        self.service.deinit();
+        source.guest_binding = null;
+        self.inputs.deinit();
+        self.builder.deinit();
+        if (self.fixed_device) |*device| device.deinit(a);
+        self.binding.deinit();
+        self.recursion.deinit();
+        a.destroy(self);
+    }
+};
+
+/// Proof workers and immutable symbol/catalogue owners live for the spool.
+/// Block-specific view addresses and proof authority live for one epoch.
+const Installer = struct {
+    a: std.mem.Allocator,
+    roms: *Roms,
+    libs: *O.Libraries,
+    peer: *const O.Peer,
+    workers: []const *W.Worker,
+    source: *Source,
+    config: R.Config,
+    env: NCB.Env,
+    identity: [32]u8,
+    installRecursion: *const fn (std.mem.Allocator, *O.Libraries, []const u8, []const u8, []const u8, bool, *RootCache) anyerror!RC.Classes,
+    fixed_roots: *RootCache,
+    library: []const u8,
+    manifest: []const u8,
+    spool: []const u8,
+    mode: S.Service.SetupMode,
+    truth_setups: ?*RequestInputs.TruthSetups,
+    active: ?*Epoch = null,
+    serial: S.Service.Serial = .{},
+
+    fn admit(raw: *anyopaque, block: u64) !*S.Service {
+        const self: *Installer = @ptrCast(@alignCast(raw));
+        _ = self.source.find(block) catch return error.GpuNativeBlockNotWarmed;
+        if (self.active) |epoch| {
+            if (epoch.service.shapeOf(block) != null) return epoch.service;
+            self.serial = try epoch.service.retire();
+            self.active = null;
+            const keys = keys: {
+                defer epoch.deinit(self.source, self.a);
+                const fixed = if (epoch.fixed_device) |*device| device else break :keys &.{};
+                break :keys try fixed.reusableKeys(self.a, self.config.reserve_words);
+            };
+            defer self.a.free(keys);
+            try self.workers[0].replaceClassEpoch(1 << 16, .{ .keys = keys, .words = self.config.reserve_words, .canonical_tables = self.config.prewarm_resources });
+        }
+        self.active = try self.install(&.{block});
+        return self.active.?.service;
+    }
+
+    fn install(self: *Installer, blocks: []const u64) !*Epoch {
+        const a = self.a;
+        const epoch = try a.create(Epoch);
+        errdefer a.destroy(epoch);
+        const device_execution = self.mode == .device_geometry;
+        var config = self.config;
+        const prepared = if (device_execution) try self.source.find(blocks[0]) else null;
+        defer if (prepared) |block| Source.clearWarm(a, block);
+        errdefer if (prepared) |block| {
+            block.admission_meter = null;
+            Source.reclaimReplay(self.source) catch |err| std.log.err("guest replay rollback: {s}", .{@errorName(err)});
+        };
+        if (prepared) |block| {
+            const reserved = self.source.prepareGuest(block, self.roms, config.capacity_words[0]) catch |err| retry: {
+                if (err != error.CudaDeviceOutOfMemory or try self.workers[0].releaseUnclaimed() == 0) return err;
+                break :retry try self.source.prepareGuest(block, self.roms, config.capacity_words[0]);
+            };
+            @memcpy(epoch.capacities[0..config.capacity_words.len], config.capacity_words);
+            epoch.capacities[0] -= reserved.base_words + reserved.replay_words;
+            config.capacity_words = epoch.capacities[0..config.capacity_words.len];
+            if (reserved.replay_words != 0) {
+                epoch.replay = .{ .words = reserved.replay_words, .ctx = self.source, .release = Source.reclaimReplay, .trim = Source.trimReplay };
+                config.reclaimable = &epoch.replay;
+            }
+        }
+        var setup_workers = if (self.source.setup_pool) |pool| try engine.work_pool.ScopedPoolBinding.init(pool) else null;
+        defer if (setup_workers) |*scope| scope.deinit();
+        epoch.recursion = try self.installRecursion(a, self.libs, self.library, self.manifest, self.spool, device_execution, self.fixed_roots);
+        errdefer epoch.recursion.deinit();
+        const binding = try B.Binding.init(a, self.libs, self.workers, .{ .identity = self.identity }, .{});
+        binding.proofless_setup = device_execution;
+        epoch.binding = binding;
+        errdefer binding.deinit();
+        epoch.fixed_device = if (device_execution) .{
+            .worker = self.workers[0],
+            .symbols = try @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_commit.Symbols.load(&self.libs.base),
+            .capacity = .{ .words = config.capacity_words[0], .reclaimable = config.reclaimable },
+            .tables = if (self.source.fixed_tables) |*tables| tables else return error.GpuNativeFixedSeedUnavailable,
+        } else null;
+        errdefer if (epoch.fixed_device) |*device| device.deinit(a);
+        epoch.builder = .{
+            .a = a,
+            .env = self.env,
+            .registry = &binding.registry,
+            .factory = &binding.stage2,
+            .framing_instances = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_device_stage2.Factory.instances_per_device * self.workers.len,
+            .fixed_setup_bytes = self.source.fixed_setup_bytes,
+            .fixed_device = if (epoch.fixed_device) |*device| device else null,
+        };
+        if (prepared) |block| {
+            epoch.builder.early = block.discovered.?.early;
+            block.discovered.?.early = null;
+        }
+        errdefer epoch.builder.deinit();
+        epoch.capture = CaptureBinding.Binding.init(a, &epoch.builder, &binding.registry, self.roms);
+        self.source.guest_binding = &epoch.capture;
+        errdefer self.source.guest_binding = null;
+        epoch.inputs = .{ .a = a, .native = &epoch.builder, .binding = binding, .base = &self.libs.base, .options = self.source.inputs_options, .recursion_classes = epoch.recursion, .truth_setups = self.truth_setups, .profile = self.source.profile };
+        errdefer epoch.inputs.deinit();
+        if (device_execution) config.resource_peak = .{ .ctx = &epoch.inputs, .words = RequestInputs.Binding.resourcePeak };
+        binding.fallback.ctx = &epoch.inputs;
+        binding.fallback.recursion_shape = RequestInputs.Binding.shape;
+        binding.bindShape(epoch.capture.shapeHooks());
+        binding.bindCapture(epoch.capture.captureHooks());
+        binding.bindInputs(epoch.inputs.hooks());
+        binding.bindNodeOps(self.libs, self.peer.*);
+        const ring = S.RingConfig{ .buffers = default_ring_buffers, .words = default_ring_bytes / 4 };
+        epoch.service = S.Service.install(a, &self.libs.ops, self.peer, self.workers, binding.nativeFactory(), binding.recursionFactory(), self.source.source(), blocks, config, ring) catch |err| {
+            std.debug.print("GPU_M8_GN_BIND install_failed error={s}\n", .{@errorName(err)});
+            binding.reportStage1();
+            return err;
+        };
+        binding.reportStage1();
+        epoch.service.hooks = .{ .ctx = binding, .publishing = publishing, .ended = ended };
+        epoch.service.setup_mode = self.mode;
+        epoch.service.resumeSerial(self.serial);
+        return epoch;
+    }
+};
 
 fn publishing(raw: *anyopaque, topology: *const @import("stwo_riscv_cuda_integration").rv64.execution.jobs.driver.dag.Topology) void {
     const binding: *B.Binding = @ptrCast(@alignCast(raw));
@@ -467,27 +300,3 @@ fn ended(raw: *anyopaque, request: u64, generation: u64) void {
     const binding: *B.Binding = @ptrCast(@alignCast(raw));
     binding.endRequest(request, generation);
 }
-
-/// Fallback hooks for factory entries no stream has landed (see the header).
-const Fallbacks = struct {
-    truths: u32,
-    fn hooks(self: *Fallbacks) B.Fallback {
-        return .{ .ctx = self, .native_shape = nativeShape, .recursion_shape = recursionShape };
-    }
-    /// Rows per native segment of the warm capture: 1 << the segment's CPU
-    /// log (Prepared.geometry().cpu_log). Registers no class: the install
-    /// then refuses at class_of until the native class builder lands.
-    fn nativeShape(_: ?*anyopaque, a: std.mem.Allocator, wb: G.WarmBlock) anyerror![]u64 {
-        const owner: *const Capture.Owner = @ptrCast(@alignCast(wb.capture.owner));
-        const rows = try a.alloc(u64, owner.native.items.len);
-        errdefer a.free(rows);
-        for (owner.native.items, rows) |n, *r| r.* = @as(u64, 1) << @intCast((try n.geometry()).cpu_log);
-        std.debug.print("GPU_M8_GN_BIND fallback=native_shape block={d} segments={d}\n", .{ wb.block, rows.len });
-        return rows;
-    }
-    fn recursionShape(raw: ?*anyopaque, wb: G.WarmBlock, keys: []const G.ClassKey) anyerror!G.RecursionShape {
-        const self: *Fallbacks = @ptrCast(@alignCast(raw.?));
-        std.debug.print("GPU_M8_GN_BIND fallback=recursion_shape block={d} segments={d} truths={d} fold_arity=4\n", .{ wb.block, keys.len, self.truths });
-        return .{ .truths = self.truths, .fold_arity = 4 };
-    }
-};

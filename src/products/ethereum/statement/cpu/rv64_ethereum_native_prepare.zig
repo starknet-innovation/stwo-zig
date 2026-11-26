@@ -50,6 +50,7 @@ pub const Walk = struct {
     identity: Packet.Identity,
     session: rv.ethereum_services.Session,
     tape: rv.compact_tape.Tape,
+    owns_tape: bool,
     capture: rv.boundary_capture.Capture,
     batches: u32 = 0,
     calls: [3]u64 = @splat(0),
@@ -97,13 +98,18 @@ pub const Walk = struct {
     /// chain the legacy Poseidon frontier (the in-process Word16 handoff);
     /// `run` (durable job collection) requires the cache.
     pub fn createWithOptions(a: std.mem.Allocator, config: Request.Config, options: Request.Options) !*Walk {
+        return createForSource(a, config, options, 0);
+    }
+    /// A segmented source traces only its checkpoint workers. Its initial
+    /// walk drives the untraced first pass and never writes retirement advice.
+    pub fn createForSource(a: std.mem.Allocator, config: Request.Config, options: Request.Options, segment_workers: u8) !*Walk {
         try Request.validateBudget(config);
         const request = try a.create(Request.Request);
         errdefer a.destroy(request);
         request.* = try Request.Request.initWithOptions(a, config, options);
         errdefer request.deinit();
         const cpu = rv.machine.Cpu.init(request.loaded.info.entry, config.symbols.stack_top);
-        return createOn(a, config, request, true, &request.loaded.memory, false, cpu, .{}, 0);
+        return createOn(a, config, request, true, &request.loaded.memory, cpu, .{}, 0, segment_workers == 0);
     }
     /// A walk that executes batch `index` (and any later ones) from a fast
     /// first-pass checkpoint, on its own copy of the checkpoint image. It
@@ -113,9 +119,10 @@ pub const Walk = struct {
         errdefer a.destroy(memory);
         memory.* = try rv.checkpoint.materialize(a, parent.memory, cp);
         errdefer memory.deinit();
-        const self = try createOn(a, parent.config, parent.request, false, memory, true, cp.cpu, cp.counters, index);
+        const self = try createOn(a, parent.config, parent.request, false, memory, cp.cpu, cp.counters, index, true);
         errdefer self.destroy();
         if (parent.fast_program) |program| try self.useFast(program);
+        self.owns_memory = true;
         return self;
     }
     /// Execute ordinary instructions with the traced fast engine borrowing
@@ -125,7 +132,7 @@ pub const Walk = struct {
         self.fast = try rv.fast_execution.Engine.initBorrowing(self.allocator, self.memory, program);
         self.fast_program = program;
     }
-    fn createOn(a: std.mem.Allocator, config: Request.Config, request: *Request.Request, owns_request: bool, memory: *rv.memory.Memory, owns_memory: bool, cpu_state: rv.machine.Cpu, counters: rv.checkpoint.Counters, index: u32) !*Walk {
+    fn createOn(a: std.mem.Allocator, config: Request.Config, request: *Request.Request, owns_request: bool, memory: *rv.memory.Memory, cpu_state: rv.machine.Cpu, counters: rv.checkpoint.Counters, index: u32, trace: bool) !*Walk {
         const self = try a.create(Walk);
         errdefer a.destroy(self);
         self.allocator = a;
@@ -133,7 +140,7 @@ pub const Walk = struct {
         self.request = request;
         self.owns_request = owns_request;
         self.memory = memory;
-        self.owns_memory = owns_memory;
+        self.owns_memory = false;
         self.traced_ns = 0;
         self.finish_ns = 0;
         self.fast_program = null;
@@ -147,8 +154,14 @@ pub const Walk = struct {
         errdefer self.session.deinit();
         counters.apply(&self.session);
         const cpu = &self.session.keccak.base.cpu;
-        self.tape = try rv.compact_tape.Tape.init(a, config.batch_steps, cpu.pc, cpu.retired, Request.tapeProfile(config));
-        errdefer self.tape.deinit();
+        const profile = Request.tapeProfile(config);
+        if (!trace and cpu.pc & 3 != 0) return error.InvalidTapeGeometry;
+        self.tape = if (trace)
+            try rv.compact_tape.Tape.init(a, config.batch_steps, cpu.pc, cpu.retired, profile)
+        else
+            .{ .allocator = a, .storage = &.{}, .initial_pc = cpu.pc, .initial_clock = cpu.retired, .execution_profile = profile };
+        self.owns_tape = trace;
+        errdefer if (self.owns_tape) self.tape.deinit();
         self.capture = try rv.boundary_capture.Capture.init(a, cpu.retired, config.batch_steps, 1 << 24);
         self.batches = index;
         self.calls = .{ counters.keccak, counters.add, counters.double };
@@ -163,7 +176,7 @@ pub const Walk = struct {
         const a = self.allocator;
         if (self.fast) |*engine| engine.deinit();
         self.capture.deinit();
-        self.tape.deinit();
+        if (self.owns_tape) self.tape.deinit();
         self.session.deinit();
         if (self.owns_memory) {
             self.memory.deinit();
@@ -183,7 +196,7 @@ pub const Walk = struct {
     /// `advance` (or `advanceTakingTape`) before the next `next`. Null once the
     /// guest completed or `max_batches` were collected.
     pub fn next(self: *Walk) !?Step {
-        if (self.pending) return error.InvalidEthereumBatchSeed;
+        if (self.pending or !self.owns_tape) return error.InvalidEthereumBatchSeed;
         const config = self.config;
         if (self.completed or (config.max_batches != 0 and self.batches >= config.max_batches)) return null;
         const c = self.cpuState();
@@ -343,7 +356,7 @@ pub fn run(a: std.mem.Allocator, config: Request.Config) !Summary {
 }
 pub fn runWithOptions(a: std.mem.Allocator, config: Request.Config, options: RunOptions) !Summary {
     // Request admission and identity precede any output-directory effect.
-    var walk = try Walk.create(a, config);
+    var walk = try Walk.createForSource(a, config, .{}, options.segment_workers);
     defer walk.destroy();
     // Create only our own output directory. Its configured parent must already
     // exist; recursively creating unsynced ancestors would weaken durability.

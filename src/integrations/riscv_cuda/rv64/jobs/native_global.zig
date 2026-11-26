@@ -19,7 +19,6 @@
 //! fails it (before publication); no bytes depend on the check's placement.
 const std = @import("std");
 const core = @import("stwo_core");
-const engine = @import("stwo_prover_engine");
 const CPU = @import("stwo_riscv_cpu_integration");
 const api = @import("api.zig");
 const Abi = @import("../abi.zig");
@@ -242,21 +241,11 @@ pub const Global = struct {
         const staged = try s.alloc(p.parameters.len);
         try s.upload(staged, p.parameters);
         self.staged = staged;
-        var key: [32]u8 = @splat(0);
-        @memcpy(key[0..16], "rv64-m8-glob-twd");
-        key[16] = @intCast(p.log);
-        // The forward tower of CanonicCoset(log).circleDomain().half_coset has
-        // 2^(log-1) words (native_composition twLen, tested there): build it on
-        // the host only when the class region is fresh (it was built on every
-        // stage of every slot before, then discarded on a warm region).
+        const key = @import("circle_twiddles.zig").tableKey(p.log, .forward);
+        // Forward half of the canonical tower, shared with truth roles.
         const tw_len = @as(usize, 1) << @intCast(p.log - 1);
         const twiddles = try s.persistent(key, tw_len);
-        if (twiddles.fresh) {
-            var tw = try engine.poly.twiddles.precomputeM31(a, core.poly.circle.canonic.CanonicCoset.new(p.log).circleDomain().half_coset);
-            defer engine.poly.twiddles.deinitM31(a, &tw);
-            if (tw.twiddles.len != tw_len) return error.InvalidGlobalGeometry;
-            try s.upload(twiddles.buffer, @as([*]const u32, @ptrCast(tw.twiddles.ptr))[0..tw.twiddles.len]);
-        }
+        if (twiddles.fresh) try @import("circle_twiddles.zig").fill(a, s, twiddles.buffer, p.log, .forward);
         self.twiddles = twiddles.buffer;
         self.fixed = null;
         if (fixed_host.len != 0) {

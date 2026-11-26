@@ -38,7 +38,8 @@ pub const Instance = struct {
     }
     pub fn variables(self: Instance) !u32 {
         const v = try std.math.add(u32, self.row_log, try self.laneLog());
-        if (self.row_log < 5 or self.row_log > 22 or v > 30) return error.InvalidLocalGkrGeometry;
+        const wide = self.row_log == 23 and self.origin == .core and self.origin.core == .cpu and self.terms == @import("fractions.zig").cpuTerms(false);
+        if (self.row_log < 5 or (self.row_log > 22 and !wide) or v > 30) return error.InvalidLocalGkrGeometry;
         return v;
     }
     pub fn rows(self: Instance) !usize {
@@ -57,4 +58,18 @@ pub fn splitPoint(instance: Instance, common: []const @import("stwo_core").field
     if (verified_variables != n or common.len < n) return error.LocalGkrPointGeometryMismatch;
     const local = common[common.len - n ..];
     return .{ .rows = local[0..instance.row_log], .lanes = local[instance.row_log..] };
+}
+
+test "wide execution frame accepts only the 15-term CPU at log 23" {
+    var i = Instance{ .origin = .{ .core = .cpu }, .row_log = 23, .terms = 15, .fixed_offset = 0, .main_offset = 0 };
+    try std.testing.expectEqual(27, try i.variables());
+    try std.testing.expectEqual(1 << 27, try i.facts());
+    i.terms = 14;
+    try std.testing.expectError(error.InvalidLocalGkrGeometry, i.variables());
+    i.terms = 15;
+    i.origin = .{ .core = .ls };
+    try std.testing.expectError(error.InvalidLocalGkrGeometry, i.variables());
+    i.origin = .{ .core = .cpu };
+    i.row_log = 24;
+    try std.testing.expectError(error.InvalidLocalGkrGeometry, i.variables());
 }

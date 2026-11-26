@@ -36,22 +36,15 @@ pub const MAX_ARITY = X.layout.rom.COUNT;
 /// All six REG terms are kept distinct, including zero-weight poles. Ranges
 /// are unit queries on padded rows as well as active rows.
 pub fn cpuFor(comptime F: type, fixed: []const F, row: []const F, epoch: F, sink: anytype) void {
-    const m = X.layout.main;
-    for (0..3) |slot| {
-        const w = row[m.enabled + slot];
-        sink.emit(.register, X.tuples.register(F, fixed, row, slot, false), w);
-        sink.emit(.register, X.tuples.register(F, fixed, row, slot, true), w.neg());
-    }
-    sink.emit(.function, X.tuples.function(F, row), row[m.function]);
-    sink.emit(.rom, X.tuples.rom(F, row), row[m.active]);
-    // Local GKR frames cap row_log at 22 (frame.zig), so never wide-clock.
-    sink.emit(.owner, X.tuples.owner(F, fixed, row, epoch, false), row[m.active].sub(row[m.function]));
-    for (0..3) |slot| sink.emit(.range16, [1]F{row[m.gap16 + slot]}, F.one());
-    for (0..3) |slot| sink.emit(.range8, [1]F{row[m.gap8 + slot]}, F.one());
+    cpuClockFor(F, fixed, row, epoch, .byte, sink);
 }
-/// Explicit V3 byte-pair mode; the legacy15-term emitter remains unchanged.
+pub const CpuClock = enum { byte, pair, wide };
 pub fn cpuModeFor(comptime F: type, fixed: []const F, row: []const F, epoch: F, pairs: bool, sink: anytype) void {
-    if (!pairs) return cpuFor(F, fixed, row, epoch, sink);
+    cpuClockFor(F, fixed, row, epoch, if (pairs) .pair else .byte, sink);
+}
+/// A log-23 CPU uses three scaled U16 high-gap queries and row+1 RAM time.
+/// Register timestamps keep their four ticks per instruction in all modes.
+pub fn cpuClockFor(comptime F: type, fixed: []const F, row: []const F, epoch: F, clock: CpuClock, sink: anytype) void {
     const m = X.layout.main;
     for (0..3) |slot| {
         const w = row[m.enabled + slot];
@@ -60,10 +53,19 @@ pub fn cpuModeFor(comptime F: type, fixed: []const F, row: []const F, epoch: F, 
     }
     sink.emit(.function, X.tuples.function(F, row), row[m.function]);
     sink.emit(.rom, X.tuples.rom(F, row), row[m.active]);
-    sink.emit(.owner, X.tuples.owner(F, fixed, row, epoch, false), row[m.active].sub(row[m.function]));
-    for (0..3) |slot| sink.emit(.range16, [1]F{row[m.gap16 + slot]}, F.one());
-    sink.emit(.byte_pair, [4]F{ row[m.gap8], row[m.gap8 + 1], F.zero(), F.one() }, F.one());
-    sink.emit(.byte_pair, [4]F{ row[m.gap8 + 2], F.zero(), F.zero(), F.one() }, F.one());
+    sink.emit(.owner, X.tuples.owner(F, fixed, row, epoch, clock == .wide), row[m.active].sub(row[m.function]));
+    clockRanges(F, row, m.gap16, m.gap8, clock, sink);
+}
+fn clockRanges(comptime F: type, row: []const F, comptime low: usize, comptime high: usize, clock: CpuClock, sink: anytype) void {
+    for (0..3) |slot| sink.emit(.range16, [1]F{row[low + slot]}, F.one());
+    switch (clock) {
+        .byte => for (0..3) |slot| sink.emit(.range8, [1]F{row[high + slot]}, F.one()),
+        .wide => for (0..3) |slot| sink.emit(.range16, [1]F{row[high + slot].mul(X.types.literal(F, X.layout.WIDE_GAP_SCALE))}, F.one()),
+        .pair => {
+            sink.emit(.byte_pair, [4]F{ row[high], row[high + 1], F.zero(), F.one() }, F.one());
+            sink.emit(.byte_pair, [4]F{ row[high + 2], F.zero(), F.zero(), F.one() }, F.one());
+        },
+    }
 }
 /// Compact decode (Geometry.cpu_compact_decode) on top of the byte-pair mode:
 /// the SAME fourteen terms, relations, order and weights as `cpuModeFor(pairs)`,
@@ -72,6 +74,9 @@ pub fn cpuModeFor(comptime F: type, fixed: []const F, row: []const F, epoch: F, 
 /// row PC chain is definitional; `previous` is the cyclic previous MAIN row and
 /// `initial_pc` is felt(public initial PC). Every coordinate has degree <= 2.
 pub fn cpuCompactFor(comptime F: type, fixed: []const F, row: []const F, previous: []const F, epoch: F, initial_pc: F, sink: anytype) void {
+    cpuCompactClockFor(F, fixed, row, previous, epoch, initial_pc, false, sink);
+}
+pub fn cpuCompactClockFor(comptime F: type, fixed: []const F, row: []const F, previous: []const F, epoch: F, initial_pc: F, wide: bool, sink: anytype) void {
     const k = X.layout.compact;
     const U = X.tuples.compact;
     for (0..3) |slot| {
@@ -81,10 +86,8 @@ pub fn cpuCompactFor(comptime F: type, fixed: []const F, row: []const F, previou
     }
     sink.emit(.function, U.function(F, row), row[k.function]);
     sink.emit(.rom, U.rom(F, fixed, row, previous, initial_pc), row[k.active]);
-    sink.emit(.owner, U.owner(F, fixed, row, epoch), row[k.active].sub(row[k.function]));
-    for (0..3) |slot| sink.emit(.range16, [1]F{row[k.gap16 + slot]}, F.one());
-    sink.emit(.byte_pair, [4]F{ row[k.gap8], row[k.gap8 + 1], F.zero(), F.one() }, F.one());
-    sink.emit(.byte_pair, [4]F{ row[k.gap8 + 2], F.zero(), F.zero(), F.one() }, F.one());
+    sink.emit(.owner, U.ownerForClock(F, fixed, row, epoch, wide), row[k.active].sub(row[k.function]));
+    clockRanges(F, row, k.gap16, k.gap8, if (wide) .wide else .pair, sink);
 }
 pub fn andTableModeFor(comptime F: type, fixed: []const F, main: []const F, pairs: bool, sink: anytype) void {
     andTableFor(F, fixed, main, sink);

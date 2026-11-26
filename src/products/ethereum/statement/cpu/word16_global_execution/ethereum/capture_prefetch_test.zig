@@ -298,6 +298,49 @@ test "in-process walk skips only the legacy Poseidon cache; packet collection ke
     try std.testing.expectEqualDeep(with.initial_cache.root(), walk.request.initial_cache.root());
 }
 const expectSameTree = FixtureSupport.expectSameTree;
+test "checkpoint-only walk borrows no retirement tape and workers hand off the serial capture" {
+    var fixture = try Fixture.init();
+    defer fixture.deinit();
+    var config = fixture.config();
+    config.batch_steps = 3;
+    config.max_batches = 2;
+    const options: Request.Options = .{ .poseidon_initial_cache = false };
+    const serial = try Walk.createWithOptions(a, config, options);
+    defer serial.destroy();
+    const parent = try Walk.createForSource(a, config, options, 2);
+    defer parent.destroy();
+    try std.testing.expectEqual(config.batch_steps, serial.tape.storage.len);
+    try std.testing.expectEqual(@as(usize, 0), parent.tape.retainedBytes());
+    try std.testing.expectError(error.InvalidEthereumBatchSeed, parent.next());
+    const Segments = @import("../../rv64_ethereum_segments.zig");
+    var source = try Segments.Source.init(a, parent, 2);
+    defer source.deinit();
+    const segments = source.segments.?;
+    segments.retain_starts = true;
+    for (0..2) |_| {
+        var expected = (try serial.nextTaking()).?;
+        defer expected.deinit();
+        var actual = (try source.next()).?;
+        defer actual.deinit();
+        const cp = segments.takeStart().?;
+        defer segments.releaseStart(cp);
+        if (actual.index == 0) {
+            // Fail the final fast-engine allocation after the checkpoint image
+            // exists. The constructor still owns that image until it succeeds.
+            var count = std.testing.FailingAllocator.init(a, .{});
+            const trial = try Walk.createSegment(count.allocator(), parent, cp, 0);
+            trial.destroy();
+            var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = count.alloc_index - 1 });
+            try std.testing.expectError(error.OutOfMemory, Walk.createSegment(fail.allocator(), parent, cp, 0));
+            try std.testing.expectEqual(fail.allocated_bytes, fail.freed_bytes);
+        }
+        try std.testing.expectEqual(expected.index, actual.index);
+        try std.testing.expectEqualDeep(expected.tape.steps(), actual.tape.steps());
+        try std.testing.expectEqualDeep(expected.tape.memory_before.items, actual.tape.memory_before.items);
+        try std.testing.expectEqualDeep(expected.finished, actual.finished);
+    }
+    try std.testing.expect((try source.next()) == null);
+}
 test "fast first pass + parallel segment walks equal the serial walk (native jobs and direct capture)" {
     var fixture = try Fixture.init();
     defer fixture.deinit();

@@ -1,4 +1,5 @@
 #include "binding.h"
+#include "gkr_loop.h"
 #include "custody.cuh"
 #include "eq_tile.cuh"
 #include "logup_t8.h"
@@ -351,7 +352,7 @@ extern "C" int
 stwo_rv64_binding_project_on(void *ctx, uint32_t lane,
                              const StwoRv64BindingProjection *input) {
   if (!input || input->reserved[0] || input->reserved[1] || !input->row_log ||
-      input->row_log > 22 || input->lane_log > 8 ||
+      input->row_log > STWO_RV64_BINDING_MAX_ROW_LOG || input->lane_log > 8 ||
       input->row_log + input->lane_log > 28)
     return int(cudaErrorInvalidValue);
   const auto job = *input;
@@ -371,7 +372,7 @@ extern "C" int stwo_rv64_binding_deferred_on(
     void *ctx, uint32_t lane, const StwoRv64BindingDeferred *input) {
   using namespace stwo::cuda::rv64;
   if (!input || input->reserved[0] || input->reserved[1] || !input->row_log ||
-      input->row_log > 22 || input->lane_log > 8 ||
+      input->row_log > STWO_RV64_BINDING_MAX_ROW_LOG || input->lane_log > 8 ||
       input->row_log + input->lane_log > 28) return int(cudaErrorInvalidValue);
   const auto job = *input;
   const uint32_t rows = 1u << job.row_log, facts = rows << job.lane_log;

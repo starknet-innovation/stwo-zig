@@ -320,6 +320,24 @@ __global__ void deep_combine_validate(StwoRv64DeepCombine j, uint32_t *ok) {
   if (!*ok)
     atomicOr(j.status, 1u);
 }
+// For a canonical circle, bit-reversed rows are in conjugate pairs.
+// The first forward line layer stores x for one of the two antipodal
+// pairs. Swapping adjacent x entries rotates by a quarter turn, with
+// the sign determined by which half of the layer the swap crosses.
+struct DomainPoint { uint32_t x, y; };
+template <bool Canonical>
+__device__ __forceinline__ DomainPoint domain_point(const uint32_t *domain, uint32_t row) {
+  if constexpr (Canonical) {
+    const uint32_t index = row >> 2;
+    const uint32_t x = domain[index], y = domain[index ^ 1u];
+    const uint32_t antipode = (row >> 1) & 1u;
+    const uint32_t flip_y = (index ^ row ^ antipode) & 1u;
+    return {antipode ? q::sub(0, x) : x, flip_y ? q::sub(0, y) : y};
+  } else {
+    return {domain[uint64_t(row) * 2], domain[uint64_t(row) * 2 + 1]};
+  }
+}
+template <bool Canonical>
 __global__ void deep_combine(StwoRv64DeepCombine j) {
   const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
   const uint32_t n = 1u << j.output_log;
@@ -330,8 +348,7 @@ __global__ void deep_combine(StwoRv64DeepCombine j) {
   // other rows, so it must never be used as a non-atomic per-row guard.
   if (!j.valid[1])
     return;
-  const uint32_t x = j.domain_xy[uint64_t(row) * 2],
-                 y = j.domain_xy[uint64_t(row) * 2 + 1];
+  const auto [x, y] = domain_point<Canonical>(j.domain_xy, row);
   if (x >= q::kPrime || y >= q::kPrime) {
     atomicOr(j.status, 2u);
     return;
@@ -502,6 +519,7 @@ struct DeepClass {
 #ifndef STWO_RV64_DEEP_COMBINE_MIN_BLOCKS
 #define STWO_RV64_DEEP_COMBINE_MIN_BLOCKS 1
 #endif
+template <bool Canonical>
 __global__ __launch_bounds__(kDeepCombineThreads, STWO_RV64_DEEP_COMBINE_MIN_BLOCKS) void deep_combine_classes(
     StwoRv64DeepCombine j) {
   __shared__ DeepClass classes[kDeepCombineGroups];
@@ -594,8 +612,7 @@ __global__ __launch_bounds__(kDeepCombineThreads, STWO_RV64_DEEP_COMBINE_MIN_BLO
   const uint32_t count = class_count;
   const bool linear_bad = lin_bad;
   for (uint32_t row = blockIdx.x * blockDim.x + lane; row < n; row += stride) {
-    const uint32_t x = j.domain_xy[uint64_t(row) * 2],
-                   y = j.domain_xy[uint64_t(row) * 2 + 1];
+    const auto [x, y] = domain_point<Canonical>(j.domain_xy, row);
     if (x >= q::kPrime || y >= q::kPrime) {
       store(j.output.words, j.output.stride, row, zero());
       atomicOr(j.status, 2u);
@@ -665,13 +682,14 @@ __global__ __launch_bounds__(kDeepCombineThreads, STWO_RV64_DEEP_COMBINE_MIN_BLO
 }
 // Persistent grid for deep_combine_classes: the per-CTA class prologue is
 // paid once per resident CTA, not once per 256 rows.
+template <bool Canonical>
 inline uint32_t deep_combine_grid(uint32_t rows) {
   static const uint32_t resident = [] {
     int device = 0, sms = 0, per_sm = 0;
     if (cudaGetDevice(&device) ||
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device) ||
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-            &per_sm, deep_combine_classes, kDeepCombineThreads, 0) ||
+            &per_sm, deep_combine_classes<Canonical>, kDeepCombineThreads, 0) ||
         sms <= 0 || per_sm <= 0) {
       cudaGetLastError();
       return 0u;
@@ -783,12 +801,13 @@ int stwo::cuda::rv64::detail::deep_prepare(void *ctx, uint32_t lane,
   }
   return int(cudaPeekAtLastError());
 }
-int stwo::cuda::rv64::detail::deep_combine(void *ctx, uint32_t lane,
-                                         const StwoRv64DeepCombine *input, bool legacy) {
+template <bool Canonical>
+static int deep_combine_mode(void *ctx, uint32_t lane,
+                             const StwoRv64DeepCombine *input, bool legacy) {
   using namespace stwo::cuda::rv64;
   if (!input || input->reserved[0] || input->reserved[1] ||
       !input->group_count || input->group_count > 1024 || !input->output_log ||
-      input->output_log > 28)
+      input->output_log > 28 || (Canonical && input->output_log < 3))
     return int(cudaErrorInvalidValue);
   if (reinterpret_cast<uintptr_t>(input->groups) % alignof(StwoRv64DeepGroup))
     return int(cudaErrorInvalidValue);
@@ -799,7 +818,7 @@ int stwo::cuda::rv64::detail::deep_combine(void *ctx, uint32_t lane,
       !c.range(j.points, uint64_t(j.group_count) * 16, false) ||
       !c.range(j.linear, uint64_t(j.group_count) * 16, false) ||
       !c.range(j.evaluations, j.evaluation_words, false) ||
-      !c.range(j.domain_xy, uint64_t(2) << j.output_log, false) ||
+      !c.range(j.domain_xy, uint64_t(1) << (Canonical ? j.output_log - 2 : j.output_log + 1), false) ||
       !c.range(j.valid, 2, true) ||
       !c.plane(j.output, 1u << j.output_log, 8, true) ||
       !c.range(j.status, 1, true))
@@ -807,11 +826,22 @@ int stwo::cuda::rv64::detail::deep_combine(void *ctx, uint32_t lane,
   deep_combine_validate<<<1, 1, 0, c.stream>>>(
       j, const_cast<uint32_t *>(j.valid) + 1);
   if (legacy || j.group_count > kDeepCombineGroups)
-    stwo::cuda::rv64::deep_combine<<<((1u << j.output_log) + 127) / 128, 128, 0, c.stream>>>(j);
+    stwo::cuda::rv64::deep_combine<Canonical><<<((1u << j.output_log) + 127) / 128, 128, 0, c.stream>>>(j);
   else
-    deep_combine_classes<<<deep_combine_grid(1u << j.output_log),
+    deep_combine_classes<Canonical><<<deep_combine_grid<Canonical>(1u << j.output_log),
                            kDeepCombineThreads, 0, c.stream>>>(j);
   return int(cudaPeekAtLastError());
+}
+
+int stwo::cuda::rv64::detail::deep_combine(void *ctx, uint32_t lane,
+                                         const StwoRv64DeepCombine *input, bool legacy) {
+  return deep_combine_mode<false>(ctx, lane, input, legacy);
+}
+
+// Used by resident PCS with its allocation-checked canonical forward tower.
+extern "C" int stwo_rv64_deep_combine_canonical_on(void *ctx, uint32_t lane,
+                                                    const StwoRv64DeepCombine *input) {
+  return deep_combine_mode<true>(ctx, lane, input, false);
 }
 
 extern "C" int stwo_rv64_deep_prepare_on(void *ctx, uint32_t lane, const StwoRv64DeepPrepare *input) {

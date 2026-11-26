@@ -33,6 +33,8 @@ pub const Mass = struct { ram: u64, kio: u64, wire: u64 };
 pub const Chain = struct { family: u32, rung: u32, vkhash: [32]u8, stmt: [32]u8, s_in: [32]u8, s_out: [32]u8 };
 const Canon = @import("../native_schema/canonical.zig");
 pub const ExpectedWorker = struct {
+    /// Owned by the request authority, never decoded from the stage-one proof.
+    envelope: @import("service_scope.zig").Envelope = .admitted,
     chain: ?Chain = null,
     kind: Kind,
     global_relations: Relations,

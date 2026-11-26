@@ -55,6 +55,11 @@ pub const Truth = union(enum) {
             inline else => |t| &t.setup.key,
         };
     }
+    pub fn fixedColumns(self: @This(), a: std.mem.Allocator) ![]Col {
+        return switch (self) {
+            inline else => |t| t.setup.fixedColumns(a),
+        };
+    }
     pub fn logs(self: @This(), a: std.mem.Allocator, tree: usize) ![]u32 {
         return switch (self) {
             .keccak => |t| t.setup.logs(a, tree),

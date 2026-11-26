@@ -63,6 +63,8 @@ pub threadlocal var class_hint: ?[32]u8 = null;
 /// Host template reuse and device immutable placement are separate decisions.
 /// Leaf plans remain request-leased, even when their host template is cached.
 pub threadlocal var class_is_leaf: bool = false;
+/// First guessed variable of each authenticated child PCS, in circuit order.
+pub threadlocal var child_proof_starts: []const u32 = &.{};
 /// Host-only producer hint (M6 hint-tape v1): the seed-origin values of the
 /// v2 fold graph whose class is `class_hint`, in variable order, recorded from
 /// the fold's guess prologue instead of building the verifier graph. A device
@@ -168,6 +170,10 @@ fn proveOwned(a: std.mem.Allocator, key: *const Native.Authority, outputs: []P.Q
         defer a.free(outputs);
         return node.prove(node.context, a, key, ctx, outputs, ordinal);
     };
+    if (key.pp.mixed_arithmetic) {
+        a.free(outputs);
+        return error.MixedArithmeticRequiresWholeNode;
+    }
     const controller = if (precommitted) |fixed| fixed.controller else factory.controller;
     if (controller) |owner| {
         const Job = struct {

@@ -83,8 +83,8 @@ pub fn outputs(ctx: *const C.Context(Q), task: Task, buf: *[4]u32) []const u32 {
 inline fn append(a: std.mem.Allocator, ctx: *const C.Context(Q), tasks: *std.ArrayList(Task), producer: []u32, task: Task) !void {
     var obuf: [4]u32 = undefined;
     var ibuf: [6]u32 = undefined;
-    const out = outputs(ctx, task, &obuf);
-    const in = inputs(ctx, task, &ibuf);
+    const out = @call(.always_inline, outputs, .{ ctx, task, &obuf });
+    const in = @call(.always_inline, inputs, .{ ctx, task, &ibuf });
     for (in) |v| if (v >= producer.len) return error.InvalidWitnessVariable;
     for (out) |v| if (v >= producer.len) return error.InvalidWitnessVariable;
     if (out.len == 1 and task.kind != .hint and task.kind != .permutation) {
@@ -158,9 +158,18 @@ fn buildImpl(a: std.mem.Allocator, ctx: *const C.Context(Q), metrics: ?*BuildMet
     if (metrics) |m| m.seeds_ns = timer.lap();
     var tasks: std.ArrayList(Task) = .empty;
     defer tasks.deinit(a);
-    for (metadata.origins.items, 0..) |origin, i| if (origin.kind != .seed) try append(a, ctx, &tasks, producer, .{ .kind = .hint, .index = @intCast(i) });
     const lists = .{ ctx.circuit.add.items, ctx.circuit.sub.items, ctx.circuit.mul.items, ctx.circuit.pointwise_mul.items, ctx.circuit.triple_xor.items, ctx.circuit.m31_to_u32.items, ctx.circuit.blake_g_gate.items };
     const kinds = [_]Kind{ .add, .sub, .mul, .pointwise_mul, .triple_xor, .m31_to_u32, .blake_g };
+    if (ready_variables) {
+        // Every accepted task owns at least one non-seed output. The second
+        // upper bound is tighter for multi-output gates and excludes seeds.
+        var registrations = metadata.origins.items.len - (seeds.items.len - ctx.constants.count()) + ctx.circuit.permutation.len();
+        inline for (lists) |list| registrations += list.len;
+        // Optional reservation only. Sparse definitions can fit even when
+        // allocating the upper bound would exceed the allocator's budget.
+        tasks.ensureTotalCapacityPrecise(a, @min(producer.len - seeds.items.len, registrations)) catch {};
+    }
+    for (metadata.origins.items, 0..) |origin, i| if (origin.kind != .seed) try append(a, ctx, &tasks, producer, .{ .kind = .hint, .index = @intCast(i) });
     inline for (lists, kinds) |list, kind| for (list, 0..) |_, i| try append(a, ctx, &tasks, producer, .{ .kind = kind, .index = @intCast(i) });
     for (0..ctx.circuit.permutation.len()) |i| try append(a, ctx, &tasks, producer, .{ .kind = .permutation, .index = @intCast(i) });
     for (producer) |p| if (p == missing) return error.WitnessDefinitionMissing;
@@ -178,6 +187,12 @@ fn buildImpl(a: std.mem.Allocator, ctx: *const C.Context(Q), metrics: ?*BuildMet
     const starts = if (ready_variables) producer.len else tasks.items.len;
     for (0..starts) |position| {
         const start: u32 = if (ready_variables) producer[position] else @intCast(position);
+        // After this iteration the prefix of producer stores final levels.
+        // Earlier dependencies take one indexed read without chasing a task ID.
+        // Forward references keep their owner IDs until their own iteration.
+        defer if (ready_variables) {
+            producer[position] = if (start == seeded) 0 else levels[start];
+        };
         if (start == seeded or levels[start] != missing) continue;
         if (ready_variables) {
             // Builders allocate variable IDs in generation order, while gate
@@ -188,6 +203,10 @@ fn buildImpl(a: std.mem.Allocator, ctx: *const C.Context(Q), metrics: ?*BuildMet
             var maximum: u32 = 0;
             var ready = true;
             for (inputs(ctx, tasks.items[start], &input_buffer)) |variable| {
+                if (variable < position) {
+                    maximum = @max(maximum, producer[variable]);
+                    continue;
+                }
                 const parent = producer[variable]; // append checked every ID
                 if (parent == seeded) continue;
                 const level = levels[parent];
@@ -215,6 +234,11 @@ fn buildImpl(a: std.mem.Allocator, ctx: *const C.Context(Q), metrics: ?*BuildMet
             if (frame.next < dependencies.len) {
                 const variable = dependencies[frame.next];
                 if (variable >= producer.len) return error.InvalidWitnessVariable;
+                if (ready_variables and variable < position) {
+                    frame.maximum = @max(frame.maximum, producer[variable]);
+                    frame.next += 1;
+                    continue;
+                }
                 const parent = producer[variable];
                 if (parent == seeded) {
                     frame.next += 1;
@@ -464,8 +488,12 @@ test "witness schedule ready-variable sweep retains DFS forward references and r
     var ctx = try C.Context(Q).initTraceOnly(a, 0);
     defer ctx.deinit();
     const seed = try ctx.guess(Q.one());
+    const earlier = try ctx.add(seed, seed);
+    const prefix = try ctx.add(earlier, seed);
     const first = try ctx.add(seed, seed);
-    const second = try ctx.mul(seed, seed);
+    // The DFS reached through the forward reference must see the already
+    // resolved prefix as a level, even when its value aliases a valid task ID.
+    const second = try ctx.mul(prefix, seed);
     try ctx.finalize(false);
     // A forward definition cannot use the ready fast path, but its level and
     // final stable family order must match the original DFS oracle exactly.

@@ -4,7 +4,9 @@ const std = @import("std");
 const core = @import("stwo_core");
 const stack = @import("stacked_opening.zig");
 const Source = @import("stacked_commitment.zig");
-const Poly = @import("poly.zig").CircleCoefficients;
+const PolyOps = @import("poly.zig");
+const Poly = PolyOps.CircleCoefficients;
+const Twiddles = @import("../twiddles.zig");
 const Base = core.fields.m31.M31;
 const Secure = core.fields.om31.OM31;
 const Point = core.circle.CirclePoint(Secure);
@@ -87,10 +89,11 @@ fn directPositions(queries: []const usize) ![]usize {
     return core.queries.sortedUniquePositions(alloc, projected);
 }
 
-fn receive(roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, opening: *const Opening, direct_opening: *const Opening, proof: Proof, layout: *const Source.Layout) !void {
+fn receive(comptime random_odd: bool, roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, opening: *const Opening, direct_opening: *const Opening, proof: Proof, layout: *const Source.Layout) !void {
     var channel = Channel.init();
     const z = try start(&channel, roots, layout);
     const alpha = weights(&channel, samples, direct_sample);
+    const odd_mix = if (random_odd) channel.drawSecureFelt() else Secure.one();
     const direct_raw = channel.drawSecureFelt();
     const direct_deep = channel.drawSecureFelt();
     var verifier = try Verifier.commit(alloc, &channel, config(), proof, FRI.CirclePolyDegreeBound.init(degree_log));
@@ -125,7 +128,7 @@ fn receive(roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, 
             s.* = payload[at ^ 1];
         }
         const w = domain.at(core.utils.bitReverseIndex(i, domain_log));
-        answers[j] = rawAnswer(opened, alpha[0]).add(try first.answer(w, &opened, &sibling)).add(try second.answer(w, &opened, &sibling));
+        answers[j] = rawAnswer(opened, alpha[0]).add((try first.answerPair(w, &opened, &sibling)).mixOdd(odd_mix).value).add((try second.answerPair(w, &opened, &sibling)).mixOdd(odd_mix).value);
         const small_index = (i >> (domain_log - direct_log + 1) << 1) | (i & 1);
         const index = std.mem.indexOfScalar(usize, direct_indices, small_index) orelse return error.InvalidQueryShape;
         const small = direct_opening.queried_values[0][index];
@@ -134,7 +137,26 @@ fn receive(roots: [2]Hash.Hash, samples: *const Samples, direct_sample: Secure, 
     try verifier.decommit(alloc, answers[0..queries.len]);
 }
 
+fn expandQuotient(coefficients: *const Column) !Column {
+    var extended = try Column.uninitialized(alloc, domain.size());
+    errdefer extended.deinit(alloc);
+    for (extended.columns, coefficients.columns) |out, original| @memcpy(out[0..original.len], original);
+    var twiddles = try Twiddles.precomputeM31(alloc, domain.half_coset);
+    defer Twiddles.deinitM31(alloc, &twiddles);
+    try PolyOps.evaluateDyadicExtensionBuffersWithTwiddlesWithPool(&extended.columns, degree_log, domain, .{
+        .root_coset = twiddles.root_coset,
+        .twiddles = twiddles.twiddles,
+        .itwiddles = twiddles.itwiddles,
+    }, null);
+    return extended;
+}
+
 test "stacked Circle width eight authenticates both siblings and verifies a two-mask OM31 FRI proof" {
+    try proveAndReceive(false);
+    try proveAndReceive(true);
+}
+
+fn proveAndReceive(comptime random_odd: bool) !void {
     var layout = try sourceLayout(1);
     defer layout.deinit(alloc);
     try std.testing.expectEqualSlices(u32, &([_]u32{domain_log} ** groups), layout.column_logs);
@@ -187,6 +209,7 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
     };
     const direct_sample = direct_poly.evalAtPointFor(Secure, z[0]);
     const alpha = weights(&channel, &samples, direct_sample);
+    const odd_mix = if (random_odd) channel.drawSecureFelt() else Secure.one();
     const direct_raw = channel.drawSecureFelt();
     const direct_deep = channel.drawSecureFelt();
     const line = try core.constraints.quadraticConjugateLineCoeffs(Secure, z[0], direct_sample, direct_deep);
@@ -197,6 +220,21 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
     defer first.deinit(alloc);
     var second = try stack.Batch.init(alloc, width, &alpha[2], z[1], &samples[1]);
     defer second.deinit(alloc);
+    // The coefficient producer emits the sum of the two sign evaluations.
+    // Divide by two to match the separately evaluated quotient's framing.
+    const half = Secure.fromBase(Base.fromCanonical(1 << 30));
+    var first_coefficients = try stack.buildQuotientCoefficients(alloc, &logical, width, &alpha[1], &.{
+        .{ .point = z[0], .values = &samples[0], .mix = half },
+    }, odd_mix);
+    defer first_coefficients.deinit(alloc);
+    var second_coefficients = try stack.buildQuotientCoefficients(alloc, &logical, width, &alpha[2], &.{
+        .{ .point = z[1], .values = &samples[1], .mix = half },
+    }, odd_mix);
+    defer second_coefficients.deinit(alloc);
+    var first_evaluations = try expandQuotient(&first_coefficients);
+    defer first_evaluations.deinit(alloc);
+    var second_evaluations = try expandQuotient(&second_coefficients);
+    defer second_evaluations.deinit(alloc);
     for (0..traces[0].len / 2) |pair| {
         const i = pair * 2;
         const point = domain.at(core.utils.bitReverseIndex(i, domain_log));
@@ -206,8 +244,8 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
             lhs.* = trace[i];
             rhs.* = trace[i + 1];
         }
-        const current = try first.answerPair(point, &even, &odd);
-        const shifted = try second.answerPair(point, &even, &odd);
+        const current = (try first.answerPair(point, &even, &odd)).mixOdd(odd_mix);
+        const shifted = (try second.answerPair(point, &even, &odd)).mixOdd(odd_mix);
         const paired = [2]Secure{ current.value.add(shifted.value), current.conjugate.add(shifted.conjugate) };
         for (paired, 0..) |answer, sign| {
             const position = i + sign;
@@ -215,7 +253,10 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
             var expected = rawAnswer(if (sign == 0) even else odd, alpha[0]);
             for (trace_columns, 0..) |trace, g| {
                 for (z, samples, alpha[1..]) |mask_point, mask, coefficient| {
-                    expected = expected.add(coefficient[g].mul(try stack.quotient(w, trace[position], trace[position ^ 1], mask_point, mask[g * width ..][0..width])));
+                    const group = mask[g * width ..][0..width];
+                    const q = try stack.quotient(w, trace[position], trace[position ^ 1], mask_point, group);
+                    const sibling_q = try stack.quotient(w.conjugate(), trace[position ^ 1], trace[position], mask_point, group);
+                    expected = expected.add(coefficient[g].mul(q.add(sibling_q).add(q.sub(sibling_q).mul(odd_mix)).mul(half)));
                 }
             }
             const raw = rawAnswer(if (sign == 0) even else odd, alpha[0]);
@@ -226,7 +267,9 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
             const v = small_trace[index];
             const d = core.constraints.quadraticLineDenominator(Secure, z[0], p);
             const q = line.c.mulM31(v).sub(line.a.mulM31(p.y)).sub(line.b).mulInner(try d.inv());
-            values.set(position, answer.add(raw).add(q).add(direct_raw.mulM31(v)));
+            const from_coefficients = first_evaluations.at(position).add(second_evaluations.at(position));
+            try std.testing.expectEqual(answer, from_coefficients);
+            values.set(position, from_coefficients.add(raw).add(q).add(direct_raw.mulM31(v)));
         }
     }
     owns_values = false; // commit takes ownership, including on errors.
@@ -247,32 +290,32 @@ test "stacked Circle width eight authenticates both siblings and verifies a two-
     defer alloc.free(direct_indices);
     var direct_opening = try small_tree.decommit(alloc, direct_indices, &.{&small_trace});
     defer direct_opening.deinit(alloc);
-    try receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout);
+    try receive(random_odd, roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout);
 
     var wrong_tree = try sourceLayout(2);
     defer wrong_tree.deinit(alloc);
-    if (receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &wrong_tree)) |_|
+    if (receive(random_odd, roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &wrong_tree)) |_|
         return error.ChangedTreeIdentityAccepted
     else |_| {}
 
     const small_word = &direct_opening.queried_values[0][0];
     small_word.* = small_word.add(Base.one());
-    try std.testing.expectError(error.RootMismatch, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
+    try std.testing.expectError(error.RootMismatch, receive(random_odd, roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
     small_word.* = small_word.sub(Base.one());
 
     for (0..2) |sign| {
         const word = &opening.queried_values[groups - 1][sign];
         word.* = word.add(Base.one());
-        try std.testing.expectError(error.RootMismatch, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
+        try std.testing.expectError(error.RootMismatch, receive(random_odd, roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
         word.* = word.sub(Base.one());
     }
     // Changing the shifted mask changes the Fiat-Shamir query set.
     samples[1][width + 2] = samples[1][width + 2].add(Secure.one());
-    try std.testing.expectError(error.InvalidQueryShape, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
+    try std.testing.expectError(if (random_odd) error.WitnessTooLong else error.InvalidQueryShape, receive(random_odd, roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
     samples[1][width + 2] = samples[1][width + 2].sub(Secure.one());
     // Mutate an unqueried FRI witness under the original transcript. The trace
     // authentication still succeeds, so the FRI verifier must reject it.
     const witness = &result.fri_proof.proof.first_layer.fri_witness[0];
     witness.* = witness.add(Secure.one());
-    try std.testing.expectError(error.FirstLayerCommitmentInvalid, receive(roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
+    try std.testing.expectError(error.FirstLayerCommitmentInvalid, receive(random_odd, roots, &samples, direct_sample, &opening, &direct_opening, result.fri_proof.proof, &layout));
 }

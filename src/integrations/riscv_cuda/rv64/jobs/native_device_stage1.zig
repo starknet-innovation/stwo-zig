@@ -185,6 +185,8 @@ pub const Spec = struct {
     fixed_host: []const []const u32,
     /// Class FIXED authority root (setup key root, little-endian words).
     fixed_root: [8]u32,
+    /// A producer-side device seal can already own these coefficients.
+    fixed_region_key: ?[32]u8 = null,
     main_shapes: []const C.Shape,
     /// Trace commitment blowup parameter (native_commit beta; D2 = 2).
     beta: u32,
@@ -194,9 +196,32 @@ pub const Spec = struct {
     /// gn-pack: arena words of the class's largest v2 witness program (its
     /// compact inputs, CPU scratch and ledgers), planned on top of jobWords.
     compact_words: u64 = 0,
+    /// The aligned subset of compact buffers held for the witness verdict.
+    /// An older class description without this census charges the full span.
+    compact_retained_words: ?u64 = null,
     /// Compact witness ROM, uploaded at install so request jobs only adopt it.
     compact_rom: ?struct { key: [8]u32, words: []const u32 } = null,
 };
+
+/// Worker storage is identified by the authenticated commitment and its
+/// ordered column layout. The layout controls offsets in the packed region.
+pub fn fixedRegionKey(root: [8]u32, beta: u32, shapes: []const C.Shape) [32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("rv64-native-fixed-region/v1\x00");
+    var word: [4]u8 = undefined;
+    for (root) |limb| {
+        std.mem.writeInt(u32, &word, limb, .little);
+        h.update(&word);
+    }
+    std.mem.writeInt(u32, &word, beta, .little);
+    h.update(&word);
+    for (shapes) |shape| {
+        std.mem.writeInt(u32, &word, shape.log_size, .little);
+        h.update(&word);
+        h.update(&.{@intFromEnum(shape.encoding)});
+    }
+    return h.finalResult();
+}
 
 pub const ResidentLayout = struct {
     main: usize = 0,
@@ -283,11 +308,14 @@ pub const Class = struct {
     child_draws: u32 = 0,
     wire: ?Wire.Program = null,
     wire_key: [32]u8 = @splat(0),
+    compact_gkr_words: ?usize = null,
 
     pub fn init(a: std.mem.Allocator, spec: Spec) !*Class {
         if (spec.gkr.fixed_count != spec.fixed_shapes.len or spec.gkr.logs.len != spec.fixed_shapes.len + spec.main_shapes.len) return error.NativeStage1ClassShape;
-        if (spec.fixed_host.len != spec.fixed_shapes.len) return error.NativeStage1ClassShape;
-        for (spec.fixed_host, spec.fixed_shapes) |h, s| if (h.len != @as(usize, 1) << @intCast(s.log_size)) return error.NativeStage1ClassShape;
+        if (spec.fixed_region_key == null) {
+            if (spec.fixed_host.len != spec.fixed_shapes.len) return error.NativeStage1ClassShape;
+            for (spec.fixed_host, spec.fixed_shapes) |h, s| if (h.len != @as(usize, 1) << @intCast(s.log_size)) return error.NativeStage1ClassShape;
+        } else if (spec.fixed_host.len != 0) return error.NativeStage1ClassShape;
         for (spec.main_shapes, spec.gkr.logs[spec.fixed_shapes.len..]) |s, l| if (s.log_size != l) return error.NativeStage1ClassShape;
         const self = try a.create(Class);
         errdefer a.destroy(self);
@@ -308,14 +336,12 @@ pub const Class = struct {
             o.* = at;
             at += @as(usize, 1) << @intCast(s.log_size);
         }
+        const fixed_key = spec.fixed_region_key orelse fixedRegionKey(spec.fixed_root, spec.beta, spec.fixed_shapes);
         var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("rv64-m8-n1-fixed-v1");
-        h.update(&spec.key);
-        const fixed_key = h.finalResult();
-        h = std.crypto.hash.sha2.Sha256.init(.{});
         h.update("rv64-m8-local-gkr-wire-v1");
         h.update(&spec.key);
-        self.* = .{ .a = a, .spec = spec, .fixed = fixed, .main = main, .bind = bind, .section = section, .resident = ResidentLayout.of(main.coefficient_cells, bind.output_words, section.words, bind.authorityWords()).withWire(wire.wireWords()).withSemantic(Semantic.words(bind.row_logs)), .fixed_key = fixed_key, .image_offsets = image_offsets, .image_words = at, .child_draws = NG.expectedChild(spec.gkr, @splat(0))[8], .wire = wire, .wire_key = h.finalResult() };
+        self.* = .{ .a = a, .spec = spec, .fixed = fixed, .main = main, .bind = bind, .section = section, .resident = ResidentLayout.of(main.coefficient_cells, bind.retainedWords(), section.words, bind.authorityWords()).withWire(wire.wireWords()).withSemantic(Semantic.words(bind.row_logs)), .fixed_key = fixed_key, .image_offsets = image_offsets, .image_words = at, .child_draws = NG.expectedChild(spec.gkr, @splat(0))[8], .wire = wire, .wire_key = h.finalResult() };
+        if (spec.fixed_region_key != null) self.compact_gkr_words = spec.gkr.compactTraversalWords();
         return self;
     }
     pub fn deinit(self: *Class) void {
@@ -345,23 +371,30 @@ pub const Class = struct {
     /// the MAIN/GKR/binding twiddle towers; shared across classes of equal
     /// logs, counted per class: an over-estimate the plan can absorb).
     pub fn heldWords(self: *const Class) u64 {
-        return self.fixedRegionWords() + twiddleWords(&self.main) + twiddleWords(&self.fixed) + self.spec.gkr.twiddle_words + self.bind.persistentWords() + (if (self.spec.compact_rom) |rom| up(rom.words.len) else 0) + (if (self.wire) |wire| up(wire.words.len) else 0);
+        return self.fixedRegionWords() + self.main.twiddleWords() + self.fixed.twiddleWords() + self.spec.gkr.twiddle_words + self.bind.persistentWords() + (if (self.spec.compact_rom) |rom| up(rom.words.len) else 0) + (if (self.wire) |wire| up(wire.words.len) else 0);
+    }
+    pub fn stagedWords(self: *const Class) usize {
+        return up(9) + granule + self.spec.gkr.stagedWords(true) + up(self.main.stagedWords(0));
+    }
+    pub fn gkrEnqueueWords(self: *const Class) usize {
+        return self.spec.gkr.enqueueWordsForTraversal(self.compact_gkr_words orelse self.spec.gkr.traversal.total_words);
     }
     /// Static arena peak of one request job (stream-ordered allocations).
     /// The MAIN commit's work (evaluations + tree, freed LIFO inside
     /// CommitPlan.enqueueInto) is dead before the local GKR + binding
     /// allocate, so the two phases share one window: max, not sum. The
-    /// witness image and compact program stay counted for the whole job (the
-    /// image free after the commit is not LIFO when the v2 program allocated
-    /// status words above it). gn-bind [M] 26235156: 8519d3b3 6.365G -> ~4.15G
-    /// words [D]; the sum overflowed phase A (GpuNativeMemoryPlanPhaseA, r7).
+    /// Compact workspace retires before either phase. Only the checked
+    /// status buffers survive until the witness verdict is written.
     pub fn jobWords(self: *const Class) usize {
         const commit = @max(self.main.deviceWords(), self.main.coefficient_cells + self.main.eval_cells) + 8 * granule;
         // v2 writes MAIN directly into main_resident. It has compact input
         // buffers instead of a second v1 expanded MAIN/scatter image.
         const witness = if (self.spec.compact_words == 0 or self.spec.beta == 1) up(self.image_words) + up(max_chunk_runs * 6) + granule else 0;
-        const tail = self.spec.gkr.enqueueWords() + self.bind.enqueueWords() + granule;
-        return up(9) + granule + self.spec.gkr.stagedWords(true) + up(self.main.stagedWords(0)) + witness + @as(usize, @intCast(self.spec.compact_words)) + @max(commit, tail) + 8 * granule;
+        const traversal_words = self.compact_gkr_words orelse self.spec.gkr.traversal.total_words;
+        const tail = self.spec.gkr.enqueueWithTailWords(traversal_words, self.bind.retainedEnqueueWords() + granule);
+        const compact = self.spec.compact_words;
+        const retained: usize = @intCast(self.spec.compact_retained_words orelse compact);
+        return self.stagedWords() + witness + @max(@as(usize, @intCast(compact)), retained + @max(commit, tail)) + 8 * granule;
     }
     /// Stage-1 fields of the class's ClassEntry (Stage 2 adds its own).
     pub fn fill(self: *const Class, entry: *G.ClassEntry, devices: u32) void {
@@ -378,11 +411,6 @@ pub const Class = struct {
         for (0..@min(devices, G.max_devices)) |d| entry.held_words[d] += self.heldWords();
     }
 };
-
-/// native_commit's persistent twiddle tower words (CommitPlan.twiddleWords).
-fn twiddleWords(p: *const C.CommitPlan) usize {
-    return p.tw.twiddles.len + p.tw.itwiddles.len;
-}
 
 /// The largest run table one chunk may carry (scatter kernel input).
 pub const max_chunk_runs: usize = 4096;
@@ -484,7 +512,7 @@ pub const Compact = struct {
     chunks: []const G.TraceChunk,
     roms: ?*NP.Roms = null,
     program: ?*const NP.Program = null,
-    bound: ?*const NP.Bound = null,
+    bound: ?*NP.Bound = null,
 };
 
 /// True when a segment's chunks are format v2 (all or none).
@@ -533,17 +561,27 @@ pub const WarmJob = struct {
         self.a.free(self.inputs);
     }
     pub fn classKey(self: *WarmJob) [32]u8 {
-        return self.class.fixed_key;
+        // The class-specific GKR and MAIN allocations still determine the
+        // warm job's footprint when two classes share their FIXED region.
+        var h = std.crypto.hash.sha2.Sha256.init(.{});
+        h.update("rv64-native-class-warm/v1\x00");
+        h.update(&self.class.spec.key);
+        return h.finalResult();
     }
     pub fn footprint(self: *WarmJob) api.Footprint {
         const c = self.class;
-        const staged = c.fixed.stagedWords(c.fixed.coefficient_cells) + c.main.stagedWords(0) + c.spec.gkr.stagedWords(true) + 8 * granule;
-        const pinned = c.fixed.coefficient_cells + twiddleWords(&c.fixed) + twiddleWords(&c.main) + c.spec.gkr.pinnedWords() + c.bind.pinnedWords() + 16 + 8 * granule + (if (c.spec.compact_rom) |rom| rom.words.len else 0) + (if (c.wire) |wire| wire.words.len else 0);
-        return .{ .device_words = staged + @max(c.fixed.deviceWords(), c.fixed.coefficient_cells + c.fixed.eval_cells) + 8 * granule, .staged_words = staged, .slab_words = self.layout.words, .pinned_words = pinned };
+        const sealed = c.spec.fixed_region_key != null;
+        const fixed_stage = if (sealed) 0 else c.fixed.stagedWords(c.fixed.coefficient_cells);
+        const fixed_pinned = if (sealed) 0 else c.fixed.coefficient_cells + c.fixed.twiddleWords();
+        const fixed_work = if (sealed) 0 else @max(c.fixed.deviceWords(), c.fixed.coefficient_cells + c.fixed.eval_cells);
+        const staged = fixed_stage + c.main.stagedWords(0) + c.spec.gkr.stagedWords(true) + 8 * granule;
+        const pinned = fixed_pinned + c.main.twiddleWords() + c.spec.gkr.pinnedWords() + c.bind.pinnedWords() + 16 + 8 * granule + (if (c.spec.compact_rom) |rom| rom.words.len else 0) + (if (c.wire) |wire| wire.words.len else 0);
+        return .{ .device_words = staged + fixed_work + 8 * granule, .staged_words = staged, .slab_words = self.layout.words, .pinned_words = pinned };
     }
     pub fn stage(self: *WarmJob, s: *api.Stager) !void {
         const c = self.class;
         const p = try s.persistent(c.fixed_key, c.fixedRegionWords());
+        if (p.fresh and c.spec.fixed_region_key != null) return error.GpuNativeFixedNotWarmed;
         self.region = p.buffer;
         self.fresh = p.fresh;
         if (c.wire) |wire| {
@@ -609,9 +647,10 @@ pub const Prologue = struct {
 /// channel := seed; witness -> MAIN evaluation image (chunks: h2d of each
 /// staged run table + scatter; device: caller columns); mix the adopted FIXED
 /// root; commit MAIN into `main_view` with its root written to `root_out`
-/// and mixed. `main` is the job's staged CommitPlan copy; `runs[i]` the
+/// and mixed. The optional node span is retained in the request arena.
+/// `main` is the job's staged CommitPlan copy; `runs[i]` the
 /// staged device buffer of chunk i. The image is freed after the commit.
-pub fn enqueuePrologue(c: *const Class, sym: *const Symbols, e: *api.Enqueue, seed: api.DeviceBuffer, fixed_region: api.DeviceBuffer, witness: Witness, runs: []const ?api.DeviceBuffer, main: *const C.CommitPlan, inputs: []C.Input, main_view: api.DeviceBuffer, root_out: api.DeviceBuffer) !Prologue {
+pub fn enqueuePrologue(c: *const Class, sym: *const Symbols, e: *api.Enqueue, seed: api.DeviceBuffer, fixed_region: api.DeviceBuffer, witness: Witness, runs: []const ?api.DeviceBuffer, main: *const C.CommitPlan, inputs: []C.Input, main_view: api.DeviceBuffer, root_out: api.DeviceBuffer, nodes: ?api.DeviceBuffer) !Prologue {
     const ectx = e.ctx();
     const stream = e.stream();
     if (fixed_region.words < c.fixedRegionWords() or inputs.len != c.main.shapes.len or root_out.words < 8 or main_view.words < c.main.coefficient_cells) return error.NativeStage1PrologueShape;
@@ -664,7 +703,7 @@ pub fn enqueuePrologue(c: *const Class, sym: *const Symbols, e: *api.Enqueue, se
     const fixed_root = try fixed_region.slice(c.fixed.coefficient_cells, 8);
     try e.channel.mixRootFromTree(fixed_root);
     const fixed = C.Committed{ .coefficients = try fixed_region.slice(0, c.fixed.coefficient_cells), .root = fixed_root.ptr };
-    const committed = try main.enqueueInto(sym.commit, e, inputs, main_view, root_out, true);
+    const committed = try main.enqueueIntoResident(sym.commit, e, inputs, main_view, root_out, nodes);
     if (image) |img| e.free(img);
     return .{ .fixed = fixed, .main = committed, .fixed_root = fixed_root, .class_root = try fixed_region.slice(c.fixed.coefficient_cells + 8, 8), .witness_status = wstatus, .compact_status = compact_status, .compact_status_len = compact_len };
 }

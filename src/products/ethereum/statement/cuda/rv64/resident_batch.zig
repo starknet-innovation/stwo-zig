@@ -60,14 +60,20 @@ fn runMode(a: std.mem.Allocator, library: []const u8, manifest_path: []const u8,
         std.crypto.hash.sha2.Sha256.hash(raw, &digest, .{});
         break :blk digest;
     };
-    if (!std.mem.eql(u8, manifest.schema, "rv64-ethereum-basket-inputs/v1") or manifest.execution_order.len == 0 or manifest.execution_order.len > 256 or manifest.repeat == 0 or manifest.repeat > 16) return error.InvalidResidentBatchManifest;
+    const live = std.mem.eql(u8, manifest.schema, "rv64-ethereum-live-service/v1");
+    if (live) {
+        if (!combined or serve_spool == null or !ready_mode or !manifest.recursion_device_fixed_candidate or
+            manifest.execution_order.len != 0 or manifest.blocks.map.count() != 0 or manifest.warm_order.len != 0 or manifest.repeat != 1)
+            return error.InvalidLiveServiceManifest;
+    } else if (!std.mem.eql(u8, manifest.schema, "rv64-ethereum-basket-inputs/v1") or manifest.execution_order.len == 0 or manifest.execution_order.len > 256 or manifest.repeat == 0 or manifest.repeat > 16) return error.InvalidResidentBatchManifest;
     // This entry never admits the host-retained comparison route.
     if (std.process.hasEnvVarConstant("STWO_RV64_GPU_HOST_RETAINED") or !std.process.hasEnvVarConstant("STWO_RV64_GPU_DEVICE_TRACE")) return error.ResidentBatchRequiresDevicePipeline;
     if (manifest.resources != .object or (manifest.resources.object.get("park_main") orelse return error.ResidentPipelineCannotParkMain) != .bool or manifest.resources.object.get("park_main").?.bool) return error.ResidentPipelineCannotParkMain;
     var config = try Router.Config.fromEnv(a);
     defer config.deinit(a);
     var first_name: [24]u8 = undefined;
-    const first = manifest.blocks.map.get(try std.fmt.bufPrint(&first_name, "{d}", .{manifest.execution_order[0]})) orelse return error.MissingResidentBatchBlock;
+    const initial_scopes = if (live) @as(usize, 1) else cpuCount(manifest.blocks.map.get(try std.fmt.bufPrint(&first_name, "{d}", .{manifest.execution_order[0]})) orelse return error.MissingResidentBatchBlock);
+    if (live and config.ids.len != 1) return error.LiveServiceRequiresSingleDevice;
     if (combined) {
         _ = try ReadyPolicy.workers(manifest.recursion_mode, config.ids, manifest.recursion_worker_budget, manifest.recursion_max_pending_authorities);
         if (!std.process.hasEnvVarConstant("STWO_RV64_GPU_DEVICE_CAPS")) @memset(config.caps, 28 << 30);
@@ -89,7 +95,7 @@ fn runMode(a: std.mem.Allocator, library: []const u8, manifest_path: []const u8,
     defer session.deinit();
     // Refuse missing deployment assets before any native work or GPU custody.
     if (combined) try @import("stwo_riscv_cuda_integration").rv64.execution.runtime.circuit_air_preflight.require(base);
-    const pool = try Pool.createWithBinding(if (combined) base else a, library, config, cpuCount(first), true);
+    const pool = try Pool.createWithBinding(if (combined) base else a, library, config, initial_scopes, true);
     defer pool.deinit();
     try pool.stages().requireFullyResident();
     var outer: if (combined) ?@import("stwo_riscv_cuda_integration").rv64.outer_source.Context else void = if (combined) (if (ready_mode) null else try @import("stwo_riscv_cuda_integration").rv64.outer_source.Context.init(base, &pool.devices[0].native, &pool.devices[0].trace, &pool.devices[0].composition)) else {};
@@ -100,11 +106,10 @@ fn runMode(a: std.mem.Allocator, library: []const u8, manifest_path: []const u8,
     defer if (combined) {
         if (ready) |context| context.deinit();
     };
-    // GPU-native class installation (native_recursion_install.zig): recursion
-    // node proofs run as OuterNodeJobs on per-GPU DeviceWorkers so the first
-    // node of each class is harvested; ordinary requests never take this.
+    // Both live admission and class installation execute complete recursion nodes.
+    // Only the installer harvests those nodes for a predeclared block roster.
     const OuterJobs = @import("stwo_riscv_cuda_integration").rv64.execution.runtime.outer_job_factory;
-    const outer_jobs: if (combined) ?*OuterJobs.Hybrid else void = if (combined) (if (try OuterJobs.hybridSelected()) blk: {
+    const outer_jobs: if (combined) ?*OuterJobs.Hybrid else void = if (combined) (if (live or try OuterJobs.hybridSelected()) blk: {
         const lanes = (ready orelse return error.M8OuterJobsRequireReadyRecursion).lanes;
         const hybrid = try OuterJobs.Hybrid.create(std.heap.smp_allocator, library);
         errdefer hybrid.destroy();
@@ -181,7 +186,7 @@ fn runMode(a: std.mem.Allocator, library: []const u8, manifest_path: []const u8,
         const preload = try @import("stwo_riscv_cuda_integration").rv64.execution.runtime.outer_assignment.ClassCache.Store.preloadAll();
         std.debug.print("GPU_RESIDENT_CLASS_PRELOAD loaded={} ns={}\n", .{ preload.loaded, preload.ns });
     }
-    const svc = .{ .a = a, .base = base, .manifest = &manifest, .pool = pool, .config = &config, .session = &session, .recycler = &recycler, .factory = factory, .ready = ready, .ready_mode = ready_mode, .resource_json = resource_json, .parent = parent, .manifest_sha256 = manifest_sha256, .outer_jobs = outer_jobs, .capture_purpose = capture_purpose };
+    const svc = .{ .live = live, .a = a, .base = base, .manifest = &manifest, .pool = pool, .config = &config, .session = &session, .recycler = &recycler, .factory = factory, .ready = ready, .ready_mode = ready_mode, .resource_json = resource_json, .parent = parent, .manifest_sha256 = manifest_sha256, .outer_jobs = outer_jobs, .capture_purpose = capture_purpose };
     if (combined) {
         if (serve_spool) |spool| return serveSpool(svc, spool, init_timer.read());
     } else if (serve_spool != null) return error.ResidentServiceRequiresCombinedBatch;
@@ -196,7 +201,9 @@ fn runMode(a: std.mem.Allocator, library: []const u8, manifest_path: []const u8,
         for (manifest.execution_order, 0..) |block, iteration| {
             if (seen.contains(block)) return error.DuplicateResidentBatchBlock;
             try seen.put(block, {});
-            _ = try requestOne(combined, svc, block, trial, iteration, trial_directory);
+            var key: [24]u8 = undefined;
+            const item = manifest.blocks.map.get(try std.fmt.bufPrint(&key, "{d}", .{block})) orelse return error.MissingResidentBatchBlock;
+            _ = try requestOne(combined, svc, block, item, trial, iteration, trial_directory);
         }
     }
 }
@@ -204,7 +211,7 @@ fn runMode(a: std.mem.Allocator, library: []const u8, manifest_path: []const u8,
 /// One request of the resident service: fresh native production plus (combined)
 /// recursion, reusing only the session's immutable setup and the device pool.
 /// Returns the request wall (ns), the same interval GPU_RESIDENT_BLOCK reports.
-fn requestOne(comptime combined: bool, svc: anytype, block: u64, trial: u64, iteration: u64, trial_directory: []const u8) !u64 {
+fn requestOne(comptime combined: bool, svc: anytype, block: u64, item: Block, trial: u64, iteration: u64, trial_directory: []const u8) !u64 {
     const a = svc.a;
     const base = svc.base;
     const manifest = svc.manifest;
@@ -228,7 +235,6 @@ fn requestOne(comptime combined: bool, svc: anytype, block: u64, trial: u64, ite
     }
     var name_buf: [24]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "{d}", .{block});
-    const item = manifest.blocks.map.get(name) orelse return error.MissingResidentBatchBlock;
     if (item.expected_cpu_segments == 0 or !std.mem.eql(u8, item.jobs, "-")) return error.ResidentBatchRequiresDirectCapture;
     try pool.router.replan(cpuCount(item));
     const directory = try std.fs.path.join(a, &.{ trial_directory, name });
@@ -324,7 +330,7 @@ fn requestOne(comptime combined: bool, svc: anytype, block: u64, trial: u64, ite
 }
 
 /// Spool protocol (all paths under `spool`):
-///   inbox/<name>.request  text: block number (must be a manifest block); taken in
+///   inbox/<name>.request  text: authorized block number; taken in
 ///                         lexical order; write as <name>.tmp then rename (atomic)
 ///   inbox/STOP            exit once the inbox holds no further requests
 ///   out/<name>/<block>/proof   the request's proof directory (same layout as a batch trial)
@@ -339,7 +345,7 @@ fn serveSpool(svc: anytype, spool: []const u8, init_ns: u64) !void {
     try dir.makePath("out");
     try dir.makePath("done");
     {
-        const ready = try std.fmt.allocPrint(a, "{{\"schema\":\"rv64-resident-service/v1\",\"pid\":{d},\"init_ns\":{d}}}\n", .{ if (@import("builtin").os.tag == .linux) std.os.linux.getpid() else 0, init_ns });
+        const ready = try std.fmt.allocPrint(a, "{{\"schema\":\"rv64-resident-service/v1\",\"live_admission\":{},\"pid\":{d},\"init_ns\":{d}}}\n", .{ svc.live, if (@import("builtin").os.tag == .linux) std.os.linux.getpid() else 0, init_ns });
         defer a.free(ready);
         try dir.writeFile(.{ .sub_path = "READY.tmp", .data = ready });
         try dir.rename("READY.tmp", "READY");
@@ -373,52 +379,118 @@ fn serveSpool(svc: anytype, spool: []const u8, init_ns: u64) !void {
         };
         const queue_ns = idle.read();
         const stem = name[0 .. name.len - ".request".len];
+        const done_name = try std.fmt.allocPrint(a, "done/{s}.json", .{stem});
+        defer a.free(done_name);
+        if (try retirePublishedTicket(dir, inbox, name, done_name)) continue;
+        const tmp_name = try std.fmt.allocPrint(a, "done/{s}.tmp", .{stem});
+        defer a.free(tmp_name);
         const out = try std.fs.path.join(a, &.{ spool, "out", stem });
         defer a.free(out);
         // Admission: a malformed, unknown or duplicate request is answered with
         // done/<stem>.json {"ok":false} and removed, so one bad file can neither
         // stop the service nor poison its restart. Only failures inside a proof
         // (device, prover) stay terminal.
-        const block = admit(svc, inbox, name, out) catch |err| {
+        var ticket = std.heap.ArenaAllocator.init(a);
+        defer ticket.deinit();
+        const admission = admit(svc, ticket.allocator(), inbox, name, out) catch |err| {
             std.debug.print("GPU_RESIDENT_SERVICE reject request={s} error={s}\n", .{ name, @errorName(err) });
             const rejected = try std.fmt.allocPrint(a, "{{\"ok\":false,\"error\":\"{s}\",\"sequence\":null}}\n", .{@errorName(err)});
             defer a.free(rejected);
-            const done_name = try std.fmt.allocPrint(a, "done/{s}.json", .{stem});
-            defer a.free(done_name);
-            const tmp_name = try std.fmt.allocPrint(a, "done/{s}.tmp", .{stem});
-            defer a.free(tmp_name);
             try dir.writeFile(.{ .sub_path = tmp_name, .data = rejected });
-            try inbox.deleteFile(name);
             try dir.rename(tmp_name, done_name);
+            try inbox.deleteFile(name);
             continue;
         };
         try std.fs.cwd().makePath(out);
-        const wall = try requestOne(true, svc, block, sequence, 0, out);
+        const block = admission.block;
+        const wall = try requestOne(true, svc, block, admission.item, sequence, 0, out);
         const result = try std.fmt.allocPrint(a, "{{\"ok\":true,\"block\":{d},\"sequence\":{d},\"request_wall_ns\":{d},\"queue_ns\":{d}}}\n", .{ block, sequence, wall, queue_ns });
         defer a.free(result);
-        const done_name = try std.fmt.allocPrint(a, "done/{s}.json", .{stem});
-        defer a.free(done_name);
-        const tmp_name = try std.fmt.allocPrint(a, "done/{s}.tmp", .{stem});
-        defer a.free(tmp_name);
         try dir.writeFile(.{ .sub_path = tmp_name, .data = result });
-        try inbox.deleteFile(name);
         try dir.rename(tmp_name, done_name);
+        try inbox.deleteFile(name);
         sequence += 1;
         idle.reset();
     }
     std.debug.print("GPU_RESIDENT_SERVICE stop requests={}\n", .{sequence});
 }
 
-fn admit(svc: anytype, inbox: std.fs.Dir, name: []const u8, out: []const u8) !u64 {
+// The completion record is immutable. A retried ticket, including one left
+// between publishing and unlinking, refers to the original decision.
+fn retirePublishedTicket(dir: std.fs.Dir, inbox: std.fs.Dir, name: []const u8, done_name: []const u8) !bool {
+    dir.access(done_name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    try inbox.deleteFile(name);
+    return true;
+}
+
+test "a retried ticket preserves its published decision" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("inbox");
+    var inbox = try tmp.dir.openDir("inbox", .{});
+    defer inbox.close();
+    try inbox.writeFile(.{ .sub_path = "job.request", .data = "2" });
+    try std.testing.expect(!try retirePublishedTicket(tmp.dir, inbox, "job.request", "job.json"));
+    try tmp.dir.writeFile(.{ .sub_path = "job.json", .data = "first decision" });
+    try std.testing.expect(try retirePublishedTicket(tmp.dir, inbox, "job.request", "job.json"));
+    var buffer: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("first decision", try tmp.dir.readFile("job.json", &buffer));
+    try std.testing.expectError(error.FileNotFound, inbox.access("job.request", .{}));
+}
+
+const Admission = struct { block: u64, item: Block };
+
+/// The trusted deployment publishes this descriptor atomically after READY.
+/// Spool clients supply only a block number. Geometry and policy are checked
+/// before a rejected submission can allocate request resources or stop service.
+fn liveTicket(a: std.mem.Allocator, dir: std.fs.Dir, block: u64) !Block {
+    var key: [48]u8 = undefined;
+    const path = try std.fmt.bufPrint(&key, "admissions/{d}.json", .{block});
+    const raw = dir.readFileAlloc(a, path, 4096) catch |err| switch (err) {
+        error.FileNotFound => return error.MissingResidentBatchBlock,
+        else => return err,
+    };
+    const item = try std.json.parseFromSliceLeaky(Block, a, raw, .{});
+    if (item.request.len == 0 or item.expected_cpu_segments == 0 or item.prefix_count != 0 or !std.mem.eql(u8, item.jobs, "-")) return error.CombinedRequiresCompleteDirectExecution;
+    return item;
+}
+
+fn admit(svc: anytype, a: std.mem.Allocator, inbox: std.fs.Dir, name: []const u8, out: []const u8) !Admission {
     var buffer: [64]u8 = undefined;
     const text = std.mem.trim(u8, inbox.readFile(name, &buffer) catch return error.ResidentRequestUnreadable, " \t\r\n");
     const block = std.fmt.parseUnsigned(u64, text, 10) catch return error.ResidentRequestMalformed;
     var name_buf: [24]u8 = undefined;
-    if (svc.manifest.blocks.map.get(try std.fmt.bufPrint(&name_buf, "{d}", .{block})) == null) return error.MissingResidentBatchBlock;
+    const item = if (svc.live) ticket: {
+        var parent = try std.fs.cwd().openDir(svc.parent, .{});
+        defer parent.close();
+        break :ticket try liveTicket(a, parent, block);
+    } else svc.manifest.blocks.map.get(try std.fmt.bufPrint(&name_buf, "{d}", .{block})) orelse return error.MissingResidentBatchBlock;
+    try svc.config.validatePlan(cpuCount(item));
     if (std.fs.cwd().access(out, .{})) |_| return error.ResidentRequestNameReused else |err| if (err != error.FileNotFound) return err;
-    return block;
+    return .{ .block = block, .item = item };
 }
 
 fn cpuCount(item: Block) usize {
     return if (item.prefix_count == 0) item.expected_cpu_segments else @min(item.prefix_count, item.expected_cpu_segments);
+}
+
+test "live admission resolves only deployment-authorized complete requests" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makeDir("admissions");
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectError(error.MissingResidentBatchBlock, liveTicket(a, tmp.dir, 17));
+    const path = "admissions/17.json";
+    try tmp.dir.writeFile(.{ .sub_path = path, .data = "{\"request\":\"request.json\",\"expected_cpu_segments\":2}" });
+    const item = try liveTicket(a, tmp.dir, 17);
+    try std.testing.expectEqualStrings("request.json", item.request);
+    try std.testing.expectEqual(@as(usize, 2), item.expected_cpu_segments);
+    try tmp.dir.writeFile(.{ .sub_path = path, .data = "{\"request\":\"request.json\",\"expected_cpu_segments\":2,\"prefix_count\":1}" });
+    try std.testing.expectError(error.CombinedRequiresCompleteDirectExecution, liveTicket(a, tmp.dir, 17));
+    try std.testing.expectError(error.MissingResidentBatchBlock, liveTicket(a, tmp.dir, 18));
 }

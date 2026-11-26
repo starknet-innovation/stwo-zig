@@ -28,6 +28,8 @@ pub const ClassEntry = struct {
     /// Native segment classes: MAIN words kept resident witness -> PCS (the
     /// driver carves them from the main_resident region; 0 = none).
     main_resident_words: usize = 0,
+    /// Optional MAIN Merkle nodes in the same request-owned region.
+    main_node_words: usize = 0,
     /// Measured arena peak of one job of this class (plan.zig sweep).
     arena_peak_words: usize = 0,
     /// Smaller pre-seal producer when a two-stage class completes in phase B.

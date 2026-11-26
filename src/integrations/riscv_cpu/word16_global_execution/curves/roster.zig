@@ -54,6 +54,9 @@ pub const TruthSetup = struct {
         return initWithSuite(a, op, log, Key.Suite.production());
     }
     pub fn initWithSuite(a: std.mem.Allocator, op: Op, log: u32, suite: Key.Suite) !TruthSetup {
+        return initWithFixedMode(a, op, log, suite, .committed);
+    }
+    pub fn initWithFixedMode(a: std.mem.Allocator, op: Op, log: u32, suite: Key.Suite, mode: Key.FixedMode) !TruthSetup {
         try suite.validate();
         if (log > MAX_LOG) return error.CurveTruthGeometryBudget;
         try validateGeometry(op, 0, 1, log);
@@ -62,7 +65,7 @@ pub const TruthSetup = struct {
         var self = TruthSetup{ .allocator = a, .op = op, .log = log, .fixed = fixed, .key = undefined };
         const cols = try self.fixedColumns(a);
         defer a.free(cols);
-        self.key = try Key.sealWithSuite(a, cols, suite);
+        self.key = try Key.prepare(a, cols, suite, mode);
         return self;
     }
     pub fn deinit(self: *TruthSetup) void {

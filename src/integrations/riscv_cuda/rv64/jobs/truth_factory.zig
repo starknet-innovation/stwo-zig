@@ -43,6 +43,7 @@ pub const Request = struct {
     first_id: u32,
     /// Packed compact inputs (K.packCompact); owned by the caller until `end`.
     compact: []const u32,
+    compact_device: ?@import("../guest_service_inputs.zig").TruthSpan = null,
     seed: [9]u32,
 };
 
@@ -59,6 +60,7 @@ pub const Factory = struct {
     /// Stage-2 proof production: `.device` (GPU-native publication) or the
     /// r-truth host assembly (`.host`, bytes via `bytes()`).
     encode: TJ.Encode = .device,
+    geometry_budget: bool = false,
 
     pub const RequestState = struct {
         truths: []Request,
@@ -72,6 +74,8 @@ pub const Factory = struct {
         class: *K.Class,
         /// Measured stage-2 arena peak (receipt arena_peak_words), 0 = unmeasured.
         measured_peak_words: usize = 0,
+        geometry_peak_words: ?usize = null,
+        shared_commit_evaluations: bool = false,
         max_encoded_bytes: usize,
         devices: u8 = 0b11,
         planned_reuse: bool = false,
@@ -104,9 +108,9 @@ pub const Factory = struct {
     /// the persistent FIXED tree (coefficients + root) and the persistent
     /// twiddle towers it stages (commit plans, interaction logs, composition).
     pub fn heldWords(class: *const K.Class) u64 {
-        var words: u64 = class.fixed_plan.coefficient_cells + 8;
+        var words: u64 = class.fixedRegionWords();
         words += class.composition.persistentWords();
-        for ([_]*const @import("native_commit.zig").CommitPlan{ &class.fixed_plan, &class.main_plan, &class.inter_plan }) |p| words += p.tw.twiddles.len + p.tw.itwiddles.len;
+        for ([_]*const @import("native_commit.zig").CommitPlan{ &class.fixed_plan, &class.main_plan, &class.inter_plan }) |p| words += p.twiddleWords();
         for (class.roles) |r| words += r.interaction.twiddleWords();
         // gn-truth: the device OODS descriptor and encode program.
         words += class.oods.words.len + class.encode.words.len;
@@ -126,6 +130,14 @@ pub const Factory = struct {
         defer self.mutex.unlock();
         var it = self.classes.iterator();
         while (it.next()) |kv| {
+            if (self.geometry_budget) {
+                const c = kv.value_ptr.class;
+                if (c.pcs.reserve_words == null) return error.TruthInstallGeometryUnsupported;
+                const share = self.encode == .device and c.pcs.require_borrowed_trees and
+                    (c.beta == 1 or self.sym.commit.n2b_compact != null);
+                kv.value_ptr.geometry_peak_words = (try TJ.stage2InstallBound(c, maxCalls(c), share)) orelse return error.TruthInstallGeometryUnsupported;
+                kv.value_ptr.shared_commit_evaluations = share;
+            }
             kv.value_ptr.planned_reuse = self.workers.len != 0;
             for (self.workers) |worker| kv.value_ptr.planned_reuse = kv.value_ptr.planned_reuse and worker.config.reuse_frees;
             const Builder = struct {
@@ -150,7 +162,7 @@ pub const Factory = struct {
                     // small Keccak classes. Unknown classes still require the
                     // full request gate; allocations remain arena-bounded.
                     const reuse_bound = declared + @max(c.mainEvalWords(), 8 * c.composition.coefficientWords());
-                    const budget = if (e.measured_peak_words != 0) e.measured_peak_words else if (e.planned_reuse) reuse_bound else declared / 2 * 3;
+                    const budget = e.geometry_peak_words orelse if (e.measured_peak_words != 0) e.measured_peak_words else if (e.planned_reuse) reuse_bound else declared / 2 * 3;
                     return .{ .key = key, .plan = c, .destroy = noDestroy, .max_encoded_bytes = e.max_encoded_bytes, .extra_checks = &K.Class.extra_checks, .arena_peak_words = budget, .phase_a_peak_words = TJ.stage1Footprint(c, maxCalls(c), 0).device_words + 1024, .phase_b = true, .held_words = held, .cost_us = 1, .needs_capture_end = true };
                 }
             };
@@ -158,6 +170,20 @@ pub const Factory = struct {
         }
     }
     fn noDestroy(_: *anyopaque) void {} // the factory owns the class
+    pub fn resourcePeak(self: *const Factory) !?usize {
+        var peak: usize = 0;
+        var it = self.classes.valueIterator();
+        while (it.next()) |entry| {
+            // The compatibility probe runs a request-sized allocation window.
+            if (entry.geometry_peak_words == null) return null;
+            const c = entry.class;
+            var job = Warm.Job{ .a = self.a, .class = c, .sym = self.sym, .fixed = c.fixed_plan, .main = c.main_plan, .inter = c.inter_plan, .composition = c.composition };
+            _ = try job.layout.add(.root, 0, 16);
+            peak = @max(peak, try job.footprint().peakWords());
+        }
+        return peak;
+    }
+
     pub fn installed(self: *Factory) !void {
         var it = self.classes.valueIterator();
         while (it.next()) |entry| {
@@ -194,6 +220,7 @@ pub const Factory = struct {
         for (self.workers) |w| if (!w.config.reuse_frees) return;
         var it = self.classes.iterator();
         while (it.next()) |kv| {
+            if (kv.value_ptr.geometry_peak_words != null) continue;
             const c = kv.value_ptr.class;
             const compact = try self.a.alloc(u32, c.compactWords(1));
             defer self.a.free(compact);
@@ -317,9 +344,12 @@ pub const Factory = struct {
         for (r.truths, truths) |old, new| {
             if (!std.mem.eql(u8, &old.class, &new.class) or old.calls != new.calls or old.first_id != new.first_id or !std.mem.eql(u32, &old.seed, &new.seed)) return error.TruthCaptureShape;
             const class = self.classes.get(old.class) orelse return error.GpuNativeClassNotWarmed;
-            if (new.compact.len != class.class.compactWords(new.calls)) return error.TruthCompactShape;
+            try TJ.validateCompact(new.compact, new.compact_device, class.class.compactWords(new.calls));
         }
-        for (r.truths, truths) |*old, new| old.compact = new.compact;
+        for (r.truths, truths) |*old, new| {
+            old.compact = new.compact;
+            old.compact_device = new.compact_device;
+        }
         r.captured = true;
     }
     fn releaseRequest(self: *Factory, r: *RequestState) void {
@@ -402,7 +432,7 @@ pub const Factory = struct {
             // Pair admission must see the same measured bound as the driver's
             // phase plan, not the older PCS estimate in stage2Footprint.
             const entry = self.classes.get(found.req.class) orelse return error.GpuNativeClassNotWarmed;
-            fp.device_words = @max(fp.device_words, entry.measured_peak_words);
+            fp.device_words = @max(fp.device_words, entry.geometry_peak_words orelse entry.measured_peak_words);
         }
         const d = try self.a.create(Deferred);
         errdefer self.a.destroy(d);
@@ -455,7 +485,7 @@ pub const Factory = struct {
         const v = try views(rc, ordinal, device);
         const job = try self.a.create(TJ.Stage1);
         errdefer self.a.destroy(job);
-        job.* = .{ .a = self.a, .class = found.class, .sym = self.sym, .ordinal = ordinal, .calls = found.req.calls, .first_id = found.req.first_id, .compact = found.req.compact, .root_out = v.root, .publish = .{ .peer = rc.peer, .device = device, .slot = v.truth_root_slot }, .verdicts = .{ .truth_root = v.verdicts.truth_root }, .request_slab_only = true };
+        job.* = .{ .a = self.a, .class = found.class, .sym = self.sym, .ordinal = ordinal, .calls = found.req.calls, .first_id = found.req.first_id, .compact = found.req.compact, .compact_device = found.req.compact_device, .root_out = v.root, .publish = .{ .peer = rc.peer, .device = device, .slot = v.truth_root_slot }, .verdicts = .{ .truth_root = v.verdicts.truth_root }, .request_slab_only = true };
         try job.init();
         errdefer job.deinit();
         try r.stage1_jobs.append(self.a, job);
@@ -478,7 +508,10 @@ pub const Factory = struct {
         }
         const job = try self.a.create(TJ.Stage2);
         errdefer self.a.destroy(job);
-        job.* = .{ .a = self.a, .class = found.class, .sym = self.sym, .ordinal = ordinal, .calls = found.req.calls, .first_id = found.req.first_id, .compact = found.req.compact, .seed = found.req.seed, .digest = v.seal_digest, .stage1_root = v.root, .verdicts = verdicts, .encode = self.encode, .encoded = if (self.encode == .host) null else v.encoded, .request_slab_only = self.encode == .device, .leaf_program = found.req.leaf_program };
+        job.* = .{ .a = self.a, .class = found.class, .sym = self.sym, .ordinal = ordinal, .calls = found.req.calls, .first_id = found.req.first_id, .compact = found.req.compact, .compact_device = found.req.compact_device, .seed = found.req.seed, .digest = v.seal_digest, .stage1_root = v.root, .verdicts = verdicts, .encode = self.encode, .encoded = if (self.encode == .host) null else v.encoded, .request_slab_only = self.encode == .device, .leaf_program = found.req.leaf_program };
+        job.shared_commit_evaluations = self.classes.get(found.req.class).?.shared_commit_evaluations;
+        job.retain_source_nodes = job.request_slab_only and self.classes.get(found.req.class).?.geometry_peak_words != null and
+            found.class.pcs.plan.source_node_images != 0 and self.sym.pcs.open_node_images != null;
         try job.init();
         errdefer job.deinit();
         try r.stage2_jobs.append(self.a, job);
@@ -575,6 +608,23 @@ test "factory refuses requests over unknown classes and mismatched request ids" 
     try testing.expectError(error.GpuNativeTruthUnknown, f.classOf(0));
     try testing.expectError(error.TruthFactoryRequestMismatch, f.end(3));
     try f.end(2);
+}
+
+test "proofless truth installation refuses a class without a rolling PCS bound" {
+    const a = testing.allocator;
+    var factory = Factory{ .a = a, .sym = undefined, .geometry_budget = true };
+    defer factory.deinit();
+    var class: K.Class = undefined;
+    class.log = 5;
+    class.source_fixed_root = @splat(0);
+    class.pcs.reserve_words = null;
+    const key: G.ClassKey = @splat(1);
+    try factory.classes.put(a, key, .{ .class = &class, .max_encoded_bytes = 64 });
+    defer _ = factory.classes.remove(key);
+    var cache = G.ClassCache.init(a);
+    defer cache.deinit();
+    try testing.expectError(error.TruthInstallGeometryUnsupported, factory.warm(&cache));
+    try testing.expectEqual(@as(usize, 0), cache.map.count());
 }
 
 test "factory entry points are fully analyzed" {

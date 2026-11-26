@@ -40,7 +40,21 @@ pub const Class = struct {
     pub fn dataBytes(self: *const Class) u32 {
         return self.words[5];
     }
+
+    pub fn stageProgram(self: *const Class, s: *api.Stager, require_warm: bool) !api.DeviceBuffer {
+        const program = try s.persistent(self.key, self.words.len);
+        if (program.fresh) {
+            if (require_warm) return error.GpuNativeRecursionClassCold;
+            try s.upload(program.buffer, self.words);
+        }
+        return program.buffer;
+    }
+
+    pub fn stageDecode(self: *const Class, s: *api.Stager, program: api.DeviceBuffer, launch: Launch) !Staged {
+        return .{ .class = self, .launch = launch, .program = program, .output = try s.alloc(self.outputWords()), .scratch = try s.alloc(scratch_words) };
+    }
 };
+pub const scratch_words = 12;
 /// Pack builder runs at install only. `Packed` is the existing lossless
 /// circuit cache codec, supplied through the host boundary.
 pub fn build(a: std.mem.Allocator, compressed: anytype, class_words: usize, fixed_words: usize) !Class {
@@ -81,7 +95,7 @@ pub const Staged = struct {
 };
 
 pub fn enqueue(sym: Launch, ctx: *anyopaque, class: *const Class, program: api.DeviceBuffer, output: api.DeviceBuffer, scratch: api.DeviceBuffer, verdict: api.DeviceBuffer, reject_code: u32) !void {
-    if (program.words != class.words.len or output.words != class.outputWords() or scratch.words < 12 or verdict.words < 1) return error.PackedClassShape;
+    if (program.words != class.words.len or output.words != class.outputWords() or scratch.words < scratch_words or verdict.words < 1) return error.PackedClassShape;
     const run = Run{ .program = program.ptr, .program_words = program.words, .output = output.ptr, .output_words = output.words, .scratch = scratch.ptr, .verdict = verdict.ptr, .blocks = class.blocks(), .data_bytes = class.dataBytes(), .reject_code = reject_code, .channels = class.channel_count };
     if (sym(ctx, 0, &run) != 0) return error.PackedClassEnqueueFailed;
 }

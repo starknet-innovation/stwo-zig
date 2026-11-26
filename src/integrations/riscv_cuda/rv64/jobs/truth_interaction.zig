@@ -16,8 +16,6 @@
 //! the job's claims buffer at the legacy claim positions; the verdict word is
 //! the device input of Check.truth_status (truth_ops.cu).
 const std = @import("std");
-const core = @import("stwo_core");
-const engine = @import("stwo_prover_engine");
 const api = @import("api.zig");
 const Abi = @import("../abi.zig");
 const Prefix = @import("../prefix_plan.zig");
@@ -131,7 +129,7 @@ pub const Plan = struct {
     /// Enqueue-time arena words besides the caller-owned output (64-word granules).
     pub fn enqueueWords(self: *const Plan) usize {
         const g = 64;
-        return std.mem.alignForward(usize, (self.fixed_count + self.main_count) * self.rows, g) + std.mem.alignForward(usize, self.pairs * 8 * self.rows, g) + std.mem.alignForward(usize, self.scan_words + self.claimWords() + 1, g) + std.mem.alignForward(usize, self.program.len * 8, g) + g;
+        return std.mem.alignForward(usize, self.fixed_count * self.rows, g) + std.mem.alignForward(usize, self.pairs * 8 * self.rows, g) + std.mem.alignForward(usize, self.scan_words + self.claimWords() + 1, g) + std.mem.alignForward(usize, self.program.len * 8, g) + g;
     }
     /// The forward twiddle tower words (class persistent; shared key with
     /// native_global: identical content per log).
@@ -141,22 +139,14 @@ pub const Plan = struct {
 };
 
 pub fn twiddleKey(log: u32) [32]u8 {
-    var key: [32]u8 = @splat(0);
-    @memcpy(key[0..16], "rv64-m8-glob-twd");
-    key[16] = @intCast(log);
-    return key;
+    return @import("circle_twiddles.zig").tableKey(log, .forward);
 }
 
-/// Phase 1: the role's class twiddle tower (persistent; host-built only when fresh).
+/// Phase 1: one persistent forward tower per role height.
 pub fn stageTwiddles(a: std.mem.Allocator, s: *api.Stager, log: u32) !api.DeviceBuffer {
     const tw_len = @as(usize, 1) << @intCast(log - 1);
     const region = try s.persistent(twiddleKey(log), tw_len);
-    if (region.fresh) {
-        var tw = try engine.poly.twiddles.precomputeM31(a, core.poly.circle.canonic.CanonicCoset.new(log).circleDomain().half_coset);
-        defer engine.poly.twiddles.deinitM31(a, &tw);
-        if (tw.twiddles.len != tw_len) return error.InvalidTruthInteractionGeometry;
-        try s.upload(region.buffer, @as([*]const u32, @ptrCast(tw.twiddles.ptr))[0..tw.twiddles.len]);
-    }
+    if (region.fresh) try @import("circle_twiddles.zig").fill(a, s, region.buffer, log, .forward);
     return region.buffer;
 }
 
@@ -165,9 +155,9 @@ fn check(code: c_int) !void {
 }
 
 pub const Inputs = struct {
-    /// FIXED / MAIN coefficient column pointers (device, role column order).
+    /// FIXED coefficients and the original, committed MAIN evaluations of this role.
     fixed: []const [*]const u32,
-    main: []const [*]const u32,
+    main: api.DeviceBuffer,
     /// Gathered projection parameters (program.len * 8 device words).
     parameters: api.DeviceBuffer,
     twiddles: api.DeviceBuffer,
@@ -183,29 +173,42 @@ pub const Outputs = struct {
     status: api.DeviceBuffer,
 };
 
+/// The witness writer and MAIN commit use original column order. Commitment
+/// coefficient offsets can differ because the PCS sorts columns by height.
+pub fn mainEvaluations(slab: api.DeviceBuffer, logs: []const u32, first: usize, count: usize, log: u32) !api.DeviceBuffer {
+    if (log < 5 or log > 22 or count == 0 or first > logs.len or count > logs.len - first)
+        return error.InvalidTruthInteractionGeometry;
+    var offset: usize = 0;
+    for (logs[0..first]) |height| {
+        if (height < 5 or height > 22) return error.InvalidTruthInteractionGeometry;
+        offset = try std.math.add(usize, offset, @as(usize, 1) << @intCast(height));
+    }
+    for (logs[first..][0..count]) |height| if (height != log) return error.InvalidTruthInteractionGeometry;
+    return slab.slice(offset, try std.math.mul(usize, count, @as(usize, 1) << @intCast(log)));
+}
+
 /// Phase 2 (exec stream, no host wait).
 pub fn enqueue(plan: *const Plan, sym: *const Symbols, e: anytype, in: Inputs, out: Outputs) !void {
     const p = plan;
-    if (in.fixed.len != p.fixed_count or in.main.len != p.main_count or in.parameters.words < p.program.len * 8 or in.twiddles.words < p.twiddleWords()) return error.InvalidTruthInteractionGeometry;
+    if (in.fixed.len != p.fixed_count or in.main.words != p.main_count * p.rows or in.parameters.words < p.program.len * 8 or in.twiddles.words < p.twiddleWords()) return error.InvalidTruthInteractionGeometry;
     if (out.output.words < p.outputWords() or out.status.words < 1) return error.InvalidTruthInteractionGeometry;
     if (p.layout == .cumulative_batches and sym.cumulative == null) return error.MissingResidentCumulativeCapability;
     const ctx = e.ctx();
     const stream = e.stream();
     const rows = p.rows;
-    const source = try e.alloc((p.fixed_count + p.main_count) * rows);
+    const source = try e.alloc(p.fixed_count * rows);
     var copies = Copies.Runs{ .ctx = ctx, .copy = sym.copy_d2d, .validate = sym.validate_allocation };
     for (in.fixed, 0..) |from, i| try copies.push(source.ptr + i * rows, from, rows);
-    for (in.main, 0..) |from, i| try copies.push(source.ptr + (p.fixed_count + i) * rows, from, rows);
     try copies.finish();
     var launches: u32 = 0;
     const tw_count: u32 = @intCast(p.twiddleWords());
-    try check(sym.n2b(source.ptr, rows, p.log, @intCast(p.fixed_count + p.main_count), in.twiddles.ptr + in.twiddles.words - tw_count, tw_count, tw_count, stream, &launches));
+    try check(sym.n2b(source.ptr, rows, p.log, @intCast(p.fixed_count), in.twiddles.ptr + in.twiddles.words - tw_count, tw_count, tw_count, stream, &launches));
     const numerator = try e.alloc(p.pairs * 8 * rows);
     const scratch = try e.alloc(p.scan_words + p.claimWords() + 1);
     const claim = scratch.ptr + p.scan_words;
     const status = claim + p.claimWords();
     try check(sym.memset(ctx, status, 0, 4));
-    try check(p.launch(ctx, 0, source.ptr, source.ptr + p.fixed_count * rows, in.parameters.ptr, numerator.ptr, out.output.ptr, status, p.log));
+    try check(p.launch(ctx, 0, source.ptr, in.main.ptr, in.parameters.ptr, numerator.ptr, out.output.ptr, status, p.log));
     var group_offset: usize = 0;
     var pair_offset: usize = 0;
     var k: usize = 0;
@@ -277,4 +280,16 @@ test "plan refuses the legacy-invalid geometries" {
     s.groups = .{ 1, 0 };
     s.program = &.{};
     try testing.expectError(error.InvalidTruthInteractionGeometry, Plan.init(s));
+}
+
+test "borrowed truth MAIN uses original witness order at mixed heights and rejects truncated roles" {
+    var words: [160]u32 = undefined;
+    const slab: api.DeviceBuffer = .{ .ptr = &words, .words = words.len };
+    const logs = [_]u32{ 6, 5, 5, 5 };
+    const second = try mainEvaluations(slab, &logs, 1, 2, 5);
+    try testing.expectEqual(@intFromPtr(&words[64]), @intFromPtr(second.ptr));
+    try testing.expectEqual(@as(usize, 64), second.words);
+    try testing.expectError(error.InvalidTruthInteractionGeometry, mainEvaluations(slab, &logs, 0, 2, 5));
+    try testing.expectError(error.InvalidTruthInteractionGeometry, mainEvaluations(slab, &logs, 3, 2, 5));
+    try testing.expectError(error.DeviceBufferOutOfRange, mainEvaluations(try slab.slice(0, 127), &logs, 1, 2, 5));
 }

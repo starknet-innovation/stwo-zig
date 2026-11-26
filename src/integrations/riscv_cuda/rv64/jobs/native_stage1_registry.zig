@@ -1,5 +1,4 @@
 //! Install/request registry owner: class warming, pending witnesses and release.
-const up = @import("native_stage1_job.zig").up;
 const Schema = @import("native_device_stage1.zig");
 const std = @import("std");
 const api = @import("api.zig");
@@ -150,8 +149,18 @@ pub const Registry = struct {
             _ = try cache.warm(spec.key, .{ .ctx = &builder, .build = EntryBuilder.build });
         }
     }
-    /// Install (after the memory plan, before the cache seals): one WarmJob
-    /// per (class, GPU) on that GPU's worker, waited here (install time).
+    /// Serial device scratch from the same footprint checked by submission.
+    pub fn resourcePeak(self: *const Registry) !usize {
+        var peak: usize = 0;
+        for (self.classes.values()) |cl| {
+            var job = Schema.WarmJob{ .a = self.a, .class = cl, .sym = self.sym orelse return error.NativeStage1SymbolsNotBound };
+            _ = try job.layout.add(.root, 0, 8);
+            peak = @max(peak, try job.footprint().peakWords());
+        }
+        return peak;
+    }
+
+    /// Install one WarmJob per class and worker, before the class cache seals.
     pub fn warmDevices(self: *Registry, workers: []const *W.Worker) !void {
         const sym = self.sym orelse return error.NativeStage1SymbolsNotBound;
         for (self.classes.values()) |cl| for (workers) |w| {
@@ -263,7 +272,7 @@ pub const Registry = struct {
         }
         pub fn footprint(self: *Deferred) api.Footprint {
             const c = self.class;
-            return .{ .device_words = c.jobWords(), .staged_words = up(9) + Schema.granule + c.spec.gkr.stagedWords(true) + up(c.main.stagedWords(0)) + @as(usize, @intCast(c.spec.compact_words)), .pinned_words = c.requestPinnedWords() };
+            return .{ .device_words = c.jobWords(), .staged_words = c.stagedWords(), .pinned_words = c.requestPinnedWords() };
         }
         pub fn stage(self: *Deferred, s: *api.Stager) !void {
             const job = try self.registry.stage1(self.ctx, self.segment, self.device);

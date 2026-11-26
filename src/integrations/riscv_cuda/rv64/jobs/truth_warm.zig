@@ -30,7 +30,7 @@ pub const Job = struct {
         self.composition.tw_device = null;
         self.inputs = try self.a.alloc(C.Input, self.class.fixed_host.len);
         for (self.inputs, self.class.fixed_host) |*input, words| input.* = .{ .host = words };
-        _ = try self.layout.add(.root, 0, 8);
+        _ = try self.layout.add(.root, 0, if (self.class.source_fixed_root != null) 16 else 8);
     }
     pub fn deinit(self: *Job) void {
         self.a.free(self.inputs);
@@ -43,17 +43,22 @@ pub const Job = struct {
     }
     pub fn footprint(self: *Job) api.Footprint {
         const c = self.class;
-        const staged = self.fixed.stagedWords(c.fixed_words) + self.main.stagedWords(0) + self.inter.stagedWords(0) + self.composition.stagedWords() + 1024;
-        var pinned = c.fixed_words + self.composition.pinnedWords() + c.oods.words.len + c.encode.words.len + 1024;
-        for ([_]*const C.CommitPlan{ &self.fixed, &self.main, &self.inter }) |p| pinned += p.twiddleWords() + 8 * p.logs.len;
+        const build_fixed = c.source_fixed_root == null;
+        const staged = (if (build_fixed) self.fixed.stagedWords(c.fixed_words) else 0) + self.main.stagedWords(0) + self.inter.stagedWords(0) + self.composition.stagedWords() + 1024;
+        var pinned = self.composition.pinnedWords() + c.oods.words.len + c.encode.words.len + 1024;
+        if (build_fixed) pinned += c.fixed_words + self.fixed.twiddleWords() + 8 * self.fixed.logs.len;
+        for ([_]*const C.CommitPlan{ &self.main, &self.inter }) |p| pinned += p.twiddleWords() + 8 * p.logs.len;
         for (c.roles) |r| pinned += r.interaction.twiddleWords();
-        return .{ .device_words = staged + self.fixed.deviceWords() + 1024, .staged_words = staged, .slab_words = self.layout.words, .pinned_words = pinned };
+        return .{ .device_words = staged + (if (build_fixed) self.fixed.deviceWords() else 0) + 1024, .staged_words = staged, .slab_words = self.layout.words, .pinned_words = pinned };
     }
     pub fn stage(self: *Job, s: *api.Stager) !void {
         const c = self.class;
-        const p = try s.persistent(c.fixed_key, c.fixed_plan.coefficient_cells + 8);
+        const p = try s.persistent(c.fixed_key, c.fixedRegionWords());
         self.region = p;
-        if (p.fresh) try self.fixed.stage(s, self.inputs);
+        if (p.fresh) {
+            if (c.source_fixed_root != null) return error.TruthClassNotWarmed;
+            try self.fixed.stage(s, self.inputs);
+        }
         const inputs = try self.a.alloc(C.Input, @max(c.main_logs.len, c.inter_logs.len));
         defer self.a.free(inputs);
         @memset(inputs, .{ .device = @ptrFromInt(@alignOf(u32)) });
@@ -71,10 +76,15 @@ pub const Job = struct {
         const root = try p.buffer.slice(self.class.fixed_plan.coefficient_cells, 8);
         if (p.fresh) _ = try self.fixed.enqueueInto(self.sym.commit, e, self.inputs, try p.buffer.slice(0, self.class.fixed_plan.coefficient_cells), root, false);
         try e.slab.bind(&self.layout);
-        if (self.sym.copy_d2d(e.ctx(), (try e.slab.field(.root, 0)).ptr, root.ptr, 32) != 0) return error.CudaEnqueueFailed;
+        const output = try e.slab.field(.root, 0);
+        if (self.sym.copy_d2d(e.ctx(), output.ptr, root.ptr, output.bytes()) != 0) return error.CudaEnqueueFailed;
     }
     pub fn finish(self: *Job, v: api.SlabView) !void {
-        if (!std.mem.eql(u8, std.mem.sliceAsBytes(try Slab.read(v, .root, 0)), &self.class.fixed_root)) return error.TruthFixedRootMismatch;
+        const roots = try Slab.read(v, .root, 0);
+        if (!std.mem.eql(u8, std.mem.sliceAsBytes(roots[0..8]), &self.class.fixed_root)) return error.TruthFixedRootMismatch;
+        if (self.class.source_fixed_root) |source_root| {
+            if (!std.mem.eql(u8, std.mem.sliceAsBytes(roots[8..16]), &source_root)) return error.TruthFixedRootMismatch;
+        }
     }
     pub fn abort(_: *Job) void {}
 };

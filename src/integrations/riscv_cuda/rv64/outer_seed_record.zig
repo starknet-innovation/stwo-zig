@@ -178,6 +178,50 @@ pub const Live = struct {
             a.free(self.entry.wire);
         }
     };
+    fn appendFound(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(Found), at: usize, entry: Entry) !void {
+        var copy = entry;
+        copy.shape = try a.dupe(u32, entry.shape);
+        errdefer a.free(copy.shape);
+        copy.image = try a.dupe(u32, entry.image);
+        errdefer a.free(copy.image);
+        copy.wire = try a.dupe(u8, entry.wire);
+        errdefer a.free(copy.wire);
+        try out.append(a, .{ .at = at, .entry = copy });
+    }
+
+    /// Resolve only proof starts emitted by the circuit builder. Constants
+    /// precede witness origins in the packed tape, whose IDs are increasing.
+    pub fn findAt(a: std.mem.Allocator, seeds: []const u32, constant_count: usize, starts: []const u32, node: bool, out: *std.ArrayListUnmanaged(Found)) !void {
+        mutex.lock();
+        defer mutex.unlock();
+        const count = seeds.len / 5;
+        if (seeds.len % 5 != 0 or constant_count > count) return error.GnNodeSeedLayout;
+        var first = constant_count;
+        for (starts) |start| {
+            var lo = first;
+            var hi = count;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (seeds[5 * mid] < start) lo = mid + 1 else hi = mid;
+            }
+            if (count - lo < 32 or seeds[5 * lo] != start) return error.GnNodeSeedLayout;
+            var main: [8]u32 = undefined;
+            for (&main, 0..) |*word, i| {
+                const low = seeds[5 * (lo + 16 + 2 * i) + 1];
+                const high = seeds[5 * (lo + 17 + 2 * i) + 1];
+                if (low > 0xffff or high > 0xffff) return error.GnNodeSeedLayout;
+                word.* = low | (high << 16);
+            }
+            for (entries.items) |entry| {
+                if (entry.node == node and std.mem.eql(u32, &entry.key, &main)) {
+                    try appendFound(a, out, lo, entry);
+                    break;
+                }
+            } else return error.GnNodeChildrenNotFound;
+            first = lo + 32;
+        }
+    }
+
     /// Children of a node from its host seed records (5 words each): every
     /// registered source (of kind `node`) whose MAIN root appears as the 16
     /// half-word seeds following a tree-0 root, in seed order. Check mode
@@ -193,14 +237,7 @@ pub const Live = struct {
                 for (0..8) |w| {
                     if (seeds[5 * (i + 2 * w) + 1] != (e.key[w] & 0xffff) or seeds[5 * (i + 2 * w + 1) + 1] != (e.key[w] >> 16)) continue :scan;
                 }
-                var copy = e;
-                copy.shape = try a.dupe(u32, e.shape);
-                errdefer a.free(copy.shape);
-                copy.image = try a.dupe(u32, e.image);
-                errdefer a.free(copy.image);
-                copy.wire = try a.dupe(u8, e.wire);
-                errdefer a.free(copy.wire);
-                try out.append(a, .{ .at = i - 16, .entry = copy });
+                try appendFound(a, out, i - 16, e);
                 break;
             }
         }
@@ -246,4 +283,32 @@ test "recursive discovery holds late leaf roots until its installation ends" {
     var next = try Live.beginInstall(1);
     defer next.deinit();
     try std.testing.expectEqual(0, Live.entries.items.len);
+}
+
+test "circuit proof starts preserve order and repeated MAIN commitments" {
+    const a = std.testing.allocator;
+    var lease = try Live.beginInstall(2);
+    defer lease.deinit();
+    try Live.put(.{ .key = @splat(42), .node = true, .image = &.{}, .shape = &.{}, .wire = &.{} });
+    try Live.put(.{ .key = @splat(43), .node = true, .image = &.{}, .shape = &.{}, .wire = &.{} });
+    // Constants are not in witness-origin order. Two authentic children may
+    // share a commitment. An unrelated later witness resembles another root.
+    var seeds = [_]u32{0} ** (5 * 100);
+    seeds[0] = 999;
+    for (1..100) |i| seeds[5 * i] = @intCast(4 * i);
+    for (0..8) |i| {
+        seeds[5 * (17 + 2 * i) + 1] = 42;
+        seeds[5 * (49 + 2 * i) + 1] = 42;
+        seeds[5 * (82 + 2 * i) + 1] = 43;
+    }
+    var found: std.ArrayListUnmanaged(Live.Found) = .empty;
+    defer found.deinit(a);
+    defer for (found.items) |*entry| entry.deinit(a);
+    try std.testing.expectError(error.GnNodeChildrenNotFound, Live.findAt(a, &seeds, 1, &.{4}, false, &found));
+    try std.testing.expectError(error.GnNodeSeedLayout, Live.findAt(a, &seeds, 1, &.{9}, true, &found));
+    try Live.findAt(a, &seeds, 1, &.{ 4, 132 }, true, &found);
+    try std.testing.expectEqual(2, found.items.len);
+    try std.testing.expectEqual(1, found.items[0].at);
+    try std.testing.expectEqual(33, found.items[1].at);
+    try std.testing.expectEqual(found.items[0].entry.key, found.items[1].entry.key);
 }

@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -10,6 +11,40 @@ from scripts.rv64 import rv64_cuda_resident_image_build as B
 
 
 class ImagePlan(unittest.TestCase):
+    def test_guest_aot_pins_elf_and_emits_only_admitted_straight_line_regions(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            elf, manifest, inc = (root / name for name in ("guest.elf", "profile.json", "rv64_guest_aot.inc"))
+            bytes_ = bytearray(132)
+            bytes_[:7] = b"\x7fELF\x02\x01\x01"
+            struct.pack_into("<HH", bytes_, 16, 2, 243)
+            struct.pack_into("<Q", bytes_, 32, 64)
+            struct.pack_into("<HH", bytes_, 54, 56, 1)
+            struct.pack_into("<II6Q", bytes_, 64, 1, 5, 120, 4096, 4096, 12, 12, 4)
+            struct.pack_into("<3I", bytes_, 120, 0x0000b283, 0xfff28293, 0x00000073)
+            elf.write_bytes(bytes_)
+            config = {"schema": "rv64-guest-aot/v1", "elf": elf.name, "elf_sha256": B.N.sha(elf),
+                      "regions": [{"pc": 4096, "instructions": 2}]}
+            manifest.write_text(json.dumps(config))
+            receipt = B.N.GuestAot.generate(manifest, inc)
+            self.assertEqual(receipt["instructions"], 2)
+            self.assertEqual(receipt["catalogue_sha256"], B.N.sha(inc))
+            header = inc.read_text()
+            self.assertIn("X(0, 4096u, 0u, ConstantInstruction<Op::LD, 5, 1, 0, UINT64_C(0)>", header)
+            self.assertIn("ConstantInstruction<Op::ADDI, 5, 5, 0, UINT64_C(18446744073709551615)>", header)
+            for regions, error in [
+                ([{"pc": 4096, "instructions": 3}], "unsupported guest instruction"),
+                ([{"pc": 4104, "instructions": 2}], "outside executable"),
+                (config["regions"] * 2, "overlapping guest AOT regions"),
+            ]:
+                manifest.write_text(json.dumps({**config, "regions": regions}))
+                with self.assertRaisesRegex(ValueError, error):
+                    B.N.GuestAot.generate(manifest, inc)
+            manifest.write_text(json.dumps(config))
+            elf.write_bytes(bytes_ + b"changed")
+            with self.assertRaisesRegex(ValueError, "ELF fingerprint mismatch"):
+                B.N.GuestAot.generate(manifest, inc)
+
     def test_split_core_keeps_original_power_offsets_and_local_dispatch(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -109,6 +144,16 @@ extern "C" __global__ void rv64_joined_domain_8(void){uint32_t i=0;switch(blockI
             path = root / "outer-manifest.json"
             path.write_text(json.dumps(manifest))
             self.assertEqual(len(B.outer_sources(root)), 13)
+            (root / "outer-group-12.cu").write_text("mixed")
+            groups.append({"id": 12, "filename": "outer-group-12.cu", "program_identity": "c" * 64,
+                           "source_identity": "d" * 64, "component": 1, "part": 0, "first": 0, "count": 6})
+            path.write_text(json.dumps(manifest))
+            self.assertEqual(len(B.outer_sources(root)), 14)
+            groups[-1]["component"] = 2
+            path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "mixed arithmetic"):
+                B.outer_sources(root)
+            groups.pop()
             groups[11]["id"] = 10
             path.write_text(json.dumps(manifest))
             with self.assertRaisesRegex(ValueError, "coverage"):
@@ -128,6 +173,17 @@ extern "C" __global__ void rv64_joined_domain_8(void){uint32_t i=0;switch(blockI
             groups = header.split("real_root_group_sizes[]={")[1].split("}")[0].split(",")
             self.assertEqual(groups[41], "32")
             self.assertEqual(groups[0], "0")
+            wide = root / "case-49-domain.cu"
+            wide.write_text('extern "C" __global__ void rv64_joined_domain_49(void){}')
+            wide_sources, wide_header = B.core_catalog(root)
+            self.assertEqual(wide_sources[:-1], sources)
+            self.assertEqual(wide_sources[-1], wide)
+            self.assertIn("rv64_joined_domain_48,(const void*)rv64_joined_domain_49", wide_header)
+            unknown = root / "case-50-domain.cu"
+            unknown.touch()
+            with self.assertRaisesRegex(ValueError, "unexpected CPU role"):
+                B.core_catalog(root)
+            unknown.unlink()
             sources[48].unlink()
             with self.assertRaises(FileNotFoundError):
                 B.core_catalog(root)
@@ -139,13 +195,14 @@ extern "C" __global__ void rv64_joined_domain_8(void){uint32_t i=0;switch(blockI
             raw.mkdir()
             parts.mkdir()
             roles = []
-            for i in range(15):
+            role_count = B.Grouped.TRUTH_ROLE_COUNT
+            for i in range(role_count):
                 source = parts / f"role-{i}.cu"
                 source.write_text(str(i))
                 roles.append({"input": f"/producer/case-{i}-domain.cu", "modules": [{"source": str(source), "sha256": B.N.sha(source)}]})
             manifest = parts / "partition.json"
             manifest.write_text(json.dumps({"roles": roles}))
-            self.assertEqual(len(B.truth_sources(raw, parts)), 15)
+            self.assertEqual(len(B.truth_sources(raw, parts)), role_count)
             (parts / "role-14.cu").write_text("changed")
             with self.assertRaisesRegex(ValueError, "partition changed"):
                 B.truth_sources(raw, parts)
@@ -154,8 +211,8 @@ extern "C" __global__ void rv64_joined_domain_8(void){uint32_t i=0;switch(blockI
             with self.assertRaisesRegex(ValueError, "ambiguous"):
                 B.truth_sources(raw, parts)
             (raw / "role-14.cu").unlink()
-            manifest.write_text(json.dumps({"roles": roles[:14]}))
-            with self.assertRaisesRegex(ValueError, "fifteen"):
+            manifest.write_text(json.dumps({"roles": roles[:-1]}))
+            with self.assertRaisesRegex(ValueError, f"all {role_count} truth roles"):
                 B.truth_sources(raw, parts)
 
 

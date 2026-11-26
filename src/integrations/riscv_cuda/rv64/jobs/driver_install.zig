@@ -16,15 +16,19 @@ const P = @import("driver_peer.zig");
 pub const SlabClass = struct { id: G.ProofId, key: ?G.ClassKey };
 
 /// Sequential MAIN views on one GPU follow every admitted native occurrence.
-pub fn nativeMainWords(cache: *G.ClassCache, rosters: []const []const SlabClass) !u64 {
-    var largest: u64 = 0;
+const MainWords = struct { required: u64 = 0, preferred: u64 = 0 };
+pub fn nativeMainWords(cache: *G.ClassCache, rosters: []const []const SlabClass) !MainWords {
+    var largest: MainWords = .{};
     for (rosters) |roster| {
-        var words: u64 = 0;
+        var words: MainWords = .{};
         for (roster) |r| if (r.id.kind == .native_segment) {
             const entry = try cache.get(r.key orelse return error.GpuNativeClassNotWarmed);
-            words = try Memory.addWords(words, try Memory.alignedWords(entry.main_resident_words));
+            const required = try Memory.alignedWords(entry.main_resident_words);
+            words.required = try Memory.addWords(words.required, required);
+            words.preferred = try Memory.addWords(words.preferred, try Memory.addWords(required, try Memory.alignedWords(entry.main_node_words)));
         };
-        largest = @max(largest, words);
+        largest.required = @max(largest.required, words.required);
+        largest.preferred = @max(largest.preferred, words.preferred);
     }
     return largest;
 }
@@ -108,6 +112,9 @@ pub const Config = struct {
     /// what the worker and the class cache already hold) when the base image
     /// exports memory_info.
     capacity_words: []const u64,
+    /// Optional same-device capture data already deducted from capacity 0.
+    /// It can be dropped before a proof arena is installed.
+    reclaimable: ?*Reclaimable = null,
     /// Largest native segment count / truths / jobs per GPU per request.
     max_segments: u32,
     /// Largest truth count per request (two-stage truths' exchange slots).
@@ -142,15 +149,72 @@ pub const Config = struct {
     /// Materialize address-independent resources before planning, so shared
     /// persistent keys are charged once from their actual allocation census.
     prewarm_resources: bool = false,
+    resource_peak: ?ResourcePeak = null,
     /// Fixed part of the request pseudo-proof's stage-one region (bytes),
     /// added when any native class declares `stage_one_bytes`.
     stage_one_base_bytes: usize = G.stage_one_base_bytes,
+
+    pub const Reclaimable = @import("resources.zig").Reclaimable;
+    /// Optional serial install-job peak, queried after class registration.
+    /// Null from the producer requests the conservative request-size window.
+    pub const ResourcePeak = struct { ctx: *anyopaque, words: *const fn (*anyopaque) anyerror!?usize };
 };
+
+test "capture replay is reclaimed only after an otherwise valid memory plan needs its capacity" {
+    const Fake = @import("fake.zig");
+    const Capture = struct {
+        dropped: usize = 0,
+        trimmed_to: ?u64 = null,
+        fn release(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.dropped += 1;
+        }
+        fn trim(raw: *anyopaque, words: u64) !u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.trimmed_to = words;
+            return words;
+        }
+    };
+    var capture = Capture{};
+    var replay = Config.Reclaimable{ .words = 256, .ctx = &capture, .release = Capture.release };
+    var owner: Owner = undefined;
+    owner.ops = &Fake.ops;
+    owner.config = .{ .capacity_words = &.{640}, .max_segments = 1, .slab_words = 64, .reclaimable = &replay };
+    owner.resources_warmed = false;
+    Fake.reset();
+    const worker = try W.Worker.create(std.testing.allocator, &Fake.ops, .{ .device = 0, .arena_words = 256, .pinned_slot_words = 64, .plan_from_env = false });
+    defer worker.destroy();
+    var input: M.Inputs = .{ .device = 0, .capacity_words = 640, .graph_exec_words = 0, .main_resident_words = 128, .phase_a_peak_words = 384, .slab_words = 64, .reserve_words = 0 };
+    const original = try owner.planLane(worker, input, 0);
+    try std.testing.expectEqual(@as(u64, 640), original.memory.capacity_words);
+    try std.testing.expectEqual(@as(usize, 0), capture.dropped);
+    input.main_resident_words = std.math.maxInt(u64);
+    try std.testing.expectError(error.ResourceSizeOverflow, owner.planLane(worker, input, 0));
+    try std.testing.expectEqual(@as(usize, 0), capture.dropped);
+    input.main_resident_words = 384;
+    const recovered = try owner.planLane(worker, input, 0);
+    try std.testing.expectEqual(@as(u64, 896), recovered.memory.capacity_words);
+    try std.testing.expectEqual(@as(u64, 384), recovered.phase_a_words);
+    try std.testing.expectEqual(@as(usize, 1), capture.dropped);
+    try std.testing.expectEqual(@as(u64, 0), replay.remaining());
+
+    replay = .{ .words = 512, .ctx = &capture, .release = Capture.release, .trim = Capture.trim };
+    input.arena_cap_words = 320;
+    try std.testing.expectError(error.GpuNativeMemoryPlanPhaseA, owner.planLane(worker, input, 0));
+    try std.testing.expectEqual(@as(?u64, null), capture.trimmed_to);
+    input.arena_cap_words = 0;
+    const partial = try owner.planLane(worker, input, 0);
+    try std.testing.expectEqual(@as(u64, 896), partial.memory.capacity_words);
+    try std.testing.expectEqual(@as(?u64, 256), capture.trimmed_to);
+    try std.testing.expectEqual(@as(u64, 256), replay.remaining());
+    try std.testing.expectEqual(@as(usize, 1), capture.dropped);
+}
 
 const Lane = struct {
     worker: *W.Worker,
     plan: M.Planned = undefined,
     main: api.DeviceBuffer = undefined,
+    retain_main_nodes: bool = false,
     slab: [2]api.DeviceBuffer = undefined,
     mirror: [2][]u32 = .{ &.{}, &.{} },
     done_event: [2]?*anyopaque = .{ null, null },
@@ -196,19 +260,26 @@ pub const Owner = struct {
         if (config.prewarm_resources) {
             const nr = native.vtable.resources orelse return error.GpuNativeResourceWarmHookMissing;
             const rr = recursion.vtable.resources orelse return error.GpuNativeResourceWarmHookMissing;
-            // The largest declared request job is a conservative installation
-            // window. It is released before the one final plan is allocated.
-            // No request exists here, and persistent regions survive both
-            // control operations. Nothing on the request path parks a worker.
-            // Class footprints need not end on a worker allocation granule.
-            const temporary = try Memory.alignedWords(@max(peaks[0], peaks[1]));
-            for (workers) |w| {
-                _ = try w.park(.{});
-                _ = try w.unpark(@intCast(@max(temporary, w.config.arena_words)));
+            // An immutable-only install uses its own serial job peak. Lanes
+            // with legacy memory probes still require a request-sized window.
+            // Persistent regions survive the transition to the final arena.
+            const install_peak = if (config.resource_peak) |bound| try bound.words(bound.ctx) else null;
+            const temporary = try Memory.alignedWords(install_peak orelse @max(peaks[0], peaks[1]));
+            for (workers, 0..) |w, d| {
+                const floor = if (install_peak == null) w.config.arena_words else W.Arena.granule;
+                const words: usize = @intCast(@max(temporary, floor));
+                if (words == w.arenaWords()) continue;
+                if (!w.isParked()) _ = try w.park(.{});
+                w.unparkForSetup(words) catch |err| {
+                    if (err != error.CudaDeviceOutOfMemory or !try self.reclaimCapture(d, "warm_arena")) return err;
+                    try w.unparkForSetup(words);
+                };
             }
+            self.config.resource_peak = null;
             try nr(native.ctx, &self.classes, @intCast(workers.len));
             try rr(recursion.ctx, &self.classes, @intCast(workers.len));
             for (workers, 0..) |w, d| {
+                _ = try w.releaseUnclaimed();
                 const Census = struct {
                     words: u64 = 0,
                     fn run(raw: *anyopaque, worker: *W.Worker) anyerror!void {
@@ -227,6 +298,8 @@ pub const Owner = struct {
             // Resource hooks may replace estimated class bounds with install
             // measurements. Admission must use those updated cache entries.
             peaks = self.classPeaks();
+        } else {
+            for (workers) |w| _ = try w.releaseUnclaimed();
         }
         // 2. peer access + per-GPU resources on each worker thread
         var ordinals: [G.max_devices]u32 = undefined;
@@ -249,24 +322,32 @@ pub const Owner = struct {
         // Placement puts at most ceil(S / devices) segments' MAIN on one GPU
         // when every GPU's region holds that many (LPT, capacity-bounded).
         const per_gpu_segments = std.math.divCeil(u64, config.max_segments, workers.len) catch unreachable;
-        const roster_main: ?u64 = if (workers.len == 1 and config.slab_rosters.len != 0 and config.main_resident_words == 0) try nativeMainWords(&self.classes, config.slab_rosters) else null;
+        const roster_main: ?MainWords = if (workers.len == 1 and config.slab_rosters.len != 0 and config.main_resident_words == 0) try nativeMainWords(&self.classes, config.slab_rosters) else null;
         // Lanes whose Setup started (a failed Setup is released too: Release
         // frees exactly what was allocated).
         var attempted: usize = 0;
         errdefer for (self.lanes[0..attempted]) |*l| self.releaseLane(l);
         for (self.lanes, 0..) |*l, d| {
-            const main_words = if (config.main_resident_words != 0) config.main_resident_words else roster_main orelse (std.math.mul(u64, largest_main, per_gpu_segments) catch return error.ResourceSizeOverflow);
+            const main_words = if (config.main_resident_words != 0) config.main_resident_words else if (roster_main) |roster| roster.required else (std.math.mul(u64, largest_main, per_gpu_segments) catch return error.ResourceSizeOverflow);
             const class_words = try self.classCacheWords(@intCast(d));
-            const capacity = try self.measuredCapacity(l.worker, config.capacity_words[d], d);
-            const inputs = M.Inputs{ .device = @intCast(d), .capacity_words = capacity, .class_cache_words = class_words, .graph_exec_words = config.graph_exec_words, .main_resident_words = main_words, .phase_a_peak_words = @max(config.phase_a_peak_words, peaks[0]), .phase_b_peak_words = @max(config.phase_b_peak_words, peaks[1]), .slab_words = self.config.slab_words, .reserve_words = config.reserve_words, .arena_cap_words = config.arena_cap_words };
-            l.plan = M.plan(inputs) catch |err| {
-                std.log.warn("M8 GPU-native memory plan device {d}: {s} (capacity {d} words; class cache {d}, main_resident {d}, phase A/B peaks {d}/{d}, slab 2x{d}, graph {d}, reserve {d})", .{ d, @errorName(err), capacity, class_words, main_words, inputs.phase_a_peak_words, inputs.phase_b_peak_words, self.config.slab_words, config.graph_exec_words, config.reserve_words });
+            const capacity = try self.laneCapacity(l.worker, d);
+            var inputs = M.Inputs{ .device = @intCast(d), .capacity_words = capacity, .class_cache_words = class_words, .graph_exec_words = config.graph_exec_words, .main_resident_words = main_words, .phase_a_peak_words = @max(config.phase_a_peak_words, peaks[0]), .phase_b_peak_words = @max(config.phase_b_peak_words, peaks[1]), .slab_words = self.config.slab_words, .reserve_words = config.reserve_words, .arena_cap_words = config.arena_cap_words };
+            l.plan = self.planLane(l.worker, inputs, d) catch |err| {
+                std.log.warn("M8 GPU-native memory plan device {d}: {s} (initial capacity {d} words; class cache {d}, main_resident {d}, phase A/B peaks {d}/{d}, slab 2x{d}, graph {d}, reserve {d})", .{ d, @errorName(err), capacity, class_words, main_words, inputs.phase_a_peak_words, inputs.phase_b_peak_words, self.config.slab_words, config.graph_exec_words, config.reserve_words });
                 return err;
             };
-            var setup = Setup{ .owner = self, .lane = l, .device = @intCast(d) };
+            if (roster_main) |roster| {
+                if (try M.withMainNodes(inputs, l.plan, roster.preferred)) |enhanced| {
+                    l.plan = enhanced;
+                    l.retain_main_nodes = true;
+                    inputs.main_resident_words = roster.preferred;
+                    std.log.info("GPU main nodes resident words={d}", .{roster.preferred - roster.required});
+                }
+            }
             attempted += 1;
-            try l.worker.call(.{ .ctx = &setup, .run = Setup.run });
+            try self.installLane(l, inputs, d);
         }
+        self.config.reclaimable = null;
         // 3. per-class captures over the installed plan, then seal.
         var info = G.Installed{ .devices = @intCast(workers.len) };
         for (self.lanes, 0..) |l, d| {
@@ -279,9 +360,64 @@ pub const Owner = struct {
         self.installed = true;
     }
 
+    fn planLane(self: *Owner, worker: *W.Worker, input: M.Inputs, device: usize) !M.Planned {
+        return M.plan(input) catch |err| switch (err) {
+            error.GpuNativeMemoryPlanExceedsDevice, error.GpuNativeMemoryPlanNoArena, error.GpuNativeMemoryPlanPhaseA, error.GpuNativeMemoryPlanPhaseB => {
+                if (device != 0) return err;
+                const replay = self.config.reclaimable orelse return err;
+                var updated = input;
+                const minimum = try M.minimumCapacity(input);
+                updated.capacity_words = minimum;
+                // An arena cap or another invalid shape cannot be fixed by
+                // discarding any amount of tape.
+                _ = M.plan(updated) catch return err;
+                if (!try replay.reclaimAtLeast(self.config.capacity_words[0], minimum -| input.capacity_words, "memory_plan")) return err;
+                updated.capacity_words = try self.laneCapacity(worker, device);
+                if (updated.capacity_words >= minimum) return M.plan(updated);
+                if (!try self.reclaimCapture(device, "measured_capacity")) return err;
+                updated.capacity_words = try self.laneCapacity(worker, device);
+                return M.plan(updated);
+            },
+            else => err,
+        };
+    }
+
+    fn reclaimCapture(self: *Owner, device: usize, reason: []const u8) !bool {
+        if (device != 0) return false;
+        const replay = self.config.reclaimable orelse return false;
+        return replay.reclaim(self.config.capacity_words[0], reason);
+    }
+
+    fn laneCapacity(self: *Owner, worker: *W.Worker, device: usize) !u64 {
+        const capacity: api.SetupCapacity = .{ .words = self.config.capacity_words[device], .reclaimable = if (device == 0) self.config.reclaimable else null };
+        const cap = try capacity.available();
+        return self.measuredCapacity(worker, cap, device);
+    }
+
+    fn installLane(self: *Owner, l: *Lane, input: M.Inputs, device: usize) !void {
+        var setup = Setup{ .owner = self, .lane = l, .device = @intCast(device) };
+        const task: W.Call = .{ .ctx = &setup, .run = Setup.run };
+        l.worker.call(task) catch |err| {
+            if (err != error.CudaDeviceOutOfMemory or !try self.reclaimCapture(device, "proof_arena")) return err;
+            // No request is live. Release any arena allocated before the
+            // slab failed, then measure physical capacity again.
+            try self.releaseLaneChecked(l);
+            var updated = input;
+            updated.capacity_words = try self.laneCapacity(l.worker, device);
+            l.plan = try M.plan(updated);
+            try l.worker.call(task);
+        };
+    }
+
     /// Every request borrow must have been drained before this call.
+    pub fn retire(self: *Owner) !void {
+        if (!self.installed) return;
+        for (self.lanes) |*lane| try self.releaseLaneChecked(lane);
+        self.installed = false;
+    }
+
     pub fn deinit(self: *Owner) void {
-        for (self.lanes) |*l| self.releaseLane(l);
+        if (self.installed) for (self.lanes) |*l| self.releaseLane(l);
         self.peer.deinitHost(self.a);
         self.classes.deinit();
         self.a.free(self.lanes);
@@ -342,9 +478,8 @@ pub const Owner = struct {
         }
         return Memory.addWords(n, self.lanes[device].worker.config.persistent_budget_words);
     }
-    /// Only the pre-plan arena is known to be reclaimable. held_words is a
-    /// class's future reservation, not evidence of a live device allocation:
-    /// installed() uploads those classes AFTER this plan is allocated.
+    /// Add back the current arena and the physically materialized, already
+    /// budgeted persistent regions. Other held_words remain reservations.
     fn measuredCapacity(self: *Owner, w: *W.Worker, cap_words: u64, device_index: usize) !u64 {
         if (self.config.fixed_pool and (self.config.pool_current == null or self.ops.exec.memory_info == null)) return error.GpuNativePoolCapacityUnavailable;
         const info = self.ops.exec.memory_info orelse return cap_words;
@@ -352,9 +487,11 @@ pub const Owner = struct {
             info: *const fn (*anyopaque, *usize, *usize) callconv(.c) c_int,
             free: usize = 0,
             total: usize = 0,
+            persistent_words: u64 = 0,
             fn run(raw: *anyopaque, wk: *W.Worker) anyerror!void {
                 const q: *@This() = @ptrCast(@alignCast(raw));
                 try O.check(q.info(wk.context, &q.free, &q.total));
+                q.persistent_words = wk.persistentWords();
             }
         };
         var q = Q{ .info = info };
@@ -382,7 +519,7 @@ pub const Owner = struct {
         // Already-live persistent allocations belong to the class_cache
         // region. Add them back to capacity once, then plan() charges that
         // same census once; they are not reclaimable workspace.
-        const resident = if (self.resources_warmed) self.resident_words[device_index] else 0;
+        const resident = if (self.resources_warmed) self.resident_words[device_index] else q.persistent_words;
         const owned = std.math.add(u64, w.arenaWords(), resident) catch return error.ResourceSizeOverflow;
         const measured = try M.allocationCapacity(q.free / 4, pooled, owned, self.config.fixed_pool);
         if (measured < cap_words) std.log.info("M8 GPU-native device {d}: plan capacity {d} words measured (cap {d})", .{ w.device_ordinal, measured, cap_words });
@@ -400,15 +537,16 @@ pub const Owner = struct {
             const ex = &self.ops.exec;
             const wt = &self.ops.wait;
             // lint:install-begin — every device/pinned allocation and event of a request.
-            try w.reserveTimingPairs(self.config.max_segments, self.peer_ops.event_create_timed);
             l.main = try w.installPlanArena(@intCast(l.plan.phase_a_words), @intCast(l.plan.phase_b_words));
             self.install_allocations += 1;
             var slab: ?[*]u32 = null;
-            try O.check(ex.alloc_u32_long(w.context, @intCast(2 * l.plan.slab_words), &slab));
+            try O.checkDeviceAllocation(ex.alloc_u32_long(w.context, @intCast(2 * l.plan.slab_words), &slab));
             self.install_allocations += 1;
-            l.slab_allocated = true;
             const half: usize = @intCast(l.plan.slab_words);
-            l.slab = .{ .{ .ptr = slab.?, .words = half }, .{ .ptr = slab.? + half, .words = half } };
+            const ptr = slab orelse return error.CudaArenaFailed;
+            l.slab = .{ .{ .ptr = ptr, .words = half }, .{ .ptr = ptr + half, .words = half } };
+            l.slab_allocated = true;
+            try w.reserveTimingPairs(self.config.max_segments, self.peer_ops.event_create_timed);
             for (0..2) |p| {
                 var host: ?*anyopaque = null;
                 try O.check(wt.host_alloc(half * 4, &host));
@@ -431,8 +569,11 @@ pub const Owner = struct {
     };
 
     fn releaseLane(self: *Owner, l: *Lane) void {
+        self.releaseLaneChecked(l) catch |err| std.log.warn("GPU plan teardown: {s}", .{@errorName(err)});
+    }
+    fn releaseLaneChecked(self: *Owner, l: *Lane) !void {
         var r = Release{ .owner = self, .lane = l };
-        l.worker.call(.{ .ctx = &r, .run = Release.run }) catch {};
+        try l.worker.call(.{ .ctx = &r, .run = Release.run });
     }
     const Release = struct {
         owner: *Owner,
@@ -443,22 +584,25 @@ pub const Owner = struct {
             const wt = &r.owner.ops.wait;
             // Nothing enqueued on this GPU may still read what is freed below.
             if (l.done_event[0]) |ev| {
-                if (r.owner.ops.exec.event_record(ev, w.execStream()) == 0) _ = w.requestWait(ev) catch {};
+                try O.check(r.owner.ops.exec.event_record(ev, w.execStream()));
+                _ = try w.requestWait(ev);
             }
-            w.uninstallPlanArena() catch |err| std.log.err("M8 GPU-native teardown: plan arena free failed: {s}", .{@errorName(err)});
-            if (l.slab_allocated) _ = r.owner.ops.exec.free_u32(w.context, l.slab[0].ptr);
-            l.slab_allocated = false;
+            try w.uninstallPlanArena();
+            if (l.slab_allocated) {
+                l.slab_allocated = false;
+                try O.check(r.owner.ops.exec.free_u32(w.context, l.slab[0].ptr));
+            }
             for (0..2) |p| {
-                if (l.mirror[p].len != 0) _ = wt.host_free(l.mirror[p].ptr);
+                if (l.mirror[p].len != 0) try O.check(wt.host_free(l.mirror[p].ptr));
                 l.mirror[p] = &.{};
                 inline for (.{ &l.done_event[p], &l.start_event[p], &l.end_event[p] }) |e| if (e.*) |ev| {
-                    _ = wt.event_destroy(ev);
+                    try O.check(wt.event_destroy(ev));
                     e.* = null;
                 };
             }
             const d = std.mem.indexOfScalar(?*anyopaque, &r.owner.peer.streams, w.execStream()) orelse return;
             for (r.owner.peer.events[d]) |*e| if (e.*) |ev| {
-                _ = wt.event_destroy(ev);
+                try O.check(wt.event_destroy(ev));
                 e.* = null;
             };
         }

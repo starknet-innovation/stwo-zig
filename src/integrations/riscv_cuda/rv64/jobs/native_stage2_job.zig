@@ -9,8 +9,39 @@ const C = @import("native_commit.zig");
 const N = @import("native_pcs.zig");
 const S2 = @import("native_stage2.zig");
 const Gl = @import("native_global.zig");
+const B = @import("native_binding.zig");
 const NO = @import("native_encode_oods.zig");
 const m31_modulus = @import("stwo_core").fields.m31.Modulus;
+
+fn bindingDestination(plan: *const C.CommitPlan, storage: api.DeviceBuffer, first: usize, log: u32) !api.DeviceBuffer {
+    if (first > plan.shapes.len or plan.shapes.len - first < 8) return error.NativeStage2BindingShape;
+    const rows = @as(usize, 1) << @intCast(log);
+    const offset = plan.offsets[first];
+    for (plan.shapes[first..][0..8], plan.offsets[first..][0..8], 0..) |shape, column, i| {
+        if (shape.log_size != log or shape.encoding != .coefficients or column != offset + i * rows)
+            return error.NativeStage2BindingShape;
+    }
+    return storage.slice(offset, 8 * rows);
+}
+
+test "binding equality writes directly to the sorted INTER coefficient region" {
+    const a = std.testing.allocator;
+    var shapes = [_]C.Shape{.{ .log_size = 6, .encoding = .coefficients }} ** 16;
+    shapes[15] = .{ .log_size = 5, .encoding = .evaluations };
+    var plan = try C.CommitPlan.init(a, &shapes, 2);
+    defer plan.deinit();
+    const words = try a.alloc(u32, plan.coefficient_cells);
+    defer a.free(words);
+    const storage = api.DeviceBuffer{ .ptr = words.ptr, .words = words.len };
+    const eq = try bindingDestination(&plan, storage, 0, 6);
+    try std.testing.expectEqual(storage.ptr + 32, eq.ptr);
+    try std.testing.expectEqual(@as(usize, 8 * 64), eq.words);
+    try std.testing.expectError(error.NativeStage2BindingShape, bindingDestination(&plan, storage, 8, 6));
+    try std.testing.expectError(error.NativeStage2BindingShape, bindingDestination(&plan, storage, 16, 6));
+    plan.shapes[1].encoding = .evaluations;
+    try std.testing.expectError(error.NativeStage2BindingShape, bindingDestination(&plan, storage, 0, 6));
+}
+
 pub const Stage2Job = struct {
     a: std.mem.Allocator,
     sym: *const Schema.Symbols,
@@ -58,6 +89,10 @@ pub const Stage2Job = struct {
         for (self.class.slots) |s| n += @intFromBool(s.global != null);
         return n;
     }
+    fn retainInteractionTree(self: *const Stage2Job) bool {
+        return self.class.pcs.prepared.geometry_only and self.class.pcs.plan.source_node_images != 0 and
+            self.class.inter.canRetainSeparateNodes(self.sym.commit);
+    }
     pub fn footprint(self: *Stage2Job) api.Footprint {
         const g = 64;
         const c = self.class;
@@ -71,26 +106,36 @@ pub const Stage2Job = struct {
             global_outputs += std.mem.alignForward(usize, gs.plan.outputWords(), g);
             global_scratch = @max(global_scratch, gs.plan.enqueueWords());
         };
-        // PCS peak: measured segment-scale class 2.14e9 words [M]
-        // (memory-plan-p2) + 7%, as the retired native-hybrid Stage2Job.
-        const pcs: usize = 2_300_000_000;
+        // The historical 2.14e9-word peak plus margin remains a bound for the
+        // legacy schedule. Strict classes can use a smaller geometry-derived
+        // upper bound without crediting arena reuse.
+        const historical_pcs: usize = 2_300_000_000;
+        const pcs = if (c.pcs.require_borrowed_trees)
+            @min(historical_pcs, c.pcs.reserve_words orelse historical_pcs)
+        else
+            historical_pcs;
         // public_claims scratch grows with the boundary cells (8 + 8 per
         // 256-cell block, up to 4104 words): sized here, not in the slack.
         const pscratch = std.mem.alignForward(usize, @intCast(self.sym.encode.public_scratch(@intCast(self.inputs.initial_tuples.len / 14), @intCast(self.inputs.terminal_tuples.len / 14))), g);
         const oods_scratch: usize = if (c.oods) |d| std.mem.alignForward(usize, NO.scratchWords(d), g) else 0;
         const fields = 8 * g + @as(usize, c.claim_count) * 8 + @as(usize, @intCast(c.pcs.outputWords())) + NE.scratch_words + 8 * Schema.shared_felts + 8 * (1 + self.globalCount()) + pscratch + oods_scratch + 4096;
+        // The addressed fallback gathers into a second coefficient region
+        // when INTER was preallocated for equality reconstruction.
+        const inter_words = c.inter.deviceWords() +
+            if (c.resident_handoff != null and c.inter.beta != 1 and self.sym.commit.n2b_compact == null) std.mem.alignForward(usize, c.inter.coefficient_cells, g) else 0;
         const work = if (c.reuse_frees) blk: {
             // Each global's scratch is freed in reverse allocation order
             // before the next global. INTER consumes all global outputs;
             // they retire before composition/PCS. Retain their entire size
             // in later bounds as a conservative fragmentation allowance.
             // composition.enqueueWords already includes its kept output.
-            const inter_peak = global_outputs + global_scratch + c.inter.deviceWords();
-            const kept = global_outputs + c.inter.coefficient_cells;
+            const inter_peak = global_outputs + global_scratch + inter_words;
+            const nodes = if (self.retainInteractionTree()) std.mem.alignForward(usize, c.inter.tree_words, g) else 0;
+            const kept = global_outputs + c.inter.coefficient_cells + nodes;
             const composition_peak = kept + c.composition.enqueueWords();
-            const pcs_peak = kept + c.composition.coefficientWords() + pcs;
+            const pcs_peak = kept + c.composition.coefficientWords() + std.mem.alignForward(usize, c.composition.retainedOpeningWords(), g) + pcs;
             break :blk @max(inter_peak, @max(composition_peak, pcs_peak)) + fields;
-        } else globals + c.inter.deviceWords() + c.composition.coefficientWords() + c.composition.enqueueWords() + pcs + fields;
+        } else globals + inter_words + c.composition.coefficientWords() + c.composition.enqueueWords() + pcs + fields;
         const fresh = c.fixed_words + c.composition.persistentWords();
         return .{ .device_words = staged + work + 16 * g, .staged_words = staged, .slab_words = 0, .pinned_words = if (c.resources_warmed) Schema.requestPinnedWords(c, self.inputs) else @as(usize, @intCast(c.pcs.ingressWords())) + c.composition.pinnedWords() + fresh + 64 * g + self.inputs.initial_tuples.len + self.inputs.terminal_tuples.len + self.inputs.public.len };
     }
@@ -114,7 +159,7 @@ pub const Stage2Job = struct {
         if (c.resident_handoff) |h| {
             const resident = ctx.main_resident[self.segment];
             self.checkpoint = try resident.slice(h.checkpoint, Schema.checkpoint_words);
-            self.bind = try resident.slice(h.binding, c.bind_plan.output_words);
+            self.bind = try resident.slice(h.binding, c.bind_plan.retainedWords());
             if (c.uses(.semantic)) self.semantic = try resident.slice(h.semantic, c.semantic_words);
         } else {
             self.checkpoint = try s.retained(req, Schema.handoffName(.checkpoint, self.segment), Schema.checkpoint_words);
@@ -175,6 +220,7 @@ pub const Stage2Job = struct {
             k += 1;
         };
         try c.composition.stage(s);
+        try c.composition.bindPcsTables(c.pcs);
         self.inter_inputs = try self.a.alloc(C.Input, c.inter.shapes.len);
         @memset(self.inter_inputs, .{ .device = @ptrFromInt(@alignOf(u32)) });
         try c.inter.stage(s, self.inter_inputs);
@@ -215,6 +261,7 @@ pub const Stage2Job = struct {
         const main = ctx.main_resident[self.segment];
         if (main.words < c.main_words) return error.NativeStage2ResidentMainShape;
         const bind = self.bind.?;
+        const reconstruct = c.resident_handoff != null;
         const views = try c.views(self.a, self.class_device);
         defer self.a.free(views.globals);
         // ---- seal slot (chi) on this GPU, then the shared draws
@@ -234,7 +281,7 @@ pub const Stage2Job = struct {
         // ---- transcript from the Stage-1 checkpoint
         try e.channel.initFromCheckpoint(self.checkpoint.?);
         const claims = try e.alloc(@max(1, @as(usize, c.claim_count) * 8));
-        const gstatus = try e.alloc(@max(1, self.globals.len));
+        const gstatus = try e.alloc(@max(1, self.globals.len + @intFromBool(reconstruct)));
         const roots = try e.alloc(32);
         const alpha = try e.alloc(8);
         const comp_status = try e.alloc(1);
@@ -257,13 +304,31 @@ pub const Stage2Job = struct {
             try self.globals[k].enqueue(e, pointers.items[0..p.fixed_count], pointers.items[p.fixed_count..], .{ .output = output, .claims = try p.claimsIn(claims, g.claim_offset), .status = try gstatus.slice(k, 1) });
             k += 1;
         };
+        const hdr = self.staged_header orelse return error.NativeStage2NotStaged;
+        const eq_status = if (reconstruct) try gstatus.slice(self.globals.len, 1) else null;
+        const inter_storage = if (reconstruct) try e.alloc(c.inter.coefficient_cells) else null;
+        if (eq_status) |word| try Schema.rcOf(sym.commit.copy_d2d(e.ctx(), word.ptr, hdr.ptr + 11, word.bytes()));
         for (c.slots, outputs) |slot, out| {
             var at = slot.inter_offset;
             const rows = @as(usize, 1) << @intCast(slot.log);
             if (slot.binding_index) |bi| {
-                const cols = try c.bind_plan.columns(bind, bi);
-                if (cols.words != 16 * rows) return error.NativeStage2BindingShape;
-                for (0..16) |col| self.inter_inputs[at + col] = .{ .device = cols.ptr + col * rows };
+                if (inter_storage) |storage| {
+                    const build = sym.binding_eq orelse return error.MissingNativeBindingSymbol;
+                    const tw = c.inter.twiddles orelse return error.TraceCommitNotStaged;
+                    const eq = try bindingDestination(c.inter, storage, at, slot.log);
+                    const prefix = try c.bind_plan.retainedPrefix(bind, bi);
+                    const point = try c.bind_plan.retainedPoint(bind, bi);
+                    if (prefix.words != 8 * rows) return error.NativeStage2BindingShape;
+                    try B.replayEq(build, sym.commit.b2n, e, point, slot.log, eq, tw, eq_status.?);
+                    for (0..8) |col| {
+                        self.inter_inputs[at + col] = .{ .device = eq.ptr + col * rows };
+                        self.inter_inputs[at + 8 + col] = .{ .device = prefix.ptr + col * rows };
+                    }
+                } else {
+                    const cols = try c.bind_plan.columns(bind, bi);
+                    if (cols.words != 16 * rows) return error.NativeStage2BindingShape;
+                    for (0..16) |col| self.inter_inputs[at + col] = .{ .device = cols.ptr + col * rows };
+                }
                 at += 16;
             }
             if (slot.global) |g| for (0..g.plan.width) |col| {
@@ -272,11 +337,15 @@ pub const Stage2Job = struct {
         }
         // ---- mixManifestAndClaims (chi from the seal slot), INTER, alpha
         const mixed = try claims.slice(0, @as(usize, c.claim_count) * 8);
-        const hdr = self.staged_header orelse return error.NativeStage2NotStaged;
         try e.channel.mixWords(try hdr.slice(0, 3));
         try e.channel.mixWords(chi);
         try e.channel.mixFelts(mixed);
-        const inter = try c.inter.enqueue(sym.commit, e, self.inter_inputs, try roots.slice(16, 8), true);
+        const retain_nodes = self.retainInteractionTree();
+        const inter_root = try roots.slice(16, 8);
+        const inter = if (inter_storage) |storage|
+            try c.inter.enqueueIntoResident(sym.commit, e, self.inter_inputs, storage, inter_root, if (retain_nodes) try e.alloc(c.inter.tree_words) else null)
+        else
+            try c.inter.enqueueWithNodes(sym.commit, e, self.inter_inputs, inter_root, true, retain_nodes);
         var i = outputs.len;
         while (i > 0) {
             i -= 1;
@@ -292,13 +361,25 @@ pub const Stage2Job = struct {
         const comp = try seam.enqueue(seam.ctx, e, .{ .alpha = alpha, .claims = mixed, .status = comp_status, .root_out = try roots.slice(24, 8), .trees = .{ fixed_view, main_view, inter_views } });
         try e.channel.mixRootFromTree(try roots.slice(24, 8));
         const trees = [4]S2.Composition.Committed{ fixed_view, main_view, inter_views, comp };
-        for (trees, 0..) |t, index| for (t.offsets, 0..) |offset, original| try c.pcs.bindColumn(index, original, t.tree.coefficients.ptr + offset);
+        for (trees, 0..) |t, index| try c.pcs.bindTree(index, t.tree.coefficients.ptr[0..t.tree.coefficients.words], t.offsets);
+        var images: N.SourceImages = .{};
+        if (c.resident_handoff) |h| {
+            if (h.main_nodes_words != 0 and h.main_nodes_at <= main.words and h.main_nodes_words <= main.words - h.main_nodes_at) {
+                const nodes = try main.slice(h.main_nodes_at, h.main_nodes_words);
+                images.retain(1, nodes.ptr, nodes.words, true);
+            }
+        }
+        if (inter.node_storage) |nodes| images.retain(2, nodes.ptr, c.inter.tree_words, true);
+        if (comp.tree.opening_image) |image| images.retain(3, image.ptr, image.words, false);
+        c.pcs.source_images = if (images.nodes_only != 0 or comp.tree.opening_image != null) images else null;
         try c.pcs.enqueueOpening(sym.pcs, e, self.pinned, oods, pcs_out);
+        if (comp.tree.opening_image) |image| e.free(image);
         e.free(comp.tree.coefficients);
+        if (inter.node_storage) |nodes| e.free(nodes);
         e.free(inter.coefficients);
         // ---- device acceptance checks -> request slab status words
-        // No global slot: nothing can reject; the check reads the staged zero word.
-        try NE.wordsZero(&sym.encode, e.ctx(), if (self.globals.len != 0) gstatus else try hdr.slice(11, 1), .global_status, try self.status(.global_status));
+        // A legacy class without global slots reads the staged zero word.
+        try NE.wordsZero(&sym.encode, e.ctx(), if (self.globals.len != 0 or reconstruct) gstatus else try hdr.slice(11, 1), .global_status, try self.status(.global_status));
         try NE.wordsZero(&sym.encode, e.ctx(), comp_status, .composition_accept, try self.status(.composition_accept));
         try NE.wordsZero(&sym.encode, e.ctx(), try e.channel.stateBuffer().slice(10, 1), .channel_order, try self.status(.channel_order));
         // root_match: FIXED vs the class authority; MAIN vs this segment's exchange root slot.

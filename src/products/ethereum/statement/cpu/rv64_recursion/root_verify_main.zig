@@ -143,6 +143,9 @@ pub fn main() !void {
         } else return error.InvalidRootVerifyArgument;
     }
     if (derive and table_root_pin != null and merge == null) return error.InvalidRootVerifyArgument;
+    if (Om31.protocol.active() == .cpu_mixed_k4_cap3_b2_q108_p20_fold4_v1 and
+        (!derive or merge != null) and table_root_pin == null)
+        return error.MissingVkTableRootPin;
     // Fresh receivers never read persisted producer setup.
     if (std.process.hasEnvVarConstant(SETUP_CACHE_ENV)) return error.PersistedSetupCacheForbiddenForReceiver;
     const fixed_setup_bytes = try std.fmt.parseUnsigned(usize, args[5], 10);
@@ -221,18 +224,20 @@ pub fn main() !void {
         dir: std.fs.Dir,
         max_steps: @FieldType(Request.Config, "max_steps"),
         result: ?W.Loaded = null,
+        envelope: @import("stwo_riscv_cpu_integration").rv64_gkr_fixed_authority_set.Envelope,
         err: ?anyerror = null,
         ns: u64 = 0,
         fn run(job: *@This()) void {
             const start = std.time.Instant.now() catch null;
-            job.result = W.read(job.a, job.dir, .{ .max_total_steps = job.max_steps }) catch |err| blk: {
+            job.result = W.readFor(job.envelope, job.a, job.dir, .{ .max_total_steps = job.max_steps }) catch |err| blk: {
                 job.err = err;
                 break :blk null;
             };
             if (start) |s0| job.ns = since(s0);
         }
     };
-    var bundle_job = BundleJob{ .a = a, .dir = dir, .max_steps = request.value.max_steps };
+    const envelope = try @import("stwo_riscv_cpu_integration").rv64_gkr_fixed_authority_set.Envelope.forRequest(@intCast(@min(request.value.max_steps, request.value.batch_steps)), profile);
+    var bundle_job = BundleJob{ .envelope = envelope, .a = a, .dir = dir, .max_steps = request.value.max_steps };
     const bundle_thread = try std.Thread.spawn(.{ .stack_size = 64 << 20 }, BundleJob.run, .{&bundle_job});
     var bundle_joined = false;
     defer if (!bundle_joined) {
@@ -300,7 +305,7 @@ pub fn main() !void {
     var setup = try SetupCache.Cache.init(a, .{ .log_blowup = pcs.fri_config.log_blowup_factor }, .{ .mode = if (rebuild_native) .prover else .verifier, .directory = native_dir, .fixed_setup_bytes = fixed_setup_bytes, .identity_only_cpu = false, .max_build_threads = NATIVE_BUILD_THREADS, .store_bulk = false });
     defer setup.deinit();
     try setup.bindRequest(request.value);
-    var keys = try Keys.initResident(a, &image, loaded.cpu_declarations, loaded.truth_declarations, true, Suite.experimentalFold4(), caches, &setup);
+    var keys = try Keys.initResidentFor(envelope, a, &image, loaded.cpu_declarations, loaded.truth_declarations, true, Suite.experimentalFold4(), caches, &setup);
     defer keys.deinit();
     const native_keys_ns = timer.lap();
     var fixed_set = if (rebuild_native) try fixedSetParallel(a, &setup.fixed, keys.cpus, keys.truths, pcs) else try FixedSet.init(a, &setup.fixed, keys.cpus, keys.truths, pcs);

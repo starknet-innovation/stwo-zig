@@ -30,7 +30,7 @@ pub fn hasLocal(d: Source.Descriptor) bool {
     return !(d.origin == .core and (d.origin.core == .initial or d.origin.core == .terminal));
 }
 pub fn shape(d: Source.Descriptor) !Main.Shape {
-    if (d.cpu_compact_decode and !d.cpu_u8_pairs) return error.InvalidSourceAuthorityLayout;
+    if (d.cpu_compact_decode and !d.cpu_u8_pairs and !d.cpu_wide_clock) return error.InvalidSourceAuthorityLayout;
     return if (hasLocal(d)) d.shape() else @import("boundary_role.zig").MAIN_SHAPE;
 }
 pub fn PublicFor(comptime C: type) type {

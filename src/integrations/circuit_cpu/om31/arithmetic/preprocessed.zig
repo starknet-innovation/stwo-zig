@@ -71,8 +71,24 @@ pub const Plan = struct {
             .first_permutation_row = 0,
         };
         errdefer result.deinit();
+        var columns: [ids.len][]M = undefined;
+        for (&columns, 0..) |*col, i| col.* = result.storage[i * result.rows ..][0..result.rows];
+        result.first_permutation_row = try self.writeColumns(source, columns, uses);
+        return result;
+    }
+
+    pub fn rowCount(self: *const Plan) usize {
+        return self.mixed_rows;
+    }
+
+    /// Emit into the frontend's final columns using its validated source and
+    /// multiplicities. No scratch arithmetic trace survives the handoff.
+    pub fn writeColumns(self: *const Plan, graph: circuit.common.preprocessed.CircuitView, columns: [ids.len][]M, uses: []const u32) !usize {
+        if (graph.nQm31OpsRows() != self.original_rows + self.make_rows)
+            return error.UnexpectedMixedPadding;
+        const result = Destination{ .cols = columns };
         var at: usize = 0;
-        const gates = .{ graph.add.items, graph.sub.items, graph.mul.items, graph.pointwise_mul.items };
+        const gates = .{ graph.add, graph.sub, graph.mul, graph.pointwise_mul };
         const skipped = [4]?*const std.DynamicBitSetUnmanaged{ &self.fusion.add_removed, &self.fusion.sub_removed, &self.fusion.mul_removed, null };
         const modes = [_]R.Mode{ .add, .sub, .mul, .pointwise_mul };
         inline for (gates, skipped, modes) |g, skip, mode| {
@@ -92,19 +108,20 @@ pub const Plan = struct {
             try result.write(at, mode, .{ fused.lhs, fused.rhs, fused.addend, fused.out }, uses[fused.out]);
             at += 1;
         }
-        result.first_permutation_row = at;
+        const first_permutation_row = at;
         var address = graph.n_vars;
-        for (0..graph.permutation.len()) |ordinal| {
-            const permutation = graph.permutation.get(ordinal);
-            for (permutation.inputs, permutation.outputs) |input, out| {
-                try result.write(at, .add, .{ 0, input, 0, address }, 1);
-                try result.write(at + 1, .add, .{ 0, address, 0, out }, uses[out]);
+        for (0..graph.nPermutations()) |ordinal| {
+            const wire = std.math.cast(u32, address) orelse return error.InvalidMixedRowAddress;
+            const begin, const end = graph.permutationRange(ordinal);
+            for (graph.permutation_inputs[begin..end], graph.permutation_outputs[begin..end]) |input, out| {
+                try result.write(at, .add, .{ 0, input, 0, wire }, 1);
+                try result.write(at + 1, .add, .{ 0, wire, 0, out }, uses[out]);
                 at += 2;
             }
             address += 1;
         }
-        if (at != result.rows) return error.UnexpectedMixedPadding;
-        return result;
+        if (at != self.mixed_rows) return error.UnexpectedMixedPadding;
+        return first_permutation_row;
     }
 };
 
@@ -121,16 +138,21 @@ pub const Block = struct {
     pub fn column(self: Block, i: usize) []const M {
         return self.storage[i * self.rows ..][0..self.rows];
     }
-    fn write(self: Block, row: usize, mode: R.Mode, addresses: [4]u32, uses: u32) !void {
-        if (row >= self.rows) return error.UnexpectedMixedPadding;
-        for (mode.fixed(), 0..) |code, i| self.storage[i * self.rows + row] = code;
+};
+
+const Destination = struct {
+    cols: [ids.len][]M,
+
+    fn write(self: Destination, row: usize, mode: R.Mode, addresses: [4]u32, uses: u32) !void {
+        if (row >= self.cols[0].len) return error.UnexpectedMixedPadding;
+        for (mode.fixed(), 0..) |code, i| self.cols[i][row] = code;
         const ordered = [_]u32{ addresses[2], addresses[0], addresses[1], addresses[3] };
         for (ordered, 3..) |address, i| {
             if (address >= core.fields.m31.Modulus) return error.InvalidMixedRowAddress;
-            self.storage[i * self.rows + row] = M.fromCanonical(address);
+            self.cols[i][row] = M.fromCanonical(address);
         }
         if (uses >= core.fields.m31.Modulus) return error.InvalidMixedUseCount;
-        self.storage[7 * self.rows + row] = M.fromCanonical(uses);
+        self.cols[7][row] = M.fromCanonical(uses);
     }
 };
 

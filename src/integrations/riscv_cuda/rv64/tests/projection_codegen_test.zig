@@ -7,7 +7,10 @@ const M = core.fields.m31.M31;
 const a = std.testing.allocator;
 test "native source projection IR preserves every role tuple weight and semantic draw slot at aliased values" {
     var rng = std.Random.DefaultPrng.init(0x87323);
-    for (Fixtures.descriptors(), 0..) |descriptor, descriptor_index| {
+    const wide = G.Source.Descriptor{ .origin = .{ .core = .cpu }, .cpu_wide_clock = true };
+    var compact_wide = wide;
+    compact_wide.cpu_compact_decode = true;
+    for (Fixtures.descriptors() ++ [_]G.Source.Descriptor{ wide, compact_wide }, 0..) |descriptor, descriptor_index| {
         var artifact = try G.record(a, descriptor);
         defer artifact.deinit();
         const identity = try artifact.identity();
@@ -190,4 +193,63 @@ test "LS-D64 descriptor45 seeded OWNER projection agrees across base lifted and 
     var expected = challenges.offsets[relation];
     for (secure, 0..) |value, i| expected = expected.sub(challenges.coefficients[relation][i].mul(value));
     try std.testing.expect(expected.eql(challenges.denominatorBase(.owner, raw)));
+}
+
+test "wide shard projection binds RAM time and scaled gap queries to its own executable" {
+    const Source = G.Source;
+    const descriptor = Source.Descriptor.forGeometry(.{ .core = .cpu }, .{ .cpu_log = 23, .cpu_fused_tail = true });
+    var artifact = try G.record(a, descriptor);
+    defer artifact.deinit();
+    const joined = @import("../joined_codegen.zig");
+    var joined_artifact = try joined.record(a, descriptor);
+    defer joined_artifact.deinit();
+    const degrees = try joined_artifact.program.degrees(a);
+    defer a.free(degrees);
+    for (joined_artifact.program.roots) |root| try std.testing.expect(degrees[root] <= 3);
+    const ordinary = Source.Descriptor.forGeometry(.{ .core = .cpu }, .{ .cpu_log = 22, .cpu_fused_tail = true });
+    var control = try G.record(a, ordinary);
+    defer control.deinit();
+    try std.testing.expect(!std.mem.eql(u8, &(try artifact.identity()), &(try control.identity())));
+    const X = @import("stwo_riscv_frontend").rv64_air.word16_execution;
+    const m = X.layout.main;
+    const fixed = [_]M{ M.fromCanonical((1 << 23) - 2), M.zero(), M.zero() };
+    var main: [m.COUNT]M = @splat(M.zero());
+    const public: [Source.Public.count]M = @splat(M.zero());
+    main[m.active] = M.one();
+    const Collector = struct {
+        ranges: [6]u32 = undefined,
+        n: usize = 0,
+        count: usize = 0,
+        tick: u32 = 0,
+        pub fn emit(self: *@This(), relation: Source.Fractions.Relation, tuple: anytype, weight: M) void {
+            self.count += 1;
+            if (tuple.len == 19 and relation == .owner and weight.eql(M.one())) self.tick = tuple[18].v;
+            if (tuple.len == 1 and relation == .range16) {
+                std.debug.assert(weight.eql(M.one()));
+                self.ranges[self.n] = tuple[0].v;
+                self.n += 1;
+            }
+        }
+    };
+    for ([_]u32{ 0, 255, 256, 511, 512 }) |hi| {
+        for (0..3) |slot| {
+            main[m.gap8 + slot] = M.fromCanonical(hi);
+            main[m.gap16 + slot] = M.fromCanonical(@intCast(slot));
+        }
+        var c = Collector{};
+        try descriptor.emit(M, &fixed, &main, &main, &public, &c);
+        try std.testing.expectEqual(15, c.count);
+        try std.testing.expectEqual(6, c.n);
+        try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, hi * 128, hi * 128, hi * 128 }, &c.ranges);
+        try std.testing.expectEqual(hi < 512, c.ranges[5] < 65536);
+        try std.testing.expectEqual(fixed[0].v + 1, c.tick);
+    }
+    var wrong = descriptor;
+    wrong.cpu_u8_pairs = true;
+    try std.testing.expectError(error.InvalidSourceAuthorityLayout, wrong.validate());
+    wrong = descriptor;
+    wrong.origin = .{ .core = .rom };
+    try std.testing.expectError(error.InvalidSourceAuthorityLayout, wrong.validate());
+    artifact.descriptor = ordinary;
+    try std.testing.expectError(error.InvalidSourceArtifact, artifact.identity());
 }

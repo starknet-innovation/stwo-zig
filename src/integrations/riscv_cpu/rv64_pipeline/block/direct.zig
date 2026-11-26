@@ -404,7 +404,7 @@ pub const Started = struct {
             self.boot_ns = t.read();
         };
         const a = self.allocator;
-        const walk = try Walk.createWithOptions(a, self.walk_config, .{ .poseidon_initial_cache = false, .authority_provider = self.authority_provider });
+        const walk = try Walk.createForSource(a, self.walk_config, .{ .poseidon_initial_cache = false, .authority_provider = self.authority_provider }, self.segment_workers);
         errdefer walk.destroy();
         var source = try Segments.Source.init(a, walk, self.segment_workers);
         errdefer source.deinit();

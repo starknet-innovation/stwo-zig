@@ -5,10 +5,16 @@ test {
     _ = @import("rv64/capture_inputs.zig");
     _ = @import("rv64/capture_execution.zig");
     _ = @import("rv64/capture_execution_consumer_test.zig");
+    _ = @import("rv64/guest_framing.zig");
     _ = @import("rv64/hybrid_scratch_output.zig");
     _ = @import("ethereum_recursion_ready_test.zig");
     _ = @import("rv64/host_retained_policy.zig");
+    _ = @import("rv64/class_setup_composition.zig");
     _ = @import("rv64/jobs/native_class_build_test.zig");
+    _ = @import("rv64/jobs/native_fixed_device.zig");
+    _ = @import("rv64/jobs/guest_inventory.zig");
     _ = @import("rv64/native_publication.zig");
+    _ = @import("rv64/native_recursion_recipe.zig");
+    _ = @import("rv64/native_capture_bind.zig");
     _ = @import("rv64_combined_ethereum_main.zig");
 }

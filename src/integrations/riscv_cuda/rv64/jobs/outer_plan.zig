@@ -17,6 +17,7 @@ const std = @import("std");
 pub const n_components = 11;
 /// Native MAIN roster: component widths (traceWidths) sum to 114.
 pub const main_columns = 114;
+pub const max_main_columns = main_columns + 4;
 /// Native INTER roster: 8 coordinates per lookup pair, 304 columns.
 pub const inter_columns = 304;
 /// MAIN columns written by the base gate kernels (components 0..4). The last
@@ -61,7 +62,7 @@ pub const Geometry = struct {
             main_at += @intCast(width);
             inter_at += @intCast(8 * pair);
         }
-        if (main_at != main_columns or inter_at != inter_columns) return error.InvalidOuterClassRoster;
+        if (main_at != g.mainColumnCount() or inter_at != inter_columns) return error.InvalidOuterClassRoster;
         g.fixed_logs = &.{};
         g.gather = @splat(&.{});
         g.n_outputs = 0;
@@ -71,7 +72,15 @@ pub const Geometry = struct {
         g.first_permutation_row = 0;
         return g;
     }
-    pub fn mainLogs(self: *const Geometry, out: *[main_columns]u32) void {
+    pub fn mixedArithmetic(self: *const Geometry) bool {
+        return self.components[1].width == 16;
+    }
+
+    pub fn mainColumnCount(self: *const Geometry) usize {
+        return if (self.mixedArithmetic()) max_main_columns else main_columns;
+    }
+
+    pub fn mainLogs(self: *const Geometry, out: []u32) void {
         for (self.components) |c| @memset(out[c.main_first..][0..c.width], c.log);
     }
     pub fn interLogs(self: *const Geometry, out: *[inter_columns]u32) void {
@@ -284,9 +293,10 @@ pub const ClassPlan = struct {
     /// base kernels write straight into the B2N input and INTER reads each
     /// component's columns contiguously.
     pub fn init(a: std.mem.Allocator, geometry: Geometry) !ClassPlan {
-        var logs: [main_columns]u32 = undefined;
-        geometry.mainLogs(&logs);
-        var main = try TreePlan.init(a, &logs, geometry.beta);
+        var storage: [max_main_columns]u32 = undefined;
+        const logs = storage[0..geometry.mainColumnCount()];
+        geometry.mainLogs(logs);
+        var main = try TreePlan.init(a, logs, geometry.beta);
         errdefer main.deinit(a);
         var inter_logs: [inter_columns]u32 = undefined;
         geometry.interLogs(&inter_logs);
@@ -342,10 +352,11 @@ pub const ClassPlan = struct {
     pub fn countRuns(self: *const ClassPlan, out: *[count_columns][2]u64) [][2]u64 {
         var n: usize = 0;
         var cols: [count_columns]u64 = undefined;
-        for (&cols, main_columns - count_columns..) |*o, column| o.* = self.main.offsets[column];
+        const columns = self.main.logs.len;
+        for (&cols, columns - count_columns..) |*o, column| o.* = self.main.offsets[column];
         std.mem.sort(u64, &cols, {}, std.sort.asc(u64));
         for (cols) |start| {
-            const column = for (main_columns - count_columns..main_columns) |c| {
+            const column = for (columns - count_columns..columns) |c| {
                 if (self.main.offsets[c] == start) break c;
             } else unreachable;
             const words = @as(u64, 1) << @intCast(self.main.logs[column]);
@@ -435,4 +446,32 @@ test "node buffers stay below the signed 32-bit element index" {
     try requireIndexable(&.{ 583745792, 1245317120, 268435448, (1 << 31) - 1 });
     try testing.expectError(error.OuterBufferExceedsInt32Index, requireIndexable(&.{ 1245317120, 2356416512 }));
     try testing.expectError(error.OuterBufferExceedsInt32Index, requireIndexable(&.{1 << 31}));
+}
+
+test "mixed arithmetic adds four MAIN planes without shifting INTER or count ownership" {
+    const a = testing.allocator;
+    const classic = try testGeometry();
+    var logs: [n_components]u32 = undefined;
+    var widths: [n_components]usize = undefined;
+    var pairs: [n_components]usize = undefined;
+    for (classic.components, &logs, &widths, &pairs) |component, *log, *width, *pair| {
+        log.* = component.log;
+        width.* = component.width;
+        pair.* = component.pairs;
+    }
+    widths[1] += 4;
+    const mixed = try Geometry.init(logs, widths, pairs);
+    var plan = try ClassPlan.init(a, mixed);
+    defer plan.deinit(a);
+    try testing.expectEqual(max_main_columns, plan.main.logs.len);
+    for (mixed.components, classic.components, 0..) |component, old, index| {
+        try testing.expectEqual(old.inter_first, component.inter_first);
+        try testing.expectEqual(old.main_first + @as(u32, if (index > 1) 4 else 0), component.main_first);
+    }
+    var runs: [count_columns][2]u64 = undefined;
+    var actual: u64 = 0;
+    for (plan.countRuns(&runs)) |run| actual += run[1];
+    var expected: u64 = 0;
+    for (classic.components[gate_components..]) |component| expected += @as(u64, component.width) << @intCast(component.log);
+    try testing.expectEqual(expected, actual);
 }

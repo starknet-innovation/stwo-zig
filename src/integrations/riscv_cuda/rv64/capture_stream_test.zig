@@ -181,7 +181,7 @@ const Packer = struct {
     rec_ends: u32 = 0,
     fn packFn(raw: *anyopaque, _: *const G.RequestContext, cs: G.CapturedSegment, w: G.ChunkWriter) anyerror!u64 {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        const tag: *const u32 = @ptrCast(@alignCast(cs.native));
+        const tag: *const u32 = @ptrCast(@alignCast(cs.native orelse return error.DeviceFixtureMissingNativeInput));
         const half: u32 = @intCast(self.rows / 2);
         for (0..2) |k| {
             const b = try w.next();

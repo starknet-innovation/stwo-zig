@@ -8,9 +8,11 @@ test {
     _ = @import("rv64/jobs/outer_staged_tower_test.zig");
     _ = @import("rv64/jobs/native_composition.zig");
     _ = @import("rv64/jobs/native_commit_test.zig");
+    _ = @import("rv64/jobs/native_fixed_seed_test.zig");
     _ = @import("rv64/jobs/native_gkr.zig");
     _ = @import("rv64/jobs/native_gkr_wire.zig");
     _ = @import("rv64/jobs/native_leaf_wire.zig");
+    _ = @import("rv64/jobs/native_leaf_build.zig");
     _ = @import("rv64/jobs/native_global.zig");
     _ = @import("rv64/jobs/native_gpu_support_test.zig");
     _ = @import("rv64/jobs/native_pcs.zig");

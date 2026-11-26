@@ -102,7 +102,10 @@ pub fn validateDivisionClass(geometry: @import("geometry.zig").Geometry, request
 /// Unit MUL truth rows include two unsigned product obligations per DIV.
 /// This bound is independent of native instruction census hints.
 pub fn validateArithmeticRequests(geometry: @import("geometry.zig").Geometry, request: Request) !void {
-    try geometry.validate();
+    return validateArithmeticRequestsFor(.classic, geometry, request);
+}
+pub fn validateArithmeticRequestsFor(projection: @import("geometry.zig").Geometry.Projection, geometry: @import("geometry.zig").Geometry, request: Request) !void {
+    try projection.validate(geometry);
     if (request.division_requests > request.cpu.steps or @as(u64, request.multiplication_requests) > 2 * @as(u64, request.cpu.steps) or
         request.division_requests > (@as(u32, 1) << @intCast(geometry.division_log)) or
         request.multiplication_requests > (@as(u32, 1) << @intCast(geometry.multiplication_log))) return error.ArithmeticRequestCapacity;

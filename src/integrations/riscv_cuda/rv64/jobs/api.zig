@@ -27,6 +27,7 @@ pub const DeviceBuffer = @import("resources.zig").DeviceBuffer;
 /// part allocated in phase 1; `slab_words` the proof slab; `pinned_words`
 /// the job-lifetime pinned host memory requested through `Stager.pinned`.
 pub const Footprint = @import("resources.zig").Footprint;
+pub const SetupCapacity = @import("resources.zig").SetupCapacity;
 pub const Readback = @import("resources.zig").Readback;
 
 /// Host step enqueued on the exec stream (cudaLaunchHostFunc). It may touch
@@ -81,6 +82,16 @@ pub const DeviceWorker = opaque {
     }
 };
 
+pub const CircleTwiddle = enum(u32) {
+    forward = 1,
+    inverse = 2,
+    both = 3,
+
+    pub fn words(self: CircleTwiddle, log: u32) usize {
+        return @as(usize, 1) << @intCast(if (self == .both) log else log - 1);
+    }
+};
+
 /// Phase 1: inputs for job k+1 (h2d stream).
 pub const Stager = struct {
     worker: *DeviceWorker,
@@ -93,6 +104,11 @@ pub const Stager = struct {
     /// pinned memory is first copied into it (so the caller's slice may die).
     pub fn upload(self: *Stager, dst: DeviceBuffer, src: []const u32) !void {
         return impl(self.worker).stageUpload(dst, src);
+    }
+    /// Generate an entire canonical circle tower on the staging stream.
+    /// Older base images expose no generator and return false.
+    pub fn circleTwiddles(self: *Stager, dst: DeviceBuffer, log: u32, direction: CircleTwiddle) !bool {
+        return impl(self.worker).stageCircleTwiddles(dst, log, direction);
     }
     /// Job-lifetime pinned host memory (valid until `finish`/`abort` returns).
     pub fn pinned(self: *Stager, words: usize) ![]u32 {

@@ -21,6 +21,7 @@ pub const Exec = struct {
     alloc_u32: *const fn (*anyopaque, usize, *?[*]u32) callconv(.c) c_int,
     alloc_u32_long: *const fn (*anyopaque, usize, *?[*]u32) callconv(.c) c_int,
     free_u32: *const fn (*anyopaque, [*]u32) callconv(.c) c_int,
+    circle_twiddles: ?*const fn (*anyopaque, [*]u32, u32, u32, *anyopaque) callconv(.c) c_int = null,
     // native OM31 channel (NAT/rv64/channel.h)
     channel_init_on: *const fn (*anyopaque, u32, [*]u32, [*]const u32, u64) callconv(.c) c_int,
     channel_mix_on: *const fn (*anyopaque, u32, [*]u32, u32, u64, u64, ?[*]const u32, u32, u32, [*]u32) callconv(.c) c_int,
@@ -88,6 +89,7 @@ pub const Libraries = struct {
             .channel_draw_raw_on = try sym(&out.addon, @FieldType(Exec, "channel_draw_raw_on"), "stwo_rv64_jobs_channel_draw_raw_on"),
             .pow_persistent_on = try sym(&out.base, @FieldType(Exec, "pow_persistent_on"), "stwo_blake2s_pow_persistent_on"),
             .copy_async = try sym(&out.addon, @FieldType(Exec, "copy_async"), "stwo_rv64_jobs_copy_async"),
+            .circle_twiddles = out.base.lookup(std.meta.Child(@FieldType(Exec, "circle_twiddles")), "stwo_circle_twiddles_on"),
             .event_record = try sym(&out.addon, @FieldType(Exec, "event_record"), "stwo_rv64_jobs_event_record"),
             .stream_wait = try sym(&out.addon, @FieldType(Exec, "stream_wait"), "stwo_rv64_jobs_stream_wait"),
             .host_fn = try sym(&out.addon, @FieldType(Exec, "host_fn"), "stwo_rv64_jobs_host_fn"),
@@ -154,4 +156,12 @@ fn sym(lib: *std.DynLib, comptime T: type, name: [:0]const u8) !T {
 
 pub fn check(code: c_int) !void {
     if (code != 0) return error.CudaEnqueueFailed;
+}
+
+// cudaErrorMemoryAllocation in the CUDA runtime ABI (driver_types.h).
+pub const allocation_exhausted: c_int = 2;
+
+pub fn checkDeviceAllocation(code: c_int) !void {
+    if (code == allocation_exhausted) return error.CudaDeviceOutOfMemory;
+    return check(code);
 }

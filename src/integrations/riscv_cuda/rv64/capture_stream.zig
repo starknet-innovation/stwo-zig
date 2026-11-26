@@ -223,6 +223,8 @@ pub const Stream = struct {
     chunks: std.atomic.Value(u64) = .init(0),
     chunk_words: std.atomic.Value(u64) = .init(0),
     attach_wait_ns: u64 = 0,
+    /// Published by the capture thread before done and read after its join.
+    guest: ?G.GuestCaptureEvidence = null,
     /// A capture-ring buffer may not be handed to another stream.
     fail_hook: Fail = undefined,
 
@@ -275,6 +277,7 @@ pub const Stream = struct {
         self.chunks.store(0, .monotonic);
         self.chunk_words.store(0, .monotonic);
         self.attach_wait_ns = 0;
+        self.guest = null;
         self.failure.store(false, .release);
         self.ended.reset();
         self.attached.reset();
@@ -476,6 +479,7 @@ pub const Feed = struct {
     current: u32 = 0,
     sequence: u32 = 0,
     buffer: ?[]u32 = null,
+    compact_loan: ?@import("guest_ingress.zig").CompactLoan = null,
     sealed: u32 = 0,
     finished: bool = false,
     /// `end` ran both factories' `captured` hooks (a clean `finish` requires it).
@@ -505,7 +509,7 @@ pub const Feed = struct {
         self.buffer = null;
         const s = self.stream;
         const sink = s.sink();
-        try sink.chunk(sink.ctx, .{ .segment = self.current, .sequence = self.sequence, .first_row = s.cursor[self.current], .rows = rows, .last = last, .words = b[0..words] });
+        try sink.chunk(sink.ctx, .{ .segment = self.current, .sequence = self.sequence, .first_row = s.cursor[self.current], .rows = rows, .last = last, .words = b[0..words], .compact_loan = if (self.sequence == 0) self.compact_loan else null });
         self.sequence += 1;
     }
     /// Fail this request's capture from the capture thread (hook adapters).
@@ -537,6 +541,8 @@ pub const Feed = struct {
         self.current = cs.segment;
         self.sequence = 0;
         self.buffer = null;
+        self.compact_loan = cs.compact_loan;
+        defer self.compact_loan = null;
         var t = std.time.Timer.start() catch unreachable;
         const rows = pack(s.native.ctx, ctx, cs, self.writer()) catch |err| return self.failWith(err);
         self.pack_ns += t.read();
@@ -555,6 +561,7 @@ pub const Feed = struct {
         const ctx = s.ctx orelse return self.failWith(error.GpuNativeCaptureNotPrepared);
         if (s.native.vtable.captured) |hook| hook(s.native.ctx, ctx, ce) catch |err| return self.failWith(err);
         if (s.recursion) |r| if (r.vtable.captured) |hook| hook(r.ctx, ctx, ce) catch |err| return self.failWith(err);
+        s.guest = ce.guest;
         self.ended = true;
     }
     /// The capture thread is done with every ring buffer: report `done`

@@ -30,6 +30,8 @@ const std = @import("std");
 const Env = @import("outer_env.zig");
 
 pub const Signature = [32]u8;
+/// The three FFT/FRI domain sets on the reference block occupy 130 MiB.
+pub const geometry_bytes: usize = 144 << 20;
 
 pub fn selected() !bool {
     return Env.flag("STWO_RV64_M8_OUTER_CLASS_PLAN", false);

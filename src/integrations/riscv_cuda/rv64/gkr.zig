@@ -163,20 +163,6 @@ fn frontierWords(height: u32) !u64 {
     }
     return maximum;
 }
-/// Skip materializing the largest product level by fusing its two levels
-/// at ingress. Smaller levels remain resident until their gate proofs close.
-fn buildFrontierTrees(commands: anytype, plan: *const Plan, inputs: []const R.Fraction, arena: Slice) !void {
-    for (inputs, 0..) |input, i| {
-        const first: usize = if (plan.variables[i] == 1) 0 else 1;
-        var current = try fraction(arena, plan.oracles[i].tree[first]);
-        try commands.layer(input, @intCast(first + 1), current);
-        for (first + 1..plan.variables[i]) |level| {
-            const next = try fraction(arena, plan.oracles[i].tree[level]);
-            try commands.layer(current, 1, next);
-            current = next;
-        }
-    }
-}
 fn append(cursor: *u64, words: u64) !Region {
     const at = (try std.math.add(u64, cursor.*, 63)) & ~@as(u64, 63);
     cursor.* = try std.math.add(u64, at, words);
@@ -196,8 +182,9 @@ fn fraction(arena: Slice, p: Pair) !R.Fraction {
 }
 fn buildTreesSerial(commands: anytype, plan: *const Plan, inputs: []const R.Fraction, arena: Slice) !void {
     for (inputs, 0..) |input, i| {
-        var current = input;
-        for (0..plan.variables[i]) |level| {
+        const start = if (plan.mode == .retained_tree) 0 else @min(2, plan.variables[i]);
+        var current = if (start == 0) input else try fraction(arena, plan.oracles[i].tree[start - 1]);
+        for (start..plan.variables[i]) |level| {
             const next = try fraction(arena, plan.oracles[i].tree[level]);
             try commands.layer(current, 1, next);
             current = next;
@@ -205,6 +192,14 @@ fn buildTreesSerial(commands: anytype, plan: *const Plan, inputs: []const R.Frac
     }
 }
 fn buildTrees(commands: anytype, plan: *const Plan, inputs: []const R.Fraction, arena: Slice) !void {
+    // Skip the largest product level by fusing two levels at ingress.
+    // The other levels still share the height-batched tree waves.
+    if (plan.mode == .recomputed_frontier) {
+        for (inputs, 0..) |input, i| {
+            const levels = @min(2, plan.variables[i]);
+            try commands.layer(input, levels, try fraction(arena, plan.oracles[i].tree[levels - 1]));
+        }
+    }
     if (comptime @hasDecl(@TypeOf(commands.*), "layerBatch")) {
         if (commands.batched_trees) {
             var height = plan.layers;
@@ -214,13 +209,14 @@ fn buildTrees(commands: anytype, plan: *const Plan, inputs: []const R.Fraction, 
                 for (inputs, 0..) |input, i| {
                     if (plan.variables[i] < height) continue;
                     const level = plan.variables[i] - height;
+                    if (plan.mode == .recomputed_frontier and level < 2) continue;
                     jobs[count] = .{
                         .input = if (level == 0) input else try fraction(arena, plan.oracles[i].tree[level - 1]),
                         .output = try fraction(arena, plan.oracles[i].tree[level]),
                     };
                     count += 1;
                 }
-                try commands.layerBatch(jobs[0..count]);
+                if (count != 0) try commands.layerBatch(jobs[0..count]);
             }
             return;
         }
@@ -275,7 +271,10 @@ pub const ClosureEnqueued = struct {
 /// Production traversal requires zero rational root sum and rejects every
 /// pole, including zero-weight 0/0. The raw enqueue remains a numerical tool.
 pub fn enqueueWithClosure(commands: anytype, inputs: []const R.Fraction, seed: Slice, arena: Slice, byte_cap: usize, chain: u64, verdict: Slice) !ClosureEnqueued {
-    return .{ .traversal = try enqueueImpl(commands, inputs, seed, arena, byte_cap, chain, verdict, .retained_tree), .verdict = verdict };
+    return enqueueWithClosureMode(commands, inputs, seed, arena, byte_cap, chain, verdict, .retained_tree);
+}
+pub fn enqueueWithClosureMode(commands: anytype, inputs: []const R.Fraction, seed: Slice, arena: Slice, byte_cap: usize, chain: u64, verdict: Slice, mode: Mode) !ClosureEnqueued {
+    return .{ .traversal = try enqueueImpl(commands, inputs, seed, arena, byte_cap, chain, verdict, mode), .verdict = verdict };
 }
 fn enqueueImpl(commands: anytype, inputs: []const R.Fraction, seed: Slice, arena: Slice, byte_cap: usize, chain: u64, verdict: ?Slice, mode: Mode) !Enqueued {
     if (commands.poisoned) return error.JobPoisoned;
@@ -312,13 +311,8 @@ fn enqueueImpl(commands: anytype, inputs: []const R.Fraction, seed: Slice, arena
     const projected = try region(arena, plan.projected);
     const roots = try region(arena, plan.roots);
     var root_sources: [max_instances]R.Fraction = undefined;
-    if (mode == .retained_tree) {
-        try buildTrees(commands, &plan, inputs, arena);
-        for (inputs, 0..) |_, i| root_sources[i] = try fraction(arena, plan.oracles[i].tree[variables[i] - 1]);
-    } else {
-        try buildFrontierTrees(commands, &plan, inputs, arena);
-        for (inputs, 0..) |_, i| root_sources[i] = try fraction(arena, plan.oracles[i].tree[variables[i] - 1]);
-    }
+    try buildTrees(commands, &plan, inputs, arena);
+    for (inputs, 0..) |_, i| root_sources[i] = try fraction(arena, plan.oracles[i].tree[variables[i] - 1]);
     try commands.packRoots(root_sources[0..inputs.len], roots);
     if (verdict) |status| try commands.closeLocalRoots(roots, plan.count, status);
     try commands.initGkr(state, seed, variables[0..inputs.len], plan.layers, chain);

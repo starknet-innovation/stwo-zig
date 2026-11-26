@@ -13,7 +13,10 @@ const Receiver = @import("gkr_receiver.zig");
 const Admission = @import("receiver.zig");
 const a = std.testing.allocator;
 test "wide GKR Ethereum receiver authenticates terminal RAM and never promotes prefix completion" {
-    const Fixed = @import("stwo_riscv_cpu_integration").rv64_gkr_fixed_authority.Fixed;
+    const CPU = @import("stwo_riscv_cpu_integration");
+    const FixedAuthority = CPU.rv64_gkr_fixed_authority;
+    const Fixed = FixedAuthority.Fixed;
+    const Setup = CPU.rv64_services_roster.CpuSetup;
     const FixedSet = @import("stwo_riscv_cpu_integration").rv64_gkr_fixed_authority_set.Set;
     const Candidate = @import("stwo_riscv_cpu_integration").rv64_om31_security_candidate;
     for ([_]bool{ false, true }) |candidate| {
@@ -32,10 +35,26 @@ test "wide GKR Ethereum receiver authenticates terminal RAM and never promotes p
             defer keys.deinit();
             var cache: ?Fixed.Cache = if (candidate) try Fixed.Cache.init(a, 1 << 30) else null;
             defer if (cache) |*owner| owner.deinit();
-            var authority: ?FixedSet = if (cache) |*owner| try FixedSet.init(a, owner, keys.cpus, keys.truths, config) else null;
+            var candidate_setup: ?Setup = if (candidate) try Setup.initCandidateWithAuthority(a, &f.image.authority, declarations[0].geometry, declarations[0].bridges, keys.cpus[0].key.suite, null) else null;
+            defer if (candidate_setup) |*setup| setup.deinit();
+            const cpus: []const *const Setup = if (candidate_setup) |*setup| &.{setup} else keys.cpus;
+            var authority: ?FixedSet = if (cache) |*owner| blk: {
+                var prepared = try FixedAuthority.Binding.acquire(owner, &cpus[0].key, config);
+                defer prepared.deinit();
+                var legacy = try FixedAuthority.Binding.acquire(owner, &keys.cpus[0].key, config);
+                defer legacy.deinit();
+                try std.testing.expect(cpus[0].key.root_only);
+                try std.testing.expectEqualDeep(legacy.fixed_identity, prepared.fixed_identity);
+                try std.testing.expectEqualDeep(legacy.fixed_root, prepared.fixed_root);
+                try std.testing.expectError(error.FixedSetupIdentityMismatch, FixedSet.initWithPreparedCpus(a, owner, keys.cpus, &.{&prepared}, &.{}, config));
+                var retained = try FixedSet.initWithPreparedCpus(a, owner, cpus, &.{&prepared}, &.{}, config);
+                errdefer retained.deinit();
+                try std.testing.expectEqual(@as(usize, 0), retained.source_validations);
+                break :blk retained;
+            } else null;
             defer if (authority) |*owner| owner.deinit();
             const expected = P.Expected{ .admission = Driver.admission(&f.image), .program_identity = program.identity, .total_steps = f.boundary.steps, .max_total_steps = 32, .final_pc = f.boundary.final_pc, .final_registers = f.boundary.final_registers };
-            var bundle = try Coordinator.produceWithAuthority(a, keys.cpus, keys.truths, &.{&native}, &advice, expected, config, .{ .gkr_budget = 2 << 30 }, if (authority) |*owner| owner else null);
+            var bundle = try Coordinator.produceWithAuthority(a, cpus, keys.truths, &.{&native}, &advice, expected, config, .{ .gkr_budget = 2 << 30 }, if (authority) |*owner| owner else null);
             defer bundle.deinit(a);
             // Rebuild trusted image-based setup; neither the producer's admitted key
             // nor its claimed final endpoint supplies receiver authority.

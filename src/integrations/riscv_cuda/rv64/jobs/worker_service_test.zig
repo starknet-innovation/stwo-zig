@@ -188,7 +188,7 @@ test "unpark to a size that cannot be allocated fails, stays parked, and a later
     try std.testing.expect(w.isParked());
     fake.counters.fail_alloc_after = fake.counters.allocations;
     defer fake.counters.fail_alloc_after = null;
-    try std.testing.expectError(error.CudaEnqueueFailed, w.unpark(0));
+    try std.testing.expectError(error.CudaDeviceOutOfMemory, w.unpark(0));
     try std.testing.expect(w.isParked());
     fake.counters.fail_alloc_after = null;
     _ = try w.unpark(0);

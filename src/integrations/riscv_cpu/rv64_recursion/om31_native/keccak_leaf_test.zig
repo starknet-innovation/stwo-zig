@@ -11,7 +11,7 @@ const Setup = @import("../../word16_global_execution/keccak/shared/roster.zig").
 const Key = @import("../../word16_global_execution/keccak/shared/key.zig").Key;
 const C = V.common;
 const a = std.testing.allocator;
-fn exercise(policy: A.crypto.keccak.equations.BatchPolicy) !void {
+fn exercise(policy: A.crypto.keccak.equations.BatchPolicy, compare_recipe: bool) !void {
     var setup = try Setup.initPolicy(a, 5, Key.Suite.production(), policy);
     defer setup.deinit();
     const truth = R.Truth{ .keccak = .{ .setup = &setup, .first_id = 3, .calls = 2 } };
@@ -24,21 +24,27 @@ fn exercise(policy: A.crypto.keccak.equations.BatchPolicy) !void {
     var cfg = W.PcsConfig{ .pow_bits = 0, .fri_config = try core.fri.FriConfig.init(0, 1, 2) };
     cfg.fri_config.fold_step = 4;
     const expected = M.ExpectedWorker{ .kind = .keccak, .ordinal = 0, .statement = try Worker.truthStatement(truth, cfg, @splat(17)), .fixed = truth.key().root, .global_relations = .{ .ram = false, .kio = true, .wire = false }, .mass = try Worker.truthMass(truth), .local_instances = null };
-    var worker = try Worker.TruthWorker.init(a, truth, source, expected, cfg, 1 << 30);
-    defer worker.deinit(a);
-    const stage = try worker.seal(a);
-    var entries = [_]M.Entry{.{ .kind = .keccak, .global_relations = expected.global_relations, .mass = expected.mass, .scope = .{ .statement = expected.statement, .fixed = expected.fixed, .main = stage.main, .ordinal = 0 }, .local = null }};
     const digest: [32]u8 = @splat(29);
+    var entries: [1]M.Entry = undefined;
     const pending = M.PendingManifest{ .entries = &entries, .digest = digest, .shared = M.drawShared(digest) };
-    var encoded = try worker.complete(a, &pending, 0, 1 << 30);
+    // The encoded proof owns its wire words. Release the producer before
+    // recording either verifier graph, and admit one native proof at a time.
+    var encoded = blk: {
+        var worker = try Worker.TruthWorker.init(a, truth, source, expected, cfg, 1 << 30);
+        defer worker.deinit(a);
+        const stage = try worker.seal(a);
+        entries[0] = .{ .kind = .keccak, .global_relations = expected.global_relations, .mass = expected.mass, .scope = .{ .statement = expected.statement, .fixed = expected.fixed, .main = stage.main, .ordinal = 0 }, .local = null };
+        break :blk try worker.complete(a, &pending, 0, 1 << 30);
+    };
     defer encoded.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const geometry = try L.shape(arena.allocator(), truth, cfg);
+    if (compare_recipe) try @import("truth_leaf_test.zig").expectRecipeParity(.{ .truth = truth, .expected = expected, .manifest = &pending, .config = cfg, .encoded = &encoded }, &geometry);
     var captured: V.proof.NativeCapture = undefined;
     var native = try L.capture(a, truth, expected, &pending, cfg, &encoded, null, &captured);
     defer native.deinit(a);
     defer captured.deinit(a);
-    var arena = std.heap.ArenaAllocator.init(a);
-    defer arena.deinit();
-    const geometry = try L.shape(arena.allocator(), truth, cfg);
     const values = try V.proof.fromNative(arena.allocator(), &native, &captured, &geometry);
     const public = L.Public{ .ordinal = 0, .statement = expected.statement, .manifest = digest, .claims = encoded.claims[0..5].* };
     var ctx = try C.Context.init(a, 0);
@@ -48,8 +54,9 @@ fn exercise(policy: A.crypto.keccak.equations.BatchPolicy) !void {
     defer if (active) C.lane.finish() catch {};
     const leaf = try L.build(&ctx, truth, cfg, null, public, &values);
     for (leaf.verified.fri_input, captured.deep_answers) |wire, value| try std.testing.expect(wire.value().eql(value));
-    const words = L.statementWords(truth, public, stage.main);
-    const claims = try L.checkStatement(&words, truth, expected, digest, stage.main);
+    const main = entries[0].scope.main;
+    const words = L.statementWords(truth, public, main);
+    const claims = try L.checkStatement(&words, truth, expected, digest, main);
     try std.testing.expect(claims.ram.isZero() and claims.wire.isZero() and claims.kio.eql(public.claims[3]));
     var h = std.crypto.hash.blake2.Blake2s256.init(.{});
     var word: [4]u8 = undefined;
@@ -66,8 +73,8 @@ fn exercise(policy: A.crypto.keccak.equations.BatchPolicy) !void {
     try std.testing.expect(try ctx.isCircuitValid());
 }
 test "OM31 V3 classic Keccak compact truth leaf covers mixed heights five masks periodic samples" {
-    try exercise(.triple_v2);
+    try exercise(.triple_v2, true);
 }
 test "OM31 V3 classic Keccak R27 throughput truth leaf accepts production policy geometry" {
-    try exercise(.throughput_r27_v1);
+    try exercise(.throughput_r27_v1, false);
 }

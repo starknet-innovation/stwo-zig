@@ -38,6 +38,49 @@ pub fn aligned(words: usize) error{ResourceSizeOverflow}!usize {
     return n & ~(granule_words - 1);
 }
 
+/// Device allocations already deducted from the advertised install capacity.
+/// The quiescent installer owns this record across class and arena admission.
+pub const Reclaimable = struct {
+    words: u64,
+    ctx: *anyopaque,
+    release: *const fn (*anyopaque) anyerror!void,
+    trim: ?*const fn (*anyopaque, u64) anyerror!u64 = null,
+    reclaimed_words: u64 = 0,
+
+    pub fn remaining(self: Reclaimable) u64 {
+        return self.words - self.reclaimed_words;
+    }
+
+    pub fn reclaim(self: *Reclaimable, capacity: u64, reason: []const u8) !bool {
+        return self.reclaimAtLeast(capacity, self.remaining(), reason);
+    }
+
+    pub fn reclaimAtLeast(self: *Reclaimable, capacity: u64, need: u64, reason: []const u8) !bool {
+        if (need == 0 or need > self.remaining()) return false;
+        _ = std.math.add(u64, capacity, self.words) catch return error.ResourceSizeOverflow;
+        const keep = self.remaining() - need;
+        const left = if (self.trim != null and keep != 0) try self.trim.?(self.ctx, keep) else blk: {
+            try self.release(self.ctx);
+            break :blk 0;
+        };
+        if (left > keep) return error.InvalidReclaimedReplayWords;
+        const reclaimed = self.remaining() - left;
+        self.reclaimed_words += reclaimed;
+        std.debug.print("GPU_GUEST_REPLAY_RECLAIM words={d} retained={d} reason={s}\n", .{ reclaimed, left, reason });
+        return true;
+    }
+};
+
+pub const SetupCapacity = struct {
+    words: u64,
+    reclaimable: ?*Reclaimable = null,
+
+    pub fn available(self: SetupCapacity) !u64 {
+        const region = self.reclaimable orelse return self.words;
+        return std.math.add(u64, self.words, region.reclaimed_words) catch error.ResourceSizeOverflow;
+    }
+};
+
 pub const Footprint = struct {
     /// Peak of staged inputs + work allocations, excluding channel and slab.
     device_words: usize,

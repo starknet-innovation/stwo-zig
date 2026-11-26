@@ -54,19 +54,19 @@ pub fn recordNative(a: std.mem.Allocator, id: u32) !Artifact {
     return recordMode(a, id, true);
 }
 fn recordMode(a: std.mem.Allocator, id: u32, raw: bool) !Artifact {
-    if ((id >= 3 and id < 7) or (id >= 10 and id < 15)) return switch (id) {
+    if (id >= T.curve_start) {
+        inline for (T.curve_ops, T.curve_start..) |op, kernel| {
+            if (id == kernel) return recordV3(a, raw, T.V3Catalog.Curve(op), id);
+        }
+        return error.UnsupportedTruthInteractionRole;
+    }
+    if (id >= 3 and id < 7) return switch (id) {
         3 => recordV3(a, raw, T.V3Catalog.Sha(), id),
         4 => recordV3(a, raw, T.V3Catalog.Arith(), id),
         5 => recordV3(a, raw, T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.add), id),
         6 => recordV3(a, raw, T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.double), id),
-        10 => recordV3(a, raw, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_add), id),
-        11 => recordV3(a, raw, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_double), id),
-        12 => recordV3(a, raw, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_fp2_mul), id),
-        13 => recordV3(a, raw, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bls12_381_fp2_mul), id),
-        14 => recordV3(a, raw, T.V3Catalog.Curve(A.crypto.curves.spec.Op.arith384_mont), id),
         else => error.UnsupportedTruthInteractionRole,
     };
-    if (id >= 10) return error.UnsupportedTruthInteractionRole;
     const local_id: u32 = if (id < 3) id else id - 7;
     const policy: K.equations.BatchPolicy = if (id < 3) .throughput_r27_v1 else .triple_v2;
     var recording = X.Recording.init(a);
@@ -179,14 +179,22 @@ pub fn emit(a: std.mem.Allocator, w: anytype, artifact: *const Artifact, kernel_
 }
 test "truth rational projection keeps native triple and strict IO groups" {
     const a = std.testing.allocator;
-    for (0..15) |id| {
+    for (0..T.role_count) |id| {
         var artifact = try record(a, @intCast(id));
         defer artifact.deinit();
         try artifact.program.validate();
-        const first = [15]u32{ 143, 1, 1, 2, @intCast(T.V3Catalog.Arith().byte_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.add).byte_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.double).byte_batches), 640, 1, 1, @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_add).byte_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_double).byte_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_fp2_mul).byte_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bls12_381_fp2_mul).byte_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.arith384_mont).byte_batches) };
-        const second = [15]u32{ 50, 0, 0, 0, @intCast(T.V3Catalog.Arith().wire_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.add).wire_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.double).wire_batches), 25, 0, 0, @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_add).wire_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_double).wire_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_fp2_mul).wire_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bls12_381_fp2_mul).wire_batches), @intCast(T.V3Catalog.Curve(A.crypto.curves.spec.Op.arith384_mont).wire_batches) };
-        try std.testing.expectEqual(first[id], artifact.groups[0]);
-        try std.testing.expectEqual(second[id], artifact.groups[1]);
+        const classic_groups = [_][2]u32{
+            .{ 143, 50 },                        .{ 1, 0 },                                                            .{ 1, 0 },                                                               .{ 2, 0 },
+            packedV3Groups(T.V3Catalog.Arith()), packedV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.add)), packedV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.double)), .{ 640, 25 },
+            .{ 1, 0 },                           .{ 1, 0 },
+        };
+        const expected = if (id < T.curve_start) classic_groups[id] else groups: {
+            inline for (T.curve_ops, T.curve_start..) |op, kernel| {
+                if (id == kernel) break :groups packedV3Groups(T.V3Catalog.Curve(op));
+            }
+            unreachable;
+        };
+        try std.testing.expectEqual(expected, artifact.groups);
         try std.testing.expectEqual(@as(usize, 2) * (artifact.groups[0] + artifact.groups[1]), artifact.program.roots.len);
         for (artifact.program.inputs) |input| {
             try std.testing.expect(input.tree < 2);
@@ -196,10 +204,13 @@ test "truth rational projection keeps native triple and strict IO groups" {
 }
 
 pub fn name(a: std.mem.Allocator, id: u32) ![]u8 {
-    if (id > 14) return error.UnsupportedTruthInteractionRole;
+    if (id >= T.role_count) return error.UnsupportedTruthInteractionRole;
     return std.fmt.allocPrint(a, "stwo_rv64_truth_projection_{}", .{id});
 }
 pub fn roleWidths(id: u32) ![2]usize {
+    inline for (T.curve_ops, T.curve_start..) |op, kernel| {
+        if (id == kernel) return .{ 4, T.V3Catalog.Curve(op).L.MAIN };
+    }
     return switch (id) {
         0, 7 => .{ 32, 1923 },
         1, 2, 8, 9 => .{ 7, 1 },
@@ -207,16 +218,11 @@ pub fn roleWidths(id: u32) ![2]usize {
         4 => .{ T.V3Catalog.Arith().fixed, T.V3Catalog.Arith().L.MAIN },
         5 => .{ 4, T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.add).L.MAIN },
         6 => .{ 4, T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.double).L.MAIN },
-        10 => .{ 4, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_add).L.MAIN },
-        11 => .{ 4, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_double).L.MAIN },
-        12 => .{ 4, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_fp2_mul).L.MAIN },
-        13 => .{ 4, T.V3Catalog.Curve(A.crypto.curves.spec.Op.bls12_381_fp2_mul).L.MAIN },
-        14 => .{ 4, T.V3Catalog.Curve(A.crypto.curves.spec.Op.arith384_mont).L.MAIN },
         else => error.UnsupportedTruthInteractionRole,
     };
 }
 pub fn writeAot(a: std.mem.Allocator, dir: std.fs.Dir) !void {
-    for (0..15) |id| {
+    for (0..T.role_count) |id| {
         var artifact = try record(a, @intCast(id));
         defer artifact.deinit();
         const symbol = try name(a, @intCast(id));
@@ -246,7 +252,8 @@ pub fn writeAot(a: std.mem.Allocator, dir: std.fs.Dir) !void {
 
 test "native GKR truth raw groups preserve original query census without classic padding" {
     const a = std.testing.allocator;
-    for ([_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 }) |id| {
+    for (0..T.role_count) |i| {
+        const id: u32 = @intCast(i);
         var raw = try recordNative(a, id);
         defer raw.deinit();
         var classic = try record(a, id);
@@ -269,12 +276,12 @@ test "native GKR truth raw groups preserve original query census without classic
                 4 => rawV3Groups(T.V3Catalog.Arith()),
                 5 => rawV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.add)),
                 6 => rawV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.SecpKind.double)),
-                10 => rawV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_add)),
-                11 => rawV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_g1_double)),
-                12 => rawV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bn254_fp2_mul)),
-                13 => rawV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.Op.bls12_381_fp2_mul)),
-                14 => rawV3Groups(T.V3Catalog.Curve(A.crypto.curves.spec.Op.arith384_mont)),
-                else => unreachable,
+                else => groups: {
+                    inline for (T.curve_ops, T.curve_start..) |op, kernel| {
+                        if (id == kernel) break :groups rawV3Groups(T.V3Catalog.Curve(op));
+                    }
+                    unreachable;
+                },
             };
             try std.testing.expectEqual(expected, raw.groups);
         }
@@ -283,6 +290,10 @@ test "native GKR truth raw groups preserve original query census without classic
         defer a.free(sorts);
         for (0..raw.groups[0] + raw.groups[1]) |query| try std.testing.expectEqual(C.ir.Sort.base, sorts[raw.program.roots[2 * query]]);
     }
+}
+
+fn packedV3Groups(comptime Type: type) [2]u32 {
+    return .{ Type.byte_batches, Type.wire_batches };
 }
 
 fn rawV3Groups(comptime Type: type) [2]u32 {

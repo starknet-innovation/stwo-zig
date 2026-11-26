@@ -85,6 +85,10 @@ pub const Component = struct {
     }
     pub fn validate(self: *const @This()) !void {
         const shape = try Authority.shape(self.descriptor);
+        if (self.descriptor.origin == .core and self.descriptor.origin.core == .cpu) {
+            const wide = A.word16_execution.layout.wideClock(self.log);
+            if (self.descriptor.cpu_wide_clock != wide or self.public.cpu.wide_clock != wide) return error.NativeGkrComponentShape;
+        }
         if (self.log < 5 or self.log > 23 or shape.fixed > MAX_FIXED or shape.main > MAX_MAIN or self.parameters.point.slice().len != self.log) return error.NativeGkrComponentShape;
         const counts = try terms(self.descriptor);
         var present = false;

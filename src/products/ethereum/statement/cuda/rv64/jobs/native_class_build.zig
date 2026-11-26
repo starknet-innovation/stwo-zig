@@ -48,9 +48,6 @@ const hashPatchSet = @import("native_class_fingerprint.zig").hashPatchSet;
 const Capture = @import("native_class_inventory.zig").Capture;
 const Plan = @import("native_class_inventory.zig").Plan;
 const Image = @import("native_class_inventory.zig").Image;
-const Keys = @import("native_class_inventory.zig").Keys;
-const FixedAuthority = @import("native_class_inventory.zig").FixedAuthority;
-const FixedSet = @import("native_class_inventory.zig").FixedSet;
 const Coordinator = @import("native_class_inventory.zig").Coordinator;
 const Execution = @import("native_class_inventory.zig").Execution;
 const LocalRoster = @import("native_class_inventory.zig").LocalRoster;
@@ -143,6 +140,7 @@ pub const Env = struct {
 // ---------------------------------------------------------------------------
 
 pub const Inputs = struct {
+    envelope: CPU.rv64_gkr_fixed_authority_set.Envelope = .admitted,
     ordinal: u32,
     setup: *const Setup,
     request: Request,
@@ -150,6 +148,7 @@ pub const Inputs = struct {
     /// FIXED tree coefficient columns, original order (host, borrowed).
     fixed: []const DP.Column,
     fixed_root: [32]u8,
+    fixed_region_key: ?[32]u8 = null,
     /// MAIN tree column logs, original order.
     main_logs: []const u32,
     /// Local GKR instances (roster.fromSetup; the worker's `instances`).
@@ -191,9 +190,10 @@ pub const Class = struct {
     fixed_shapes: []NC.Shape,
     main_shapes: []NC.Shape,
     fixed_host: [][]const u32,
-    /// Owned copy of the FIXED coefficients (the capture-side leases die).
+    /// Legacy host coefficients. Device-sealed classes keep only the layout.
     fixed_storage: []u32,
     fixed_root: [32]u8,
+    fixed_region_key: ?[32]u8 = null,
     beta: u32,
     capture_words: u64 = 0,
     // ---- Stage 2 (the hybrid Framing, plus the n-stage2 extras) ----
@@ -315,15 +315,12 @@ pub const Class = struct {
     }
 
     pub fn spec(self: *const Class) S1.Spec {
-        return .{ .key = self.key, .gkr = &self.gkr, .instances = self.instances, .fixed_shapes = self.fixed_shapes, .fixed_host = self.fixed_host, .fixed_root = S2.words8(self.fixed_root), .main_shapes = self.main_shapes, .beta = self.beta, .capture_words = self.capture_words };
+        return .{ .key = self.key, .gkr = &self.gkr, .instances = self.instances, .fixed_shapes = self.fixed_shapes, .fixed_host = self.fixed_host, .fixed_root = S2.words8(self.fixed_root), .fixed_region_key = self.fixed_region_key, .main_shapes = self.main_shapes, .beta = self.beta, .capture_words = self.capture_words };
     }
     /// native_device_stage1 Class.fixed_key of this class (the worker-
     /// persistent FIXED region Stage 2 reads).
     pub fn fixedKey(self: *const Class) [32]u8 {
-        var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("rv64-m8-n1-fixed-v1");
-        h.update(&self.key);
-        return h.finalResult();
+        return self.fixed_region_key orelse S1.fixedRegionKey(S2.words8(self.fixed_root), self.beta, self.fixed_shapes);
     }
     /// The Stage-2 framing's class-cache key (distinct from the Stage-1
     /// key: one ClassCache entry per key, and the two stages own different
@@ -335,9 +332,8 @@ pub const Class = struct {
 
 /// Stage 1 of `build`: the hybrid prove()'s plan construction, verbatim
 /// (NG.Plan.init on the segment's FIXED host / MAIN shapes; NB.Plan). The
-/// plan keeps views of its host FIXED columns (staged by the GKR job), so it
-/// is built on the class's OWN copy (`fixed_storage`), never on the
-/// capture-side lease.
+/// plan keeps FIXED column views. They describe resident columns for a
+/// device-sealed class and borrow the class-owned copy on the host path.
 const buildStage1 = @import("native_class_inputs.zig").buildStage1;
 
 /// Build one segment's class (Stage 1 spec + Stage 2 framing) from `in`.
@@ -349,12 +345,13 @@ pub fn build(env: *const Env, in: Inputs) !*Class {
     cl.a = a;
     cl.instances = try a.dupe(NG.Instance, in.instances);
     errdefer a.free(cl.instances);
-    // FIXED: owned copy of the host coefficients (original order).
+    cl.fixed_region_key = in.fixed_region_key;
+    // For device-sealed classes the worker owns every coefficient.
     var fixed_words: usize = 0;
     for (in.fixed) |c| fixed_words += c.coefficients.len;
-    cl.fixed_storage = try a.alloc(u32, fixed_words);
+    cl.fixed_storage = if (in.fixed_region_key == null) try a.alloc(u32, fixed_words) else &.{};
     errdefer a.free(cl.fixed_storage);
-    cl.fixed_host = try a.alloc([]const u32, in.fixed.len);
+    cl.fixed_host = if (in.fixed_region_key == null) try a.alloc([]const u32, in.fixed.len) else &.{};
     errdefer a.free(cl.fixed_host);
     cl.fixed_shapes = try a.alloc(NC.Shape, in.fixed.len);
     errdefer a.free(cl.fixed_shapes);
@@ -362,13 +359,17 @@ pub fn build(env: *const Env, in: Inputs) !*Class {
     errdefer a.free(cl.fixed_offsets);
     {
         var at: usize = 0;
-        for (in.fixed, cl.fixed_host, cl.fixed_shapes, cl.fixed_offsets) |c, *h, *s, *o| {
-            const w = coefficientWords(c.coefficients);
-            @memcpy(cl.fixed_storage[at..][0..w.len], w);
-            h.* = cl.fixed_storage[at..][0..w.len];
+        for (in.fixed, cl.fixed_shapes, cl.fixed_offsets, 0..) |c, *s, *o, i| {
+            const words: usize = @as(usize, 1) << @intCast(c.log_size);
+            if (in.fixed_region_key == null) {
+                if (c.coefficients.len != words) return error.DeviceGkrCoefficientsRequired;
+                const window = cl.fixed_storage[at..][0..words];
+                @memcpy(window, coefficientWords(c.coefficients));
+                cl.fixed_host[i] = window;
+            }
             s.* = .{ .log_size = c.log_size, .encoding = .coefficients };
             o.* = at;
-            at += w.len;
+            at += words;
         }
         cl.fixed_words = at;
     }
@@ -434,7 +435,7 @@ fn globalItem(a: std.mem.Allocator, native: *const NativeSources, slot: anytype,
 fn buildStage2(env: *const Env, in: Inputs, cl: *Class) !void {
     const a = env.a;
     const beta = cl.beta;
-    var plan = try Components.Plan.init(a, in.setup);
+    var plan = try Components.Plan.initFor(in.envelope, a, in.setup);
     defer plan.deinit();
     cl.claim_count = @intCast(plan.claim_count);
     const fixed_logs = try a.alloc(u32, in.fixed.len);
@@ -548,7 +549,16 @@ fn buildStage2(env: *const Env, in: Inputs, cl: *Class) !void {
     };
     const scope = DP.Scope{ .statement = in.statement, .fixed = in.fixed_root, .main = in.main_root, .ordinal = in.ordinal };
     const pcs_request = DP.Request{ .scope = scope, .config = env.config, .lifting_log_size = comp_plan.chunkLog() + beta, .trees = &trees, .points = .{ .items = &tree_points } };
-    cl.pcs = try NP.PcsJob.prepare(a, env.psym, pcs_request, placeholder, env.wide);
+    cl.pcs = if (in.fixed_region_key != null)
+        try NP.PcsJob.prepareDevice(a, env.psym, pcs_request, placeholder, env.wide)
+    else
+        try NP.PcsJob.prepare(a, env.psym, pcs_request, placeholder, env.wide);
+    // Strict segment producers commit FIXED, MAIN, INTER and composition in
+    // PCS order. The opening checks the actual contiguous spans before launch.
+    if (in.fixed_region_key != null) {
+        try cl.pcs.?.requireBorrowedTrees(a);
+        comp_plan.retain_opening = cl.pcs.?.plan.source_node_images != 0;
+    }
     cl.pristine_columns = try a.dupe(PcsColumn, cl.pcs.?.prepared.coefficients);
 
     // ---- n-stage2 extras: encode program + device patch tables ----

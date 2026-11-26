@@ -7,14 +7,15 @@ const ProductCPU = @import("ethereum_cpu_component");
 const CPU = @import("stwo_riscv_cpu_integration");
 const core = @import("stwo_core");
 const G = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.gpu_native;
+const Guest = @import("stwo_riscv_cuda_integration").rv64.execution.runtime.guest_execution;
 const NCB = @import("jobs/native_class_build.zig");
+const Capture = @import("native_capture_bind.zig");
 const B = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.driver_bind;
 const RC = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.recursion_classes;
 const LF = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_leaf_wire;
 const LB = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_leaf_build;
 const LW = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_leaf_warm;
 const Publication = @import("native_publication.zig");
-const Bounds = CPU.rv64_gkr_source_bounds;
 const S2 = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_device_stage2;
 const Channel = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.channel;
 const TF = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.truth_factory;
@@ -23,21 +24,55 @@ const K = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.truth_class
 const Seed = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_stage1;
 const Plan = ProductCPU.rv64_ethereum_plan;
 const Keys = ProductCPU.rv64_ethereum_keys.Owner;
+const SetupBudget = @import("stwo_prover_engine").host_budget_allocator.SharedHostBudget;
 const FixedSet = CPU.rv64_gkr_fixed_authority_set.Set;
+const ProducerFixed = CPU.rv64_gkr_fixed_authority_set.Producer;
+const FixedAuthority = CPU.rv64_gkr_fixed_authority;
+const FixedSeal = @import("stwo_riscv_cuda_integration").rv64.execution.jobs.native_fixed_seed.Sealed;
 const Execution = CPU.rv64_gkr_execution;
-const WP = CPU.rv64_gkr_worker_protocol;
 const Front = @import("ethereum_frontend_component").rv64_air;
 const M = core.fields.m31.M31;
+
+/// The live installer owns one cache across quiescent block transitions.
+/// Entries contain suite-scoped immutable tables. Request call spans remain
+/// on the per-block owner. Uncached builds use the original allocator.
+pub const TruthSetups = struct {
+    budget: *SetupBudget,
+    keys: Keys,
+    const suite = CPU.rv64_pcs_suite.Suite.experimentalFold4();
+
+    pub fn init(a: std.mem.Allocator, bytes: usize) !TruthSetups {
+        const budget = try SetupBudget.create(a, bytes);
+        return .{ .budget = budget, .keys = .{ .allocator = budget.allocator(), .cpus = &.{}, .truths = &.{} } };
+    }
+
+    pub fn deinit(self: *TruthSetups) void {
+        self.keys.deinit();
+        self.budget.destroy();
+    }
+
+    fn acquire(self: *TruthSetups, a: std.mem.Allocator, image: *const ProductCPU.rv64_expected_image.Owner, decls: []const CPU.rv64_gkr_bundle_wire.TruthDeclaration) !Keys {
+        return Keys.initProducerTruths(self.budget.allocator(), image, decls, suite, &self.keys) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            // No active proof retains a borrow: installation occurs after
+            // the previous block's epoch has drained and been destroyed.
+            self.keys.deinit();
+            self.keys = .{ .allocator = self.budget.allocator(), .cpus = &.{}, .truths = &.{} };
+            return Keys.initProducerTruths(a, image, decls, suite, null);
+        };
+    }
+};
 
 pub const Options = struct {
     uniform: bool = false,
     one_per_family: bool = false,
     coalesce: bool = false,
+    grouped_recursion: bool = false,
     max_log: u32 = 18,
     pub fn fromResources(v: std.json.Value) !Options {
         if (v != .object) return error.GpuNativeManifestResources;
         var out = Options{};
-        inline for (.{ .{ "keccak_uniform_throughput", "uniform" }, .{ "one_truth_per_family", "one_per_family" }, .{ "coalesce_truth_families", "coalesce" } }) |pair| {
+        inline for (.{ .{ "keccak_uniform_throughput", "uniform" }, .{ "one_truth_per_family", "one_per_family" }, .{ "coalesce_truth_families", "coalesce" }, .{ "grouped_service_recursion", "grouped_recursion" } }) |pair| {
             if (v.object.get(pair[0])) |value| {
                 if (value != .bool) return error.GpuNativeManifestResources;
                 @field(out, pair[1]) = value.bool;
@@ -51,19 +86,34 @@ pub const Options = struct {
     }
 };
 
+/// Use the grouped circuit only for the tail it can authenticate. An ordinary
+/// fold proves every worker individually when another service follows the trio.
+fn groupedTail(truths: @FieldType(Keys, "truths"), cpus: usize) !bool {
+    if (truths.len < 3) return false;
+    const end = try std.math.add(usize, cpus, truths.len);
+    const span = try CPU.rv64_om31_execution_wrap.ClassSetup.ServiceGroupSpan.init(@intCast(end - 3), end);
+    for (truths[truths.len - 3 ..], 0..) |truth, i| {
+        span.checkRole(i, truth, @intCast(end - 3 + i)) catch |err| switch (err) {
+            error.ServiceGroupMembership => return false,
+        };
+    }
+    return true;
+}
+
 pub const Block = struct {
     a: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     keys: ?Keys = null,
+    grouped: bool = false,
     fixed: ?FixedSet = null,
+    producer_fixed: ?ProducerFixed = null,
     inventory: ?Execution.Inventory = null,
     native_inputs: []S2.RequestInputs = &.{},
     truths: []TF.Request = &.{},
-    bounds: ?*Bounds.Report = null,
     fn deinit(self: *Block) void {
-        if (self.bounds) |value| value.deinit();
         if (self.inventory) |*i| i.deinit();
         if (self.fixed) |*f| f.deinit();
+        if (self.producer_fixed) |*f| f.deinit();
         if (self.keys) |*k| k.deinit();
         self.arena.deinit();
         self.a.destroy(self);
@@ -77,6 +127,7 @@ pub const Binding = struct {
     base: *std.DynLib,
     options: Options,
     recursion_classes: RC.Classes,
+    truth_setups: ?*TruthSetups = null,
     profile: CPU.rv64_om31_security_candidate.Profile,
     blocks: std.AutoHashMapUnmanaged(u64, *Block) = .empty,
     mutex: std.Thread.Mutex = .{},
@@ -100,8 +151,15 @@ pub const Binding = struct {
         if (!live.captured) return error.GpuNativeCaptureNotFinished;
         const b = live.block;
         const inv = self.native.inventories.get(p.block) orelse return error.GpuNativeInventoryMissing;
-        try Publication.write(self.a, .{ .native = inv, .truths = b.keys.?.truths, .inventory = &b.inventory.?, .native_inputs = b.native_inputs, .truth_inputs = b.truths, .recursion = self.recursion_classes, .bounds = b.bounds.?, .profile = self.profile, .keccak_uniform_throughput = self.options.uniform }, ctx, p, live.output orelse return error.GpuNativeCaptureNotFinished);
+        try Publication.write(self.a, .{ .native = inv, .truths = b.keys.?.truths, .inventory = &b.inventory.?, .native_inputs = b.native_inputs, .truth_inputs = b.truths, .recursion = self.recursion_classes, .profile = self.profile, .keccak_uniform_throughput = self.options.uniform, .grouped_recursion = b.grouped }, ctx, p, live.output orelse return error.GpuNativeCaptureNotFinished);
     }
+    pub fn resourcePeak(raw: *anyopaque) anyerror!?usize {
+        const self = of(raw);
+        const recursion = (try self.recursion_classes.resourcePeak()) orelse return null;
+        const truth = if (self.binding.truth) |*factory| (try factory.resourcePeak()) orelse return null else 0;
+        return @max(recursion, truth, try self.binding.registry.resourcePeak(), try self.binding.stage2.resourcePeak());
+    }
+
     fn installed(raw: *anyopaque) anyerror!void {
         const self = of(raw);
         var it = self.blocks.valueIterator();
@@ -143,7 +201,18 @@ pub const Binding = struct {
                 const words = try CPU.rv64_om31_cpu_leaf.expectedWords(a, inv.setup(i), inv.requests[i], b.inventory.?.first_ids[i], b.inventory.?.workers[i], @splat(0), @splat(0), @splat(0), zero_claims);
                 const leaf = try self.recursion_classes.leaf(number, i);
                 const program = try a.create(LF.Program);
-                program.* = try LB.cpu(a, .{ .wire_words = leaf.wire_words, .image_words = leaf.image_words, .tail_seeds = leaf.tail_seeds }, c.spec.gkr, &c.section, &fr.program, try self.recursion_classes.coefficients(number, i), words, fr.claim_count);
+                const spec = LB.Cpu{
+                    .geometry = .{ .wire_words = leaf.wire_words, .image_words = leaf.image_words, .tail_seeds = leaf.tail_seeds },
+                    .plan = c.spec.gkr,
+                    .section = &c.section,
+                    .physical = &fr.program,
+                    .public_words = words,
+                    .claims = fr.claim_count,
+                };
+                program.* = spec.build(a, null) catch |err| switch (err) {
+                    error.NativeLeafExactCountsRequired => try spec.build(a, try self.recursion_classes.coefficients(number, i, &b.inventory.?)),
+                    else => return err,
+                };
                 input.leaf_program = program;
                 try cacheLeaf(cache, program);
             }
@@ -235,14 +304,38 @@ pub const Binding = struct {
         defer self.mutex.unlock();
         const live = self.requests.get(ctx.request) orelse return error.GpuNativeRequestNotBegun;
         if (live.captured) return error.GpuNativeCaptureEndTwice;
-        const current: *const ProductCPU.rv64_ethereum_capture.Owner = @ptrCast(@alignCast(ce.owner));
         const block_inv = self.native.inventories.get(ctx.block) orelse return error.GpuNativeInventoryMissing;
-        live.output = try ProductCPU.rv64_ethereum_terminal.require(block_inv.image, block_inv.requests[block_inv.requests.len - 1].base.cpu, current.advice.terminal);
         const a = live.arena.allocator();
         const values = try a.dupe(TF.Request, live.block.truths);
-        for (values, live.block.keys.?.truths) |*value, truth| value.compact = try K.packCompact(a, truth, &current.advice);
+        const admitted = live.block.keys.?.truths;
+        const output = if (ce.guest_terminal != null) blk: {
+            const resident = ce.guest_truth orelse return error.InvalidDeviceTruthSpan;
+            const expected_output = try Capture.requireDeviceTerminal(block_inv, ce);
+            if (ctx.truth_devices.len != values.len) return error.GpuNativeTruthShape;
+            const workers = self.binding.registry.workers;
+            var counts: [Guest.Service.wire_count]u32 = @splat(0);
+            for (values, admitted, ctx.truth_devices) |*value, truth, device| {
+                if (device >= workers.len or workers[device].device_ordinal != resident.device)
+                    return error.TruthCompactDevice;
+                const family = @intFromEnum(truth.family());
+                if (truth.first() != try std.math.add(u32, counts[family], 1)) return error.InvalidDeviceTruthSpan;
+                counts[family] = try std.math.add(u32, counts[family], truth.count());
+                value.compact_device = (try resident.span(family, truth.first(), truth.count())) orelse
+                    return error.InvalidDeviceTruthSpan;
+            }
+            try resident.requireCounts(counts);
+            break :blk expected_output;
+        } else blk: {
+            if (ce.guest_truth != null) return error.InvalidDeviceTruthSpan;
+            const raw_owner = ce.owner orelse return error.GpuNativeCaptureInventoryMismatch;
+            const current: *const ProductCPU.rv64_ethereum_capture.Owner = @ptrCast(@alignCast(raw_owner));
+            const final = block_inv.requests[block_inv.requests.len - 1].base.cpu;
+            for (values, admitted) |*value, truth| value.compact = try K.packCompact(a, truth, &current.advice);
+            break :blk try ProductCPU.rv64_ethereum_terminal.require(block_inv.image, final, current.advice.terminal);
+        };
         const truth = if (self.binding.truth) |*f| f else return error.GpuNativeTruthFactoryMissing;
         try truth.setCaptured(ctx.request, values);
+        live.output = output;
         live.captured = true;
     }
     fn ended(raw: *anyopaque, request: u64) void {
@@ -268,13 +361,13 @@ pub const Binding = struct {
     pub fn shape(raw: ?*anyopaque, wb: G.WarmBlock, native_keys: []const G.ClassKey) anyerror!G.RecursionShape {
         const self: *Binding = @ptrCast(@alignCast(raw.?));
         const b = try self.prepare(wb, native_keys);
-        return .{ .truths = @intCast(b.truths.len), .fold_arity = 4 };
+        return .{ .truths = @intCast(b.truths.len), .fold_arity = 4, .grouped_recursion = b.grouped };
     }
     fn prepare(self: *Binding, wb: G.WarmBlock, native_keys: []const G.ClassKey) !*Block {
         if (self.blocks.get(wb.block)) |known| return known;
         const inv = self.native.inventories.get(wb.block) orelse return error.GpuNativeInventoryMissing;
+        if (self.options.grouped_recursion and inv.fixed_device == null) return error.ServiceGroupRequiresProoflessInstall;
         if (native_keys.len != inv.count()) return error.GpuNativeCaptureSegmentCountChanged;
-        const warm_owner: *const ProductCPU.rv64_ethereum_capture.Owner = @ptrCast(@alignCast(wb.capture.owner));
         const config: *const ProductCPU.rv64_ethereum_request.Config = @ptrCast(@alignCast(wb.capture.config));
         const program: *const CPU.rv64_program.Program = @ptrCast(@alignCast(wb.capture.program));
         const b = try self.a.create(Block);
@@ -283,24 +376,49 @@ pub const Binding = struct {
         const a = b.arena.allocator();
         const strict = (try CPU.rv64_native_policy.current()).strictRoster();
         const canonical = false;
-        const decls = try Plan.truthsWithOptions(a, warm_owner, .{ .v3 = config.execution_profile == .ethereum_services_v3, .uniform_throughput = self.options.uniform, .one_per_family = self.options.one_per_family, .coalesce_families = self.options.coalesce, .split_families = Plan.truthSplitEnabled(), .rung_bound = strict or canonical }, self.options.max_log);
+        var calls: [CPU.rv64_services_types.FAMILIES]u32 = @splat(0);
+        for (inv.requests) |request| {
+            for (&calls, request.calls) |*total, count| total.* = try std.math.add(u32, total.*, count);
+            calls[0] = try std.math.add(u32, calls[0], request.sponge.perms);
+        }
+        const decls = try Plan.truthsForServiceCounts(a, calls, .{ .v3 = config.execution_profile == .ethereum_services_v3, .uniform_throughput = self.options.uniform, .one_per_family = self.options.one_per_family, .coalesce_families = self.options.coalesce, .split_families = Plan.truthSplitEnabled(), .rung_bound = strict or canonical }, self.options.max_log);
         if (strict or canonical) {
             const classes = try a.alloc(Plan.CanonClass, decls.len);
             try Plan.canonicalTruths(decls, CPU.rv64_native_rungs, classes);
         }
-        b.keys = try Keys.initWithSuiteAndCaches(self.a, inv.image, &.{}, decls, true, CPU.rv64_pcs_suite.Suite.experimentalFold4(), .{});
+        const suite = CPU.rv64_pcs_suite.Suite.experimentalFold4();
+        b.keys = if (inv.fixed_device != null) key: {
+            if (self.truth_setups) |cache| break :key try cache.acquire(self.a, inv.image, decls);
+            break :key try Keys.initProducerTruths(self.a, inv.image, decls, suite, null);
+        } else try Keys.initWithSuiteAndCaches(self.a, inv.image, &.{}, decls, true, suite, .{});
         const cpus = try a.alloc(*const NCB.Setup, inv.count());
-        for (cpus, 0..) |*out, i| out.* = inv.setup(i);
-        b.fixed = try FixedSet.init(self.a, &inv.fixed_cache, cpus, b.keys.?.truths, inv.config);
+        for (cpus, 0..) |*setup, i| setup.* = inv.setup(i);
         const expected = try ProductCPU.rv64_ethereum_receiver.expectedFromRequests(inv.image, program.identity, inv.requests, config.max_steps, config.batch_steps, true);
-        b.inventory = try Execution.Inventory.initWithAuthority(self.a, cpus, b.keys.?.truths, inv.requests, expected, inv.config, &b.fixed.?);
-        const cpu_declarations = try a.alloc(CPU.rv64_gkr_bundle_wire.CpuDeclaration, cpus.len);
-        for (cpu_declarations, cpus) |*declaration, setup| declaration.* = .{ .geometry = setup.materials.geometry, .bridges = setup.bridges };
-        const truth_declarations = try a.alloc(CPU.rv64_gkr_bundle_wire.TruthDeclaration, b.keys.?.truths.len);
-        for (truth_declarations, b.keys.?.truths) |*declaration, truth| declaration.* = CPU.rv64_gkr_bundle_wire.TruthDeclaration.from(truth);
-        const bounds = try a.create(Bounds.Report);
-        bounds.* = try Bounds.derive(a, program.log_size, cpu_declarations, truth_declarations, inv.requests);
-        b.bounds = bounds;
+        b.grouped = self.options.grouped_recursion and try groupedTail(b.keys.?.truths, cpus.len);
+        const truth_seals: []FixedSeal = if (inv.fixed_device != null) try a.alloc(FixedSeal, decls.len) else &.{};
+        if (inv.fixed_device) |device| {
+            const keys = try a.alloc(FixedAuthority.ProducerKey, cpus.len);
+            for (keys, inv.segs) |*key, seg| key.* = seg.device_key orelse return error.GpuNativeFixedNotWarmed;
+            const truth_keys = try a.alloc(FixedAuthority.ProducerTruthKey, decls.len);
+            const descriptor: FixedAuthority.Fixed.CommitmentDescriptor = .{ .log_blowup = inv.config.fri_config.log_blowup_factor };
+            for (b.keys.?.truths, truth_seals, truth_keys) |truth, *seal, *truth_key| {
+                const source_beta = truth.key().suite.config().fri_config.log_blowup_factor;
+                const columns = try truth.fixedColumns(self.a);
+                defer self.a.free(columns);
+                seal.* = try device.sealEvaluations(self.a, columns, descriptor, truth.key().root, source_beta);
+                truth_key.* = .{
+                    .candidate = try FixedAuthority.ProducerKey.fromDeviceRoot(truth.key(), inv.config, seal.root),
+                    .source_root = seal.source_root orelse return error.GpuNativeFixedNotWarmed,
+                };
+            }
+            b.producer_fixed = try ProducerFixed.initWithDeviceTruths(self.a, keys, truth_keys, inv.config);
+            b.inventory = try Execution.Inventory.initBound(inv.envelope, self.a, cpus, b.keys.?.truths, inv.requests, expected, inv.config, .{ .producer = &b.producer_fixed.? });
+        } else {
+            const fixed_cpus = try a.alloc(*const CPU.rv64_gkr_fixed_authority.Binding, cpus.len);
+            for (fixed_cpus, 0..) |*fixed, i| fixed.* = inv.binding(i);
+            b.fixed = try FixedSet.initWithPreparedCpus(self.a, &inv.fixed_cache, cpus, fixed_cpus, b.keys.?.truths, inv.config);
+            b.inventory = try Execution.Inventory.initBound(inv.envelope, self.a, cpus, b.keys.?.truths, inv.requests, expected, inv.config, .{ .receiver = &b.fixed.? });
+        }
         b.native_inputs = try a.alloc(S2.RequestInputs, inv.count());
         const rec = for (self.native.blocks.items) |r| {
             if (r.block == wb.block) break r;
@@ -321,22 +439,21 @@ pub const Binding = struct {
         b.truths = try a.alloc(TF.Request, b.keys.?.truths.len);
         for (b.keys.?.truths, b.truths, 0..) |truth, *out, i| {
             const ordinal = inv.count() + i;
-            const authority = b.fixed.?.at(ordinal);
+            const authority = if (b.fixed) |*set| set.at(ordinal) else null;
+            const header = if (b.producer_fixed) |*set| set.device_truths.?[i].candidate.header else authority.?.header();
+            const sealed = if (b.producer_fixed != null) truth_seals[i] else null;
             const worker = b.inventory.?.workers[ordinal];
-            const key = try K.classKey(truth, inv.config, authority.root());
+            if (!std.mem.eql(u8, &worker.fixed, &header.fixed_root)) return error.GpuNativeFixedNotWarmed;
+            const key = try K.classKey(truth, inv.config, header.fixed_root);
             if (!factory.classes.contains(key)) {
-                var scheme = try WP.Prover.init(self.a, inv.config);
-                defer scheme.deinit(self.a);
-                scheme.setCompactPolynomialStorage(1);
-                var ch = authority.begin(inv.config, worker);
-                try authority.append(self.a, truth.key(), worker.fixed, &scheme, &ch);
-                const columns = scheme.trees.items[0].coefficients orelse return error.DeviceGkrCoefficientsRequired;
+                const columns = if (authority) |binding| binding.lease.key.tree.coefficients orelse return error.DeviceGkrCoefficientsRequired else &.{};
                 const fixed = try a.alloc(K.FixedColumn, columns.len);
+                defer a.free(fixed);
                 for (fixed, columns) |*d, c| {
                     const words = c.coefficients();
                     d.* = .{ .log_size = c.logSize(), .words = @as([*]const u32, @ptrCast(words.ptr))[0..words.len] };
                 }
-                const class = try K.build(self.a, .{ .truth = truth, .config = inv.config, .fixed = fixed, .fixed_root = authority.root(), .psym = self.native.env.psym, .wide_framing = self.native.env.wide });
+                const class = try K.build(self.a, .{ .truth = truth, .config = inv.config, .fixed = fixed, .fixed_root = header.fixed_root, .device_fixed = sealed, .psym = self.native.env.psym, .wide_framing = self.native.env.wide });
                 errdefer {
                     class.deinit();
                     self.a.destroy(class);
@@ -345,11 +462,22 @@ pub const Binding = struct {
                 try factory.addClass(class, 0);
                 added.appendAssumeCapacity(key);
             }
-            out.* = .{ .class = key, .calls = truth.count(), .first_id = truth.first(), .compact = &.{}, .seed = Seed.seedOf(authority.begin(inv.config, worker)) };
+            out.* = .{ .class = key, .calls = truth.count(), .first_id = truth.first(), .compact = &.{}, .seed = Seed.seedOf(header.begin(inv.config, worker)) };
             const class = factory.classes.get(key).?.class;
             std.debug.print("GPU_M8_GN_TRUTH class={s} family={s} log={} calls={} first={} main_words={} inter_words={} comp_words={} compact_per_call={}\n", .{ std.fmt.bytesToHex(key[0..6], .lower), @tagName(truth), class.log, truth.count(), truth.first(), class.mainEvalWords(), class.inter_plan.coefficient_cells, class.composition.coefficientWords(), class.compact_words_per_call });
         }
-        try self.recursion_classes.register(wb.block, &self.binding.recursion, native_keys, &self.binding.stage2, b.truths, factory, &b.inventory.?);
+        const recipes: ?RC.RecipeInputs = if (inv.fixed_device) |device| .{
+            .inventory = &b.inventory.?,
+            .cpus = cpus,
+            .requests = inv.requests,
+            .truths = b.keys.?.truths,
+            .config = inv.config,
+            .fixed = &b.producer_fixed.?,
+            .worker = device.worker,
+            .capacity = device.capacity,
+            .grouped_recursion = b.grouped,
+        } else null;
+        try self.recursion_classes.register(wb.block, &self.binding.recursion, native_keys, &self.binding.stage2, b.truths, factory, recipes);
         for (native_keys, 0..) |key, i| {
             const suffix = try self.recursion_classes.leaf(wb.block, i);
             const pool = self.binding.stage2.classes.get(S2.framingKey(key)) orelse return error.GpuNativeClassNotWarmed;

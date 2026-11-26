@@ -1093,6 +1093,9 @@ static int alloc_u32_from(void *handle, size_t count, uint32_t **out_pointer, bo
         };
     } else {
         *out_pointer = nullptr;
+        // Optional allocations may release their reservation and continue.
+        // Keep their typed OOM result off the next kernel's launch status.
+        if (status == cudaErrorMemoryAllocation) (void)cudaGetLastError();
     }
     return static_cast<int>(status);
 }

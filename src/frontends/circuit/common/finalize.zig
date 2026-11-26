@@ -180,6 +180,38 @@ fn rowsToAdd(n_rows: usize, target: usize) error{ComponentExceedsTarget}!usize {
     return target - n_rows;
 }
 
+/// Emit the ordinary padding gates into consecutive typed slots. A trace-only
+/// class has no value array or padding hints. Its output wire numbers are fixed
+/// before the next family starts, including the four wires per Blake G.
+fn tracePadding(ctx: *builder.Context(QM31), comptime kind: ComponentSizes.Field, n: usize, input: u32) PadError!void {
+    std.debug.assert(ctx.trace_only and ctx.record_gates);
+    const family = if (kind == .qm31_ops) "add" else @tagName(kind);
+    const gates = &@field(ctx.circuit, family);
+    const stride: usize = switch (kind) {
+        .eq => 0,
+        .blake_g_gate => 4,
+        else => 1,
+    };
+    const first = ctx.circuit.n_vars;
+    if (stride != 0 and n > (builder.circuit.max_vars - 1 - first) / stride) return error.TooManyVars;
+    const rows = try gates.addManyAsSlice(ctx.gpa, n);
+    if (kind == .eq) {
+        @memset(rows, .{ .in0 = input, .in1 = input });
+    } else for (rows, 0..) |*row, i| {
+        const out = first + @as(u32, @intCast(i * stride));
+        row.* = switch (kind) {
+            .qm31_ops => .{ .in0 = input, .in1 = input, .out = out },
+            .triple_xor => .{ .input_a = input, .input_b = input, .input_c = input, .out = out },
+            .m31_to_u32 => .{ .input = input, .out = out },
+            .blake_g_gate => .{ .input_a = input, .input_b = input, .input_c = input, .input_d = input, .input_f0 = input, .input_f1 = input, .out_base = out },
+            .eq => unreachable,
+        };
+    }
+    ctx.circuit.n_vars += @intCast(n * stride);
+    @field(ctx.gate_counts, @tagName(kind)) += n;
+    if (kind != .blake_g_gate) @field(ctx.stats, if (kind == .eq) "equals" else family) += n;
+}
+
 /// `0 = 0` rows.
 fn padEq(comptime V: type, ctx: *builder.Context(V), target: usize) PadError!void {
     const n = try rowsToAdd(ctx.gate_counts.eq, target);
@@ -188,6 +220,7 @@ fn padEq(comptime V: type, ctx: *builder.Context(V), target: usize) PadError!voi
         ctx.stats.equals += n;
         return;
     }
+    if (V == QM31 and ctx.trace_only and !ctx.assert_eq_on_eval) return tracePadding(ctx, .eq, n, ctx.zero().idx);
     for (0..n) |_| try ctx.eq(ctx.zero(), ctx.zero());
 }
 
@@ -200,6 +233,7 @@ fn padQm31Ops(comptime V: type, ctx: *builder.Context(V), target: usize) PadErro
         ctx.stats.add += n;
         return;
     }
+    if (V == QM31 and ctx.trace_only) return tracePadding(ctx, .qm31_ops, n, ctx.one().idx);
     for (0..n) |_| _ = try ctx.add(ctx.one(), ctx.one());
 }
 
@@ -213,6 +247,7 @@ fn padTripleXor(comptime V: type, ctx: *builder.Context(V), target: usize) PadEr
         ctx.stats.triple_xor += n;
         return;
     }
+    if (V == QM31 and ctx.trace_only) return tracePadding(ctx, .triple_xor, n, zero.get().idx);
     for (0..n) |_| _ = try builder.blake.tripleXor(V, ctx, zero, zero, zero);
 }
 
@@ -225,6 +260,7 @@ fn padM31ToU32(comptime V: type, ctx: *builder.Context(V), target: usize) PadErr
         ctx.stats.m31_to_u32 += n;
         return;
     }
+    if (V == QM31 and ctx.trace_only) return tracePadding(ctx, .m31_to_u32, n, ctx.zero().idx);
     for (0..n) |_| _ = try builder.blake.m31ToU32(V, ctx, ctx.zero());
 }
 
@@ -237,6 +273,7 @@ fn padBlakeGGate(comptime V: type, ctx: *builder.Context(V), target: usize) PadE
         ctx.gate_counts.blake_g_gate = target;
         return;
     }
+    if (V == QM31 and ctx.trace_only) return tracePadding(ctx, .blake_g_gate, n, zero.get().idx);
     for (0..n) |_| _ = try builder.blake.blakeGGate(V, ctx, zero, zero, zero, zero, zero, zero);
 }
 
@@ -326,4 +363,32 @@ test "finalize: gate-free witness replay keeps values and padding positions" {
     try std.testing.expectEqual(@as(usize, 0), witness.circuit.blake_g_gate.items.len);
     try std.testing.expectEqual(@as(usize, 0), witness.circuit.add.items.len);
     for (full.values(), witness.values()) |expected, actual| try std.testing.expect(expected.eql(actual));
+}
+
+test "trace-only bulk padding reproduces each scalar gate, variable, and statistic" {
+    const a = std.testing.allocator;
+    var trace = try builder.Context(QM31).initTraceOnly(a, 0);
+    defer trace.deinit();
+    var scalar = try builder.Context(QM31).initWithWitnessOrigins(a, 0);
+    defer scalar.deinit();
+    for ([_]*builder.Context(QM31){ &trace, &scalar }) |ctx| {
+        const value = try ctx.guess(QM31.fromU32Unchecked(23, 1, 3, 4));
+        _ = try ctx.mul(value, ctx.one());
+        try ctx.finalize(false);
+    }
+    for ([_]usize{ 4096, 4096, 4097 }) |size| {
+        const target: ComponentSizes = .{ .eq = size - 3, .qm31_ops = size, .triple_xor = size + 2, .m31_to_u32 = size + 1, .blake_g_gate = size };
+        try padToTargets(QM31, &trace, target);
+        try padToTargets(QM31, &scalar, target);
+        inline for (.{ "eq", "add", "triple_xor", "m31_to_u32", "blake_g_gate" }) |field|
+            try std.testing.expectEqualDeep(@field(scalar.circuit, field).items, @field(trace.circuit, field).items);
+        try std.testing.expectEqualDeep(scalar.gate_counts, trace.gate_counts);
+        try std.testing.expectEqualDeep(scalar.stats, trace.stats);
+        try std.testing.expectEqual(scalar.circuit.n_vars, trace.circuit.n_vars);
+        try std.testing.expectEqualDeep(scalar.witness_metadata.?.origins.items, trace.witness_metadata.?.origins.items);
+    }
+    trace.circuit.n_vars = builder.circuit.max_vars - 4;
+    const before = trace.circuit.blake_g_gate.items.len;
+    try std.testing.expectError(error.TooManyVars, tracePadding(&trace, .blake_g_gate, 1, 0));
+    try std.testing.expectEqual(before, trace.circuit.blake_g_gate.items.len);
 }

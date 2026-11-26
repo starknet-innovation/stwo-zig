@@ -41,6 +41,15 @@ class LegacyKernelOwnership(unittest.TestCase):
         for name, filename in (("deep_prepare", "deep.cu"), ("deep_combine", "deep.cu"), ("sample_evaluate", "samples.cu")):
             source = (NATIVE / filename).read_text()
             actual = body(source, "int stwo::cuda::rv64::detail::" + name + "(")
+            if name == "deep_combine":
+                self.assertEqual("return deep_combine_mode<false>(ctx, lane, input, legacy);", actual.strip())
+                actual = body(source, "static int deep_combine_mode(")
+                # Substitute the dense specialization before checking the
+                # original validation, custody and launch-body digest.
+                actual = (actual.replace(" || (Canonical && input->output_log < 3)", "")
+                          .replace("uint64_t(1) << (Canonical ? j.output_log - 2 : j.output_log + 1)",
+                                   "uint64_t(2) << j.output_log")
+                          .replace("<Canonical>", ""))
             self.assertEqual(EXPECTED[name], digest(actual), name)
 
     def test_public_abi_always_selects_unchanged_default_without_process_override(self):

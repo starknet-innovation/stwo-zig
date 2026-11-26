@@ -79,14 +79,17 @@ pub const Pending = struct {
     flight: *R.InFlight,
     timer: std.time.Timer,
     begin_ns: u64,
+    admission_ns: u64 = 0,
 };
 
 pub const Result = struct {
     outcome: R.Outcome,
-    /// begin -> finish returned (request wall seen by the service) [M].
+    /// Admission, begin and finish wall time [M].
     request_wall_ns: u64,
     /// Host time of `begin` (plan, make, enqueue; overlaps capture) [M].
     begin_ns: u64,
+    admission_ns: u64 = 0,
+    guest: ?G.GuestCaptureEvidence = null,
 };
 
 /// Per-request service hooks of the binding (driver_bind.zig): `publishing`
@@ -112,6 +115,16 @@ pub const Service = struct {
     streams: [2]*C.Stream,
     busy: [2]bool = .{ false, false },
     next_id: u64 = 1,
+    setup_mode: SetupMode = .example_proof,
+
+    pub const SetupMode = enum {
+        example_proof,
+        device_geometry,
+
+        pub fn requestLimit(self: SetupMode) usize {
+            return if (self == .device_geometry) 1 else 2;
+        }
+    };
 
     pub fn install(a: std.mem.Allocator, ops: *const O.Ops, peer: *const O.Peer, workers: []const *W.Worker, native: G.NativeFactory, recursion: G.RecursionFactory, source: CaptureSource, blocks: []const u64, config: R.Config, ring_config: RingConfig) !*Service {
         if (blocks.len == 0) return error.GpuNativeServiceNoBlocks;
@@ -141,7 +154,7 @@ pub const Service = struct {
                 return err;
             };
             if (rs.truths > config.max_truths) return error.GpuNativeTruthsExceedPlan;
-            var topo = try D.Topology.carry(a, @intCast(rows.len), rs.truths, rs.fold_arity);
+            var topo = try D.Topology.carryExecution(a, @intCast(rows.len), rs.truths, rs.fold_arity, rs.grouped_recursion);
             errdefer topo.deinit();
             const roster = try a.alloc(@import("driver_install.zig").SlabClass, rows.len + rs.truths + topo.nodes.len + 1);
             errdefer a.free(roster);
@@ -201,6 +214,22 @@ pub const Service = struct {
         return self;
     }
 
+    pub const Serial = struct {
+        next_request: u64 = 1,
+        generation: u64 = 0,
+    };
+
+    pub fn retire(self: *Service) !Serial {
+        try self.driver.retire();
+        return .{ .next_request = self.next_id, .generation = self.driver.generation };
+    }
+
+    pub fn resumeSerial(self: *Service, serial: Serial) void {
+        std.debug.assert(self.next_id == 1 and self.driver.generation == 0);
+        self.next_id = serial.next_request;
+        self.driver.generation = serial.generation;
+    }
+
     /// Teardown after every Pending was finished (serveSpool guarantees it).
     pub fn deinit(self: *Service) void {
         self.driver.deinit();
@@ -226,7 +255,7 @@ pub const Service = struct {
     /// the capture still runs; Stage1s follow its sealed segments).
     pub fn begin(self: *Service, block: u64, out: ?std.fs.Dir) !*Pending {
         const shape = self.shapeOf(block) orelse return error.GpuNativeBlockNotWarmed;
-        const slot: usize = if (!self.busy[0]) 0 else if (!self.busy[1]) 1 else return error.GpuNativePipelineFull;
+        const slot = std.mem.indexOfScalar(bool, self.busy[0..self.setup_mode.requestLimit()], false) orelse return error.GpuNativePipelineFull;
         const stream = self.streams[slot];
         const p = try self.a.create(Pending);
         errdefer self.a.destroy(p);
@@ -272,7 +301,7 @@ pub const Service = struct {
         // The driver detached the stream (capture done): join its thread.
         if (p.handle) |h| self.source.vtable.join(self.source.ctx, h);
         if (self.hooks) |h| h.ended(h.ctx, p.request, p.generation);
-        return .{ .outcome = try out, .request_wall_ns = p.timer.read(), .begin_ns = p.begin_ns };
+        return .{ .outcome = try out, .request_wall_ns = p.admission_ns + p.timer.read(), .begin_ns = p.begin_ns, .admission_ns = p.admission_ns, .guest = p.stream.guest };
     }
 
     pub fn serve(self: *Service, block: u64, out: ?std.fs.Dir) !Result {
@@ -308,9 +337,9 @@ pub const Spool = struct {
         self.inbox.close();
         self.dir.close();
     }
-    pub fn ready(self: *Spool, init_ns: u64) !void {
+    pub fn ready(self: *Spool, init_ns: u64, mode: Service.SetupMode, preinstalled_blocks: usize) !void {
         const pid: i64 = if (@import("builtin").os.tag == .linux) std.os.linux.getpid() else 0;
-        const text = try std.fmt.allocPrint(self.a, "{{\"schema\":\"rv64-resident-service/v1\",\"runtime\":\"m8-gpu-native\",\"pid\":{d},\"init_ns\":{d}}}\n", .{ pid, init_ns });
+        const text = try std.fmt.allocPrint(self.a, "{{\"schema\":\"rv64-resident-service/v1\",\"runtime\":\"m8-gpu-native\",\"pid\":{d},\"init_ns\":{d},\"setup_mode\":\"{s}\",\"preinstalled_blocks\":{d}}}\n", .{ pid, init_ns, @tagName(mode), preinstalled_blocks });
         defer self.a.free(text);
         try self.dir.writeFile(.{ .sub_path = "READY.tmp", .data = text });
         try self.dir.rename("READY.tmp", "READY");
@@ -378,7 +407,7 @@ pub const Spool = struct {
 
 /// The driver receipt as published per request (m8-jobs.json; D4/D5).
 pub fn receiptJson(a: std.mem.Allocator, block: u64, sequence: u64, r: Result) ![]u8 {
-    return std.json.Stringify.valueAlloc(a, .{ .schema = "rv64-m8-gpu-native-request/v1", .block = block, .sequence = sequence, .request_wall_ns = r.request_wall_ns, .begin_ns = r.begin_ns, .proofs = r.outcome.proofs.len, .receipt = r.outcome.receipt, .scope = "host_waits/d2h counted by the driver; device_gpu_us = CUDA-event span per GPU (preamble start -> slab D2H end) [M]; host ns = CPU wall on the driver threads [M]" }, .{ .whitespace = .indent_1 });
+    return std.json.Stringify.valueAlloc(a, .{ .schema = "rv64-m8-gpu-native-request/v1", .block = block, .sequence = sequence, .request_wall_ns = r.request_wall_ns, .begin_ns = r.begin_ns, .admission_ns = r.admission_ns, .proofs = r.outcome.proofs.len, .receipt = r.outcome.receipt, .guest = r.guest, .scope = "host_waits/d2h counted by the proof driver; guest reports its own readbacks. device_gpu_us = CUDA-event span per GPU (preamble start -> slab D2H end) [M]; host ns = CPU wall on the driver threads [M]" }, .{ .whitespace = .indent_1 });
 }
 
 /// Spool loop: up to two requests in flight (the next request's capture and
@@ -386,17 +415,40 @@ pub fn receiptJson(a: std.mem.Allocator, block: u64, sequence: u64, r: Result) !
 /// refused request is answered {"ok":false}; a poisoned driver (device
 /// fault) stops the service with the error after answering.
 pub fn serveSpool(svc: *Service, spool_path: []const u8, init_ns: u64) !void {
-    const a = svc.a;
+    const Installed = struct {
+        fn resolve(raw: *anyopaque, _: u64) !*Service {
+            return @ptrCast(@alignCast(raw));
+        }
+    };
+    try serveSpoolWith(svc.a, spool_path, init_ns, .{
+        .ctx = svc,
+        .resolve = Installed.resolve,
+        .mode = svc.setup_mode,
+        .preinstalled_blocks = svc.shapes.len,
+    });
+}
+
+/// Admission borrows an installed service through completion of its tickets.
+/// Selecting a different single-ticket service may retire the previous plan.
+pub const SpoolAdmission = struct {
+    ctx: *anyopaque,
+    resolve: *const fn (*anyopaque, u64) anyerror!*Service,
+    mode: Service.SetupMode,
+    preinstalled_blocks: usize = 0,
+};
+
+pub fn serveSpoolWith(a: std.mem.Allocator, spool_path: []const u8, init_ns: u64, admission: SpoolAdmission) !void {
     var spool = try Spool.open(a, spool_path);
     defer spool.close();
-    try spool.ready(init_ns);
+    try spool.ready(init_ns, admission.mode, admission.preinstalled_blocks);
     std.debug.print("GPU_RESIDENT_SERVICE ready init_ns={} runtime=m8-gpu-native\n", .{init_ns});
-    const Item = struct { stem: []const u8, block: u64, pending: *Pending, queue_ns: u64, out: std.fs.Dir };
+    const Item = struct { stem: []const u8, block: u64, service: *Service, pending: *Pending, queue_ns: u64, out: std.fs.Dir };
     var queue: [2]Item = undefined;
     var queued: usize = 0;
+    const request_limit = admission.mode.requestLimit();
     // Never leave a request in flight behind (error exits included).
     defer for (queue[0..queued]) |*it| {
-        if (svc.finish(it.pending)) |res| {
+        if (it.service.finish(it.pending)) |res| {
             var r = res;
             r.outcome.deinit();
         } else |_| {}
@@ -405,13 +457,21 @@ pub fn serveSpool(svc: *Service, spool_path: []const u8, init_ns: u64) !void {
     var idle = try std.time.Timer.start();
     var stop = false;
     while (true) {
-        if (queued < queue.len) if (try spool.next(&stop)) |n| {
+        if (queued < request_limit) if (try spool.next(&stop)) |n| {
             const queue_ns = idle.read();
             if (n.err) |err| {
                 try spool.refuse(n.stem, err, null);
                 continue;
             }
             var out = try spool.proofDir(n.stem, n.block);
+            var admission_timer = try std.time.Timer.start();
+            const svc = admission.resolve(admission.ctx, n.block) catch |err| {
+                out.close();
+                try spool.refuse(n.stem, err, null);
+                if (err == error.GpuNativeBlockNotWarmed) continue;
+                return err;
+            };
+            const admission_ns = if (admission.preinstalled_blocks == 0) admission_timer.read() else 0;
             const p = svc.begin(n.block, out) catch |err| {
                 out.close();
                 std.debug.print("GPU_RESIDENT_SERVICE reject request={s} error={s}\n", .{ n.stem, @errorName(err) });
@@ -419,7 +479,8 @@ pub fn serveSpool(svc: *Service, spool_path: []const u8, init_ns: u64) !void {
                 if (svc.driver.poisoned) return err;
                 continue;
             };
-            queue[queued] = .{ .stem = n.stem, .block = n.block, .pending = p, .queue_ns = queue_ns, .out = out };
+            p.admission_ns = admission_ns;
+            queue[queued] = .{ .stem = n.stem, .block = n.block, .service = svc, .pending = p, .queue_ns = queue_ns, .out = out };
             queued += 1;
             continue;
         };
@@ -432,10 +493,10 @@ pub fn serveSpool(svc: *Service, spool_path: []const u8, init_ns: u64) !void {
             const seq = spool.sequence;
             spool.sequence += 1;
             idle.reset();
-            const res = svc.finish(it.pending) catch |err| {
+            const res = it.service.finish(it.pending) catch |err| {
                 std.debug.print("GPU_RESIDENT_SERVICE failed request={s} error={s}\n", .{ it.stem, @errorName(err) });
                 try spool.refuse(it.stem, err, seq);
-                if (svc.driver.poisoned) return err;
+                if (it.service.driver.poisoned) return err;
                 continue;
             };
             var r = res;
