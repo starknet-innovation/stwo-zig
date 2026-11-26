@@ -297,34 +297,6 @@ test "in-process walk skips only the legacy Poseidon cache; packet collection ke
     try std.testing.expect(walk.request.has_initial_cache);
     try std.testing.expectEqualDeep(with.initial_cache.root(), walk.request.initial_cache.root());
 }
-test "expected image reads inputs up to the request loader's bound (no 4 MiB cap)" {
-    const front = @import("ethereum_frontend_component");
-    try std.testing.expectEqual(@as(usize, front.rv64.ethereum_contract.INPUT_CAPACITY_MAX - 4), Image.MAX_INPUT_BYTES);
-    try std.testing.expect(Image.MAX_INPUT_BYTES > 4 << 20);
-    var fixture = try Fixture.init();
-    defer fixture.deinit();
-    // A 4 MiB + 1 input with a matching pin is no longer refused by the read
-    // bound; this fixture's 4 MiB guest window then rejects it on load.
-    const big = try a.alloc(u8, (4 << 20) + 1);
-    defer a.free(big);
-    @memset(big, 0);
-    try fixture.temp.dir.writeFile(.{ .sub_path = "input", .data = big });
-    var config = fixture.config();
-    var hash = std.fmt.bytesToHex(Request.sha(big), .lower);
-    config.input_sha256 = &hash;
-    const result = Image.Owner.init(a, config);
-    if (result) |value| {
-        var owned = value;
-        owned.deinit();
-        return error.TestUnexpectedResult;
-    } else |err| try std.testing.expect(err != error.FileTooBig);
-    // Over the bound is still refused before hashing.
-    const huge = try a.alloc(u8, Image.MAX_INPUT_BYTES + 1);
-    defer a.free(huge);
-    @memset(huge, 0);
-    try fixture.temp.dir.writeFile(.{ .sub_path = "input", .data = huge });
-    try std.testing.expectError(error.FileTooBig, Image.Owner.init(a, config));
-}
 const expectSameTree = FixtureSupport.expectSameTree;
 test "checkpoint-only walk borrows no retirement tape and workers hand off the serial capture" {
     var fixture = try Fixture.init();

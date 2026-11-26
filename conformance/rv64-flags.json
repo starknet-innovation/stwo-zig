@@ -4642,7 +4642,7 @@
       "expires": "2026-12-09"
     },
     "STWO_RV64_OUTER_ASSIGNMENT_NARROW_RUNS": {
-      "owner": "src/integrations/riscv_cuda/rv64/outer_assignment.zig",
+      "owner": "src/integrations/riscv_cuda/rv64/assignment_runs.zig",
       "default": "false",
       "status": "runtime",
       "date": "2026-11-08",
@@ -4650,11 +4650,11 @@
         "conformance/rv64/presets/integration-stack-preset.json",
         "scripts/rv64/rv64_m3_pod.py",
         "scripts/rv64/rv64_m4_arena_job.sh",
-        "src/integrations/riscv_cuda/rv64/outer_assignment.zig"
+        "src/integrations/riscv_cuda/rv64/assignment_runs.zig"
       ],
       "default_evidence": {
-        "path": "src/integrations/riscv_cuda/rv64/outer_assignment.zig",
-        "text": "        const option = std.process.getEnvVarOwned(a, \"STWO_RV64_OUTER_ASSIGNMENT_NARROW_RUNS\") catch |err| switch (err) {\n            error.EnvironmentVariableNotFound => null,\n            else => return err,\n        };\n        defer if (option) |value| a.free(value);\n        const narrow_enabled = try Runs.parseOptIn(option);\n        const narrow = library.lookup(LaunchRun, \"stwo_circuit_assignment_narrow_run_on\");\n        if (narrow_enabled and narrow == null) return error.MissingCircuitAssignmentNarrowRunKernel;"
+        "path": "src/integrations/riscv_cuda/rv64/assignment_runs.zig",
+        "text": "        const option = std.process.getEnvVarOwned(a, \"STWO_RV64_OUTER_ASSIGNMENT_NARROW_RUNS\") catch |err| switch (err) {\n            error.EnvironmentVariableNotFound => null,\n            else => return err,\n        };\n        defer if (option) |value| a.free(value);\n        const narrow_enabled = try parseOptIn(option);\n        const narrow = library.lookup(LaunchRun, \"stwo_circuit_assignment_narrow_run_on\");\n        if (narrow_enabled and narrow == null) return error.MissingCircuitAssignmentNarrowRunKernel;"
       },
       "expires": "2026-12-09"
     },

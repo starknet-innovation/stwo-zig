@@ -5,6 +5,31 @@ const std = @import("std");
 const NG = @import("native_gkr.zig");
 const Slab = @import("slab.zig");
 
+/// The instance-list mixes of `begin` (after the MAIN root), as word spans.
+pub const instance_mixes_per_instance = 4;
+pub fn instanceWords(a: std.mem.Allocator, instances: []const NG.Instance) ![]u32 {
+    const out = try a.alloc(u32, 1 + 8 * instances.len);
+    out[0] = @intCast(instances.len);
+    for (instances, 0..) |instance, i| {
+        const w = out[1 + 8 * i ..][0..8];
+        w[0..2].* = NG.originWords(instance.origin);
+        w[2] = instance.row_log;
+        w[3] = instance.terms;
+        w[4] = @truncate(instance.fixed_offset);
+        w[5] = @truncate(@as(u64, instance.fixed_offset) >> 32);
+        w[6] = @truncate(instance.main_offset);
+        w[7] = @truncate(@as(u64, instance.main_offset) >> 32);
+    }
+    return out;
+}
+/// Span (offset, words) of the k-th instance-list mix inside `instanceWords`.
+pub fn instanceSpan(k: usize) [2]usize {
+    if (k == 0) return .{ 0, 1 };
+    const i = (k - 1) / instance_mixes_per_instance;
+    const part = (k - 1) % instance_mixes_per_instance;
+    return .{ 1 + 8 * i + 2 * part, 2 };
+}
+
 pub const magic: u32 = 0x3157474c; // LGW1
 pub const header_words = 12;
 pub const Src = enum(u32) { pool = 0, section = 1, scope = 2, marginals = 3 };
@@ -230,4 +255,11 @@ fn appendWords(a: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), words: []
 
 test {
     _ = @import("native_gkr_wire_test.zig");
+}
+
+test "instance mixes cover the instance list in begin order" {
+    try std.testing.expectEqual([2]usize{ 0, 1 }, instanceSpan(0));
+    try std.testing.expectEqual([2]usize{ 1, 2 }, instanceSpan(1));
+    try std.testing.expectEqual([2]usize{ 7, 2 }, instanceSpan(4));
+    try std.testing.expectEqual([2]usize{ 9, 2 }, instanceSpan(5));
 }
