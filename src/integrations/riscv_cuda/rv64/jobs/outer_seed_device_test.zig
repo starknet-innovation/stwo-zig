@@ -19,7 +19,7 @@ test "seed program: grouped service leaves preserve singletons' seeds and exact 
     const tail = Schema.service_group_tail_seeds;
     const cap_log = 3;
     const first = 8;
-    var captured: Schema.Synthetic = undefined;
+    var captured: Synthetic = undefined;
     try captured.init(scratch, 17, 128);
     const layout = try Schema.Layout.of(captured.shape);
     const child = Schema.ChildClass{
@@ -92,10 +92,10 @@ test "seed program: trace.position matches lifting" {
 test "seed program: synthetic children fill, caps verified, negatives fail closed" {
     const t = std.testing;
     const a = t.allocator;
-    var c0: Schema.Synthetic = undefined;
+    var c0: Synthetic = undefined;
     try c0.init(a, 1, 128);
     defer c0.deinit(a);
-    var c1: Schema.Synthetic = undefined;
+    var c1: Synthetic = undefined;
     try c1.init(a, 2, 128);
     defer c1.deinit(a);
     const classes = [_]Schema.ChildClass{
@@ -191,7 +191,7 @@ test "seed program: short FRI gather owns coordinate order and clears unseen gro
     for ([_]bool{ false, true }) |sparse| {
         var draws: [32]u32 = undefined;
         for (&draws, 0..) |*q, i| q.* = if (sparse) 5 else @intCast(i % 16);
-        var child: Schema.Synthetic = undefined;
+        var child: Synthetic = undefined;
         try child.initQueries(a, 531, 128, &draws);
         defer child.deinit(a);
         const cls = Schema.ChildClass{ .shape = child.shape, .wire_words = 128, .n_outputs = 2, .identity = @splat(7), .fixed_root = @splat(0) };
@@ -238,7 +238,7 @@ test "seed program: short FRI gather owns coordinate order and clears unseen gro
 test "seed program: a sparse depth-four frontier binds every upper sibling" {
     const a = std.testing.allocator;
     const draws = [_]u32{63} ** 54;
-    var child: Schema.Synthetic = undefined;
+    var child: Synthetic = undefined;
     try child.initAtDegree(a, 539, 128, &draws, 5);
     defer child.deinit(a);
     const cls = Schema.ChildClass{ .shape = child.shape, .wire_words = 128, .n_outputs = 2, .identity = @splat(7), .fixed_root = @splat(0) };
@@ -265,7 +265,7 @@ test "seed program: a sparse depth-four frontier binds every upper sibling" {
 test "seed program: direct native leaf equals the retained discovery version" {
     const a = std.testing.allocator;
     const Pcs = @import("../pcs_assembly.zig");
-    var captured: Schema.Synthetic = undefined;
+    var captured: Synthetic = undefined;
     try captured.init(a, 17, 128);
     defer captured.deinit(a);
     const observed = captured.shape;
@@ -325,4 +325,113 @@ test "seed program: direct native leaf equals the retained discovery version" {
     try std.testing.expect(!parsed.eql(altered));
     native_trees[0].sample_counts = &.{};
     try std.testing.expectError(error.GnSeedShapeInvalid, Schema.Shape.fromPcs(metadata, &storage));
+}
+
+// Binary heap layout: node 1 is the root and the final half holds the leaves.
+fn fixtureTree(a: std.mem.Allocator, words: []const u32, words_per_leaf: usize) ![]Schema.Hash {
+    const leaves = @divExact(words.len, words_per_leaf);
+    std.debug.assert(std.math.isPowerOfTwo(leaves));
+    const tree = try a.alloc(Schema.Hash, 2 * leaves);
+    for (tree[leaves..], 0..) |*leaf, i| leaf.* = Schema.leafHash(words[i * words_per_leaf ..][0..words_per_leaf]);
+    var parent = leaves;
+    while (parent > 1) {
+        parent -= 1;
+        tree[parent] = Schema.nodeHash(tree[parent * 2], tree[parent * 2 + 1]);
+    }
+    return tree;
+}
+
+/// Synthetic child (tests): a PCS image whose trace trees are real Merkle
+/// trees over pseudo-random rows, with `queries` raw queries.
+pub const Synthetic = struct {
+    shape: Schema.Shape,
+    image: []u32,
+    region: []u32,
+    trees_store: [2]Schema.Tree,
+    logs: [2][3]u32,
+    s2o: [2][3]u32,
+    sc: [2][3]u32,
+    pub fn init(self: *Synthetic, a: std.mem.Allocator, seed: u64, wire_words: u32) !void {
+        return self.initQueries(a, seed, wire_words, null);
+    }
+    pub fn initQueries(self: *Synthetic, a: std.mem.Allocator, seed: u64, wire_words: u32, draws: ?[]const u32) !void {
+        return self.initAtDegree(a, seed, wire_words, draws, 3);
+    }
+    pub fn initAtDegree(self: *Synthetic, a: std.mem.Allocator, seed: u64, wire_words: u32, draws: ?[]const u32, degree: u32) !void {
+        if (degree < 3 or degree > 8) return error.InvalidSeedProgram;
+        var rng = std.Random.DefaultPrng.init(seed);
+        const r = rng.random();
+        self.logs = .{ .{ degree, 2, degree }, .{ degree, degree, 1 } };
+        self.s2o = .{ .{ 1, 0, 2 }, .{ 2, 0, 1 } };
+        self.sc = .{ .{ 1, 0, 2 }, .{ 1, 1, 0 } };
+        for (&self.trees_store, 0..) |*t, i| t.* = .{ .logs = &self.logs[i], .sorted_to_original = &self.s2o[i], .sample_counts = &self.sc[i] };
+        self.shape = .{ .pow_bits = 1, .log_blowup = 1, .log_last = 0, .n_queries = if (draws) |v| @intCast(v.len) else 6, .fold_step = 1, .lifting = null, .degree_log = degree, .trees = &self.trees_store };
+        const L = try Schema.Layout.of(self.shape);
+        self.image = try a.alloc(u32, L.words);
+        errdefer a.free(self.image);
+        for (self.image) |*w| w.* = r.int(u32) & 0x3fff_ffff;
+        self.image[0] = Schema.image_magic;
+        self.image[1] = 2;
+        const queries = self.image[L.queries..][0..L.nq];
+        if (draws) |v| @memcpy(queries, v) else {
+            for (queries) |*q| q.* = r.uintLessThan(u32, @as(u32, 1) << @intCast(L.initial_log));
+        }
+        for (0..2) |t| {
+            const tl = L.trees[t];
+            const h = tl.height;
+            const n = @as(usize, 1) << @intCast(h);
+            // rows (sorted column order) per tree position
+            const rows = try a.alloc(u32, n * tl.columns);
+            defer a.free(rows);
+            for (rows) |*v| v.* = r.uintLessThan(u32, Schema.modulus);
+            const tree = try fixtureTree(a, rows, tl.columns);
+            defer a.free(tree);
+            @memcpy(self.image[L.roots + 8 * t ..][0..8], &tree[1]);
+            for (queries, 0..) |q, qi| {
+                const p = Schema.position(q, L.initial_log, h);
+                for (0..tl.columns) |ci| self.image[tl.values + ci * L.nq + qi] = rows[p * tl.columns + ci];
+                for (0..h) |l| @memcpy(self.image[tl.paths + (qi * h + l) * 8 ..][0..8], &tree[((n + p) >> @intCast(l)) ^ 1]);
+            }
+        }
+        // FRI layers: real Merkle trees over (packed) leaves of canonical values.
+        for (L.layers[0..L.n_layers]) |l| {
+            const width: usize = if (l.leaf_log == 2) 4 else 1;
+            const n_leaves = @as(usize, 1) << @intCast(l.height);
+            const vals = try a.alloc(u32, n_leaves * width * 8);
+            defer a.free(vals);
+            for (vals) |*v| v.* = r.uintLessThan(u32, Schema.modulus);
+            const tree = try fixtureTree(a, vals, width * 8);
+            defer a.free(tree);
+            @memcpy(self.image[l.root..][0..8], &tree[1]);
+            const subset = @as(usize, 1) << @intCast(l.step);
+            for (queries, 0..) |q, qi| {
+                const start = ((@as(usize, q) >> @intCast(l.shift)) >> @intCast(l.step)) << @intCast(l.step);
+                const first_leaf = start >> @intCast(l.leaf_log);
+                @memcpy(self.image[l.values + qi * subset * 8 ..][0 .. subset * 8], vals[first_leaf * width * 8 ..][0 .. subset * 8]);
+                for (0..l.slots) |slot| for (0..l.height) |lv| {
+                    @memcpy(self.image[l.paths + ((qi * l.slots + slot) * l.height + lv) * 8 ..][0..8], &tree[((n_leaves + first_leaf + slot) >> @intCast(lv)) ^ 1]);
+                };
+            }
+        }
+        // canonical samples / terminal
+        for (self.image[L.samples..L.queries]) |*w| w.* &= 0x3fff_ffff;
+        self.region = try a.alloc(u32, wire_words + L.words);
+        @memset(self.region, 0);
+        self.region[0] = 4 * (wire_words - 1);
+        @memcpy(self.region[wire_words..], self.image);
+    }
+    pub fn deinit(self: *Synthetic, a: std.mem.Allocator) void {
+        a.free(self.image);
+        a.free(self.region);
+    }
+};
+
+test "seed program: partial child construction releases every allocation" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(a: std.mem.Allocator) !void {
+            var child: Synthetic = undefined;
+            try child.init(a, 7, 128);
+            child.deinit(a);
+        }
+    }.run, .{});
 }
