@@ -10,6 +10,7 @@
 //! a mismatch fails the request. Salted native-GKR v2 is refused here.
 //! Existing OM31 fold/sum and tail kernels preserve that transcript order.
 const std = @import("std");
+const Wire = @import("native_gkr_wire.zig");
 const core = @import("stwo_core");
 const engine = @import("stwo_prover_engine");
 const CPU = @import("stwo_riscv_cpu_integration");
@@ -153,34 +154,12 @@ pub fn childPrefix(scope: Scope, instances: []const Instance) HostChannel {
     for ([_][32]u8{ scope.statement, scope.fixed }) |bytes| ch.mixU32s(&rootWords(bytes));
     return ch;
 }
-/// The instance-list mixes of `begin` (after the MAIN root), as word spans.
-pub const instance_mixes_per_instance = 4;
-pub fn instanceWords(a: std.mem.Allocator, instances: []const Instance) ![]u32 {
-    const out = try a.alloc(u32, 1 + 8 * instances.len);
-    out[0] = @intCast(instances.len);
-    for (instances, 0..) |instance, i| {
-        const w = out[1 + 8 * i ..][0..8];
-        w[0..2].* = originWords(instance.origin);
-        w[2] = instance.row_log;
-        w[3] = instance.terms;
-        w[4] = @truncate(instance.fixed_offset);
-        w[5] = @truncate(@as(u64, instance.fixed_offset) >> 32);
-        w[6] = @truncate(instance.main_offset);
-        w[7] = @truncate(@as(u64, instance.main_offset) >> 32);
-    }
-    return out;
-}
-/// Span (offset, words) of the k-th instance-list mix inside `instanceWords`.
-fn instanceSpan(k: usize) [2]usize {
-    if (k == 0) return .{ 0, 1 };
-    const i = (k - 1) / instance_mixes_per_instance;
-    const part = (k - 1) % instance_mixes_per_instance;
-    return .{ 1 + 8 * i + 2 * part, 2 };
-}
+pub const instance_mixes_per_instance = Wire.instance_mixes_per_instance;
+pub const instanceWords = Wire.instanceWords;
 pub fn mixInstancesHost(ch: *HostChannel, words: []const u32) void {
     const mixes = 1 + instance_mixes_per_instance * ((words.len - 1) / 8);
     for (0..mixes) |k| {
-        const s = instanceSpan(k);
+        const s = Wire.instanceSpan(k);
         ch.mixU32s(words[s[0]..][0..s[1]]);
     }
 }
@@ -189,25 +168,9 @@ fn rootWords(bytes: [32]u8) [8]u32 {
     for (&words, 0..) |*word, i| word.* = std.mem.readInt(u32, bytes[4 * i ..][0..4], .little);
     return words;
 }
-// Restated from gkr_local/frame.zig (not exported by the CPU module).
-pub fn originWords(origin: anytype) [2]u32 {
-    return switch (origin) {
-        .core => |v| .{ 0, @intFromEnum(v) },
-        .bridge => |v| .{ 1, @intFromEnum(v) },
-        .bulk => |v| .{ 2, @intFromEnum(v) },
-        .dword => |v| .{ 3, v },
-        .sponge => |v| .{ 4, @intFromEnum(v) },
-    };
-}
-// Restated from gkr_local/frame.zig v3Instances.
-pub fn v3Instances(instances: []const Instance) bool {
-    for (instances) |instance| switch (instance.origin) {
-        .bulk, .dword, .sponge => return true,
-        .bridge => |family| if (@intFromEnum(family) >= CPU.rv64_services_types.V2_FAMILIES) return true,
-        .core => {},
-    };
-    return false;
-}
+pub const originWords = Source.Frame.originWords;
+pub const v3Instances = Source.Frame.v3Instances;
+
 pub fn seedWords(ch: HostChannel) [9]u32 {
     var seed: [9]u32 = undefined;
     for (seed[0..8], 0..) |*w, i| w.* = std.mem.readInt(u32, ch.inner.digest[i * 4 ..][0..4], .little);
@@ -535,7 +498,7 @@ pub const Gkr = struct {
         try child.mixRootFromTree(main_root);
         const instance_base = 9 + p.constants.len;
         for (0..p.instance_mixes) |k| {
-            const span = instanceSpan(k);
+            const span = Wire.instanceSpan(k);
             try child.mixWords(try staged.slice(instance_base + span[0], span[1]));
         }
         const reservoir = try e.alloc(reservoir_felts * 8);
@@ -790,13 +753,6 @@ test "v3 header tag follows frame.zig (bulk/dword/sponge or a post-v2 bridge)" {
     }
 }
 
-test "instance mixes cover the instance list in begin order" {
-    try std.testing.expectEqual([2]usize{ 0, 1 }, instanceSpan(0));
-    try std.testing.expectEqual([2]usize{ 1, 2 }, instanceSpan(1));
-    try std.testing.expectEqual([2]usize{ 7, 2 }, instanceSpan(4));
-    try std.testing.expectEqual([2]usize{ 9, 2 }, instanceSpan(5));
-}
-
 test "slab fields of a section are namespaced by base and sized by the traversal plan" {
     const fields = Fields{ .base = 100, .layers = 3 };
     try std.testing.expectEqual(@as(u32, 100), fields.header());
@@ -820,12 +776,14 @@ test "local GKR job path is fully analyzed (stage, enqueue, finish, job adapter)
 }
 
 test "active native OM31 GKR enables only available batched fusions" {
+    // The selector inspects symbol presence only. Function pointers require alignment on ARM.
+    const present = std.heap.page_size_min;
     for (0..16) |mask| {
         var sym: Symbols = undefined;
-        sym.numerical.stwo_rv64_batch_sum_on = if (mask & 1 != 0) @ptrFromInt(1) else null;
-        sym.numerical.stwo_rv64_batch_fold_on = if (mask & 2 != 0) @ptrFromInt(1) else null;
-        sym.numerical.stwo_rv64_batch_tail_on = if (mask & 4 != 0) @ptrFromInt(1) else null;
-        sym.numerical.stwo_rv64_batch_fold_sum_on = if (mask & 8 != 0) @ptrFromInt(1) else null;
+        sym.numerical.stwo_rv64_batch_sum_on = if (mask & 1 != 0) @ptrFromInt(present) else null;
+        sym.numerical.stwo_rv64_batch_fold_on = if (mask & 2 != 0) @ptrFromInt(present) else null;
+        sym.numerical.stwo_rv64_batch_tail_on = if (mask & 4 != 0) @ptrFromInt(present) else null;
+        sym.numerical.stwo_rv64_batch_fold_sum_on = if (mask & 8 != 0) @ptrFromInt(present) else null;
         sym.selectRoutes();
         const batch = mask & 3 == 3;
         try std.testing.expectEqual(batch, sym.batched_oracles);

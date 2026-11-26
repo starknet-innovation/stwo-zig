@@ -805,11 +805,8 @@ fn wrapHybridGraphOrLoad(a: std.mem.Allocator, ctx: *C.Context, digest: [32]u8, 
     var prep = try prepareHost(a, ctx, gpu);
     defer prep.deinit(a);
     var produced = try proveDeviceForOutputs(a, ctx, &prep, &expected, ordinal, gpu, true);
-    var owns = true;
-    defer if (owns) produced.deinit(a);
-    const result = try finishProvedForOutputs(a, &produced, &expected, digest);
-    owns = false;
-    return result;
+    errdefer produced.deinit(a);
+    return finishProvedForOutputs(a, &produced, &expected, digest);
 }
 /// Output values must be canonical encoded raw-u32 words, not arbitrary QM31s
 /// that happen to reduce to the same field value.
