@@ -162,3 +162,77 @@ test "wide census scans every CPU row while provider head bands remain separatel
     input.rom_log += 1;
     try std.testing.expectError(error.InvalidFamilyCensusBuffers, enqueue(symbols, &token, input));
 }
+
+const CPU = @import("stwo_riscv_cpu_integration");
+const Stage = CPU.rv64_device_source_stage;
+const Tail = CPU.rv64_provider_tails;
+const Setup = @FieldType(Stage.Request, "setup");
+const Native = std.meta.Child(@FieldType(Stage.Request, "native"));
+pub const FamilyCount = struct { rows: usize, mass: usize, head_mass: usize = 0, unweighted: bool = false };
+
+/// Installed family geometry. Native execution supplies the physical facts and
+/// witnesses them against these exact row and mass bounds when creating MAIN.
+pub const ResidentCounts = struct {
+    splits: Tail.Splits,
+    alu: FamilyCount,
+    binary: FamilyCount,
+    shift: FamilyCount,
+    zbb: FamilyCount,
+    jalr: usize,
+    division: usize,
+    raw_mul: usize,
+
+    pub fn fromCensus(geometry: CPU.rv64_execution.word16.setup.Geometry, steps: u32, census: *const Receipt) !ResidentCounts {
+        try census.validate(steps);
+        const alu = census.family(.alu);
+        const binary = census.family(.binary);
+        const shift = census.family(.shift);
+        const zbb = census.family(.zbb);
+        const splits = try Tail.splitCounts(geometry, alu.rows, binary.rows, shift.rows);
+        return .{
+            .splits = splits,
+            .alu = try censusCount(alu, geometry.alu_log, splits.alu.tail != 0),
+            .binary = try censusCount(binary, geometry.binary_log, splits.binary.tail != 0),
+            .shift = try censusCount(shift, geometry.shift_log, splits.shift.tail != 0),
+            .zbb = .{ .rows = zbb.rows, .mass = zbb.mass },
+            .jalr = census.family(.jalr).rows,
+            .division = census.family(.division).rows,
+            .raw_mul = census.family(.multiplication).rows,
+        };
+    }
+
+    fn censusCount(s: Summary, log: u32, split: bool) !FamilyCount {
+        return .{ .rows = s.rows, .mass = s.mass, .head_mass = if (split) try s.headMass(log) else 0, .unweighted = s.rows == s.mass };
+    }
+
+    pub fn freeze(prepared: *const Native, setup: Setup) !ResidentCounts {
+        const geometry = setup.materials.geometry;
+        const splits = try Tail.validate(geometry, prepared);
+        const jalr = prepared.jalr orelse return error.PreparedExecutionConsumed;
+        if (jalr.log_size != geometry.jalr_log) return error.PreparedGeometryMismatch;
+        if (prepared.division.len != prepared.raw_counts.division or jalr.facts.len != prepared.raw_counts.jalr or
+            prepared.multiplication.len != @as(usize, prepared.raw_counts.multiplication) + 2 * prepared.division.len) return error.InvalidFamilyFactShape;
+        try Tail.weights(prepared.zbb.facts.len, prepared.zbb.weights);
+        return .{
+            .splits = splits,
+            .alu = familyCount(prepared.alu.facts.len, prepared.raw_counts.alu, prepared.alu.weights, splits.alu),
+            .binary = familyCount(prepared.binary.facts.len, prepared.raw_counts.binary, prepared.binary.weights, splits.binary),
+            .shift = familyCount(prepared.shift.len, prepared.raw_counts.shift, prepared.shift_weights, splits.shift),
+            .zbb = .{ .rows = prepared.zbb.facts.len, .mass = weightMass(prepared.zbb.weights, prepared.zbb.facts.len) },
+            .jalr = jalr.facts.len,
+            .division = prepared.division.len,
+            .raw_mul = prepared.raw_counts.multiplication,
+        };
+    }
+
+    fn familyCount(rows: usize, mass: usize, weights: []const u32, split: @FieldType(Tail.Splits, "alu")) FamilyCount {
+        return .{ .rows = rows, .mass = mass, .head_mass = if (split.tail == 0) 0 else weightMass(weights, split.head), .unweighted = rows == mass };
+    }
+};
+
+fn weightMass(weights: []const u32, count: usize) usize {
+    if (weights.len == 0) return count;
+    var mass: usize = 0;
+    for (weights[0..count]) |weight| mass += weight;
+    return mass;
+}

@@ -1,24 +1,7 @@
-//! Capture-side serializer of compact TraceChunk v2 (stream gn-pack, IO lever
-//! L0): one native segment's compact facts/events -> the v2 launch program
-//! (native_pack.zig) written straight into the pinned capture ring.
-//!
-//! This is the host half of the legacy resident source orchestration, ported
-//! using the same witness kernels and producing byte-identical device MAIN:
-//!   cpu_projection.zig Job.run          CompactRecord + seeds, ROM, CPU scratch,
-//!                                       cpu_unpack + cpu_witness
-//!   core_witness.zig BuildJob.run       shared CPU/core ledgers, DIV -> MUL support,
-//!                                       core family/memory/boundary roles,
-//!   core_witness.zig Finish.run         table multiplicities (deferred, last)
-//!   bridge_witness.zig format           keccak/secp/sha256/arith256/curves
-//!   bulk_sponge.zig format              bulk analyse + bulk kinds, sponge
-//!   device_source.zig appendLocalExtensions   Zbb, LS-D64
-//! The validations the legacy host runs on these inputs are kept (fail
-//! closed on the capture thread). What is NOT ported: the narrow host
-//! descriptors (`Headers`) the legacy CPU worker reads after the source; the
-//! GPU-native Stage 2 owns its own descriptors.
-//!
-//! A live guest loan projects provider facts from the unpacked device rows.
-//! The reference ingress encodes its existing compact inputs on the host.
+//! Serialize one native segment into the pinned witness ring. A live loan
+//! projects provider facts from resident execution rows. Host capture writes
+//! the same launch records from compact advice. The packer emits CPU, core
+//! and service witnesses before closing shared table multiplicities.
 const std = @import("std");
 const CPU = @import("stwo_riscv_cpu_integration");
 const Front = @import("stwo_riscv_frontend").rv64_air;
@@ -36,36 +19,15 @@ const Tail = CPU.rv64_provider_tails;
 const X = Front.word16_execution;
 const K = Front.crypto.keccak.word16_bridge;
 const W = Front.crypto.secp256k1.word16_bridge;
-const B = Front.crypto.bulk_memory;
-const S = Front.crypto.keccak_sponge;
 
-// bulk_sponge.zig device records (copied ABI; sizes pinned there and here).
-pub const State = extern struct { value: u64, tick: u32, epoch: u16, rights: u8, reserved: u8 = 0 };
-pub const BulkCall = extern struct { pointer: u64, dst: u64, word1: u64, len: u64, epoch: u32, tick: u32, op: u32, examined: u32, result: i32, first_word: u32, first_scan: u32, reserved: u32 = 0, packet: [4]State };
-pub const Word = extern struct { dst: State, src: State };
-pub const Row = extern struct { call: u32, word: u32, index: u32, reserved: u32 = 0 };
-pub const SpongeCall = extern struct { pointer: u64, epoch: u32, tick: u32, first_word: u32, first_perm: u32, packet: [4]State, state: [25]State };
-comptime {
-    std.debug.assert(@sizeOf(State) == 16 and @sizeOf(BulkCall) == 128 and @sizeOf(SpongeCall) == 488 and @sizeOf(Row) == 16 and @sizeOf(Word) == 32);
-    const Service = Guest.Service;
-    std.debug.assert(Service.wire_count == T.FAMILIES);
-    std.debug.assert(Service.sponge_call_words * 4 == @sizeOf(SpongeCall));
-    std.debug.assert(Service.sponge_word_words * 4 == @sizeOf(State));
-    std.debug.assert(Service.sponge_row_words * 4 == @sizeOf(Row));
-    for (1..T.FAMILIES) |index| {
-        const kind = T.bridgeKind(@enumFromInt(index));
-        const coordinates = W.types.coordinates(kind);
-        std.debug.assert(Service.coordinates[index] == coordinates);
-        var mask: u32 = 0;
-        for (0..coordinates) |coordinate| {
-            if (W.types.isWritten(kind, coordinate)) mask |= @as(u32, 1) << @intCast(coordinate);
-        }
-        std.debug.assert(Service.write_masks[index] == mask);
-    }
-}
-fn state(v: B.types.State) State {
-    return .{ .value = v.value, .tick = v.tick, .epoch = v.epoch, .rights = v.rights };
-}
+const Services = @import("native_pack_services.zig");
+pub const State = Guest.Service.Records.State;
+pub const BulkCall = Guest.Service.Records.BulkCall;
+pub const Word = Guest.Service.Records.Word;
+pub const Row = Guest.Service.Records.Row;
+pub const SpongeCall = Guest.Service.Records.SpongeCall;
+pub const encodeKeccak = Guest.Service.Bridge.encodeKeccak;
+pub const encodeWire = Guest.Service.Bridge.encodeWire;
 
 /// What a packed segment cost on the capture thread [M] and shipped [M].
 pub const Stats = struct {
@@ -93,70 +55,11 @@ pub const Stats = struct {
     ext_ns: u64 = 0,
 };
 
-/// The ROM key (= legacy immutable-ROM cache identity, cpu_projection.zig rom()).
-pub fn romKey(program: anytype) [8]u32 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    h.update("stwo/rv64/cuda/immutable-cpu-rom/v2\x00");
-    h.update(&program.identity);
-    var log_bytes: [4]u8 = undefined;
-    std.mem.writeInt(u32, &log_bytes, program.log_size, .little);
-    h.update(&log_bytes);
-    h.update(&.{@intFromBool(program.compact)});
-    std.mem.writeInt(u32, &log_bytes, @intFromEnum(program.profile), .little);
-    h.update(&log_bytes);
-    const digest = h.finalResult();
-    var identity: [8]u32 = undefined;
-    for (&identity, 0..) |*word, i| word.* = std.mem.readInt(u32, digest[4 * i ..][0..4], .little);
-    return identity;
-}
+pub const romKey = Ingress.romKey;
+pub const romWords = Ingress.romWords;
 
-/// cpu_projection.zig reconstructRom (identical physical ROM tuple layout).
-pub fn romWords(a: std.mem.Allocator, program: anytype) ![]u32 {
-    const rows = program.size();
-    const count = X.layout.rom.FIXED * rows;
-    if (!program.fixed_retired) {
-        const words = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(program.fixed));
-        if (words.len != count) return error.InvalidCpuRomGeometry;
-        return a.dupe(u32, words);
-    }
-    const data = try a.alloc(u32, count);
-    errdefer a.free(data);
-    @memset(data, 0);
-    for (0..rows) |logical| {
-        const tuple = try program.tupleAt(logical);
-        const physical = X.layout.physical(logical, program.log_size);
-        for (tuple, 0..) |value, col| data[col * rows + physical] = value.v;
-    }
-    data[X.layout.rom.FIRST * rows + X.layout.physical(0, program.log_size)] = 1;
-    data[X.layout.rom.LAST * rows + X.layout.physical(rows - 1, program.log_size)] = 1;
-    return data;
-}
-
-fn words32(comptime E: type, values: []const E) []const u32 {
-    return @alignCast(std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(values)));
-}
-
-/// Core ledger layout (core_witness.zig BuildJob sizes).
-const Ledger = struct {
-    id: u16,
-    rom_count: usize,
-    const range16: usize = 0;
-    const range8: usize = 65536;
-    const pairs: usize = range8 + 256;
-    const and_: usize = pairs + 65536;
-    const shift: usize = and_ + 65536;
-    const selection: usize = shift + 16 * 65536;
-    const rom: usize = selection + 2 * 65536;
-    fn status(self: Ledger) usize {
-        return rom + self.rom_count;
-    }
-    fn words(self: Ledger) usize {
-        return self.status() + 1;
-    }
-    fn at(self: Ledger, off: usize) P.Ref {
-        return P.ref(self.id, off);
-    }
-};
+const words32 = P.words32;
+const Ledger = P.Ledger;
 
 /// Pack one native segment (`req` = the legacy DeviceSourceStage.Request the
 /// segment's source would be built from) into v2 chunks through `out`.
@@ -170,67 +73,9 @@ pub fn pack(a: std.mem.Allocator, req: Stage.Request, roms: *P.Roms, out: G.Chun
 
 const Setup = @FieldType(Stage.Request, "setup");
 const Native = std.meta.Child(@FieldType(Stage.Request, "native"));
-const FamilyCount = struct { rows: usize, mass: usize, head_mass: usize = 0, unweighted: bool = false };
-
-/// Installed family geometry. Native execution supplies the physical facts and
-/// witnesses them against these exact row and mass bounds when creating MAIN.
-pub const ResidentCounts = struct {
-    splits: Tail.Splits,
-    alu: FamilyCount,
-    binary: FamilyCount,
-    shift: FamilyCount,
-    zbb: FamilyCount,
-    jalr: usize,
-    division: usize,
-    raw_mul: usize,
-
-    pub fn fromCensus(geometry: CPU.rv64_execution.word16.setup.Geometry, steps: u32, census: *const FamilyCensus.Receipt) !ResidentCounts {
-        try census.validate(steps);
-        const alu = census.family(.alu);
-        const binary = census.family(.binary);
-        const shift = census.family(.shift);
-        const zbb = census.family(.zbb);
-        const splits = try Tail.splitCounts(geometry, alu.rows, binary.rows, shift.rows);
-        return .{
-            .splits = splits,
-            .alu = try censusCount(alu, geometry.alu_log, splits.alu.tail != 0),
-            .binary = try censusCount(binary, geometry.binary_log, splits.binary.tail != 0),
-            .shift = try censusCount(shift, geometry.shift_log, splits.shift.tail != 0),
-            .zbb = .{ .rows = zbb.rows, .mass = zbb.mass },
-            .jalr = census.family(.jalr).rows,
-            .division = census.family(.division).rows,
-            .raw_mul = census.family(.multiplication).rows,
-        };
-    }
-
-    fn censusCount(s: FamilyCensus.Summary, log: u32, split: bool) !FamilyCount {
-        return .{ .rows = s.rows, .mass = s.mass, .head_mass = if (split) try s.headMass(log) else 0, .unweighted = s.rows == s.mass };
-    }
-
-    pub fn freeze(prepared: *const Native, setup: Setup) !ResidentCounts {
-        const geometry = setup.materials.geometry;
-        const splits = try Tail.validate(geometry, prepared);
-        const jalr = prepared.jalr orelse return error.PreparedExecutionConsumed;
-        if (jalr.log_size != geometry.jalr_log) return error.PreparedGeometryMismatch;
-        if (prepared.division.len != prepared.raw_counts.division or jalr.facts.len != prepared.raw_counts.jalr or
-            prepared.multiplication.len != @as(usize, prepared.raw_counts.multiplication) + 2 * prepared.division.len) return error.InvalidFamilyFactShape;
-        try Tail.weights(prepared.zbb.facts.len, prepared.zbb.weights);
-        return .{
-            .splits = splits,
-            .alu = familyCount(prepared.alu.facts.len, prepared.raw_counts.alu, prepared.alu.weights, splits.alu),
-            .binary = familyCount(prepared.binary.facts.len, prepared.raw_counts.binary, prepared.binary.weights, splits.binary),
-            .shift = familyCount(prepared.shift.len, prepared.raw_counts.shift, prepared.shift_weights, splits.shift),
-            .zbb = .{ .rows = prepared.zbb.facts.len, .mass = weightMass(prepared.zbb.weights, prepared.zbb.facts.len) },
-            .jalr = jalr.facts.len,
-            .division = prepared.division.len,
-            .raw_mul = prepared.raw_counts.multiplication,
-        };
-    }
-
-    fn familyCount(rows: usize, mass: usize, weights: []const u32, split: @FieldType(Tail.Splits, "alu")) FamilyCount {
-        return .{ .rows = rows, .mass = mass, .head_mass = if (split.tail == 0) 0 else weightMass(weights, split.head), .unweighted = rows == mass };
-    }
-};
+const Census = @import("../guest_family_census.zig");
+const FamilyCount = Census.FamilyCount;
+pub const ResidentCounts = Census.ResidentCounts;
 
 pub const ResidentRequest = struct {
     setup: Setup,
@@ -321,7 +166,7 @@ fn packInternal(a: std.mem.Allocator, req: ResidentRequest, host: ?Stage.Request
     const input = if (loan) |span|
         try w.declare(span.words(), .compact_loan)
     else
-        try compactInput(a, &w, &(src orelse return error.CpuDeviceIngressUnavailable));
+        try w.compactInput(a, &(src orelse return error.CpuDeviceIngressUnavailable));
     stats.compact_ns = timer.read() - c0;
     try w.launch(.cpu_unpack, .{ .records = P.ref(input, 0), .seeds = P.ref(input, records_words), .rom = P.ref(rom, 0), .metadata = P.ref(metadata, 0), .status = cpu_status, .count = @intCast(cpu_rows), .rom_log = program.log_size, .chunk_rows = Ingress.compact_chunk_rows }, 0, 0);
     var cpu_column: ?usize = null;
@@ -577,13 +422,13 @@ fn packInternal(a: std.mem.Allocator, req: ResidentRequest, host: ?Stage.Request
                 const advice = capture.advice.bulk[capture.ordinal];
                 if (span.calls != advice.calls.len or span.words != advice.words.len) return error.InvalidGuestBulkCounts;
             };
-            try bulkResident(&w, req, ledger, input, loan.?);
-        } else try bulk(a, &w, host orelse return error.GnPackCompactLoanMissing, ledger);
+            try Services.bulkResident(&w, req.setup, req.request.bulk, ledger, input, loan.?);
+        } else try Services.bulk(a, &w, host orelse return error.GnPackCompactLoanMissing, ledger);
     }
     if (setup.bridges.sponge.any()) {
         if (loan != null and loan.?.services != null) {
-            try spongeResident(&w, req, ledger, input, loan.?);
-        } else try sponge(a, &w, host orelse return error.GnPackCompactLoanMissing, ledger);
+            try Services.spongeResident(&w, req.setup, req.request.sponge, ledger, input, loan.?);
+        } else try Services.sponge(a, &w, host orelse return error.GnPackCompactLoanMissing, ledger);
     }
 
     stats.services_ns = timer.read() - stats.cpu_ns - stats.core_ns;
@@ -628,47 +473,6 @@ fn packInternal(a: std.mem.Allocator, req: ResidentRequest, host: ?Stage.Request
     return stats;
 }
 
-fn compactInput(a: std.mem.Allocator, w: *P.Writer, src: *const @import("stwo_riscv_cpu_integration").rv64_cpu_source.Source) !u16 {
-    const Work = @import("stwo_prover_engine").work_pool;
-    const rows = src.metadata.len;
-    const chunk = Ingress.compact_chunk_rows;
-    const count = std.math.divCeil(usize, rows, chunk) catch unreachable;
-    const record_words = @sizeOf(Ingress.CompactRecord) / 4;
-    const seed_words = @sizeOf(Ingress.CompactSeed) / 4;
-    const input = try w.declare(rows * record_words + count * seed_words, .upload);
-    // Keep packet boundaries identical at install and replay, with or
-    // without an available worker lease. Small fixture rings retain the
-    // ordinary split-record writer.
-    if (w.supportsUnit(chunk * record_words)) {
-        var lease: ?Work.WorkLease = null;
-        if (Work.currentScopedPool()) |pool| {
-            const budget = try Work.WorkerBudget.init(@min(4, pool.workerCount()));
-            lease = pool.acquire(budget) catch null;
-        }
-        defer if (lease) |*owned| owned.deinit();
-        const workers = if (lease) |*owned| owned else null;
-        const seeds = try a.alloc(Ingress.CompactSeed, count);
-        defer a.free(seeds);
-        var first: usize = 0;
-        while (first < rows) {
-            const unit_rows: usize = @min(chunk, rows - first);
-            const words = try w.reserveUnits(input, first * record_words, (rows - first) / unit_rows, unit_rows * record_words);
-            const records = std.mem.bytesAsSlice(Ingress.CompactRecord, std.mem.sliceAsBytes(words));
-            const seed = first / chunk;
-            const span = records.len / unit_rows;
-            try Ingress.Compact.fillWindow(src, first, records, seeds[seed..][0..span], workers);
-            first += records.len;
-        }
-        try w.data(input, rows * record_words, words32(Ingress.CompactSeed, seeds));
-        return input;
-    }
-    var compact = try Ingress.Compact.fromCapture(a, src);
-    defer compact.deinit();
-    try w.data(input, 0, words32(Ingress.CompactRecord, compact.records));
-    try w.data(input, rows * record_words, words32(Ingress.CompactSeed, compact.seeds));
-    return input;
-}
-
 fn family(w: *P.Writer, ledger: Ledger, batch: *const Inputs.Batch, col: u32, width: u32) !void {
     const words = batch.words();
     const buf = try w.declare(words.len, .upload);
@@ -679,13 +483,6 @@ fn family(w: *P.Writer, ledger: Ledger, batch: *const Inputs.Batch, col: u32, wi
 fn familyFromBuffer(w: *P.Writer, ledger: Ledger, buffer: u16, start: usize, count: usize, kind: Inputs.Kind, log: u32, col: u32, width: u32) !void {
     if (log < 5 or log > 26 or count > @as(usize, 1) << @intCast(log)) return error.InvalidDeviceFamilyGeometry;
     try w.launch(.family, .{ .facts = if (count == 0) 0 else P.ref(buffer, start * P.FamilyFactJob.fact_words), .main = P.column(col), .range16 = ledger.at(Ledger.range16), .and_ = ledger.at(Ledger.and_), .shift = ledger.at(Ledger.shift), .status = ledger.at(ledger.status()), .count = @intCast(count), .log = log, .kind = @intFromEnum(kind) }, col, width);
-}
-
-fn weightMass(weights: []const u32, count: usize) usize {
-    if (weights.len == 0) return count;
-    var mass: usize = 0;
-    for (weights[0..count]) |weight| mass += weight;
-    return mass;
 }
 
 const FactProjection = struct {
@@ -795,216 +592,6 @@ fn memory(w: *P.Writer, ledger: Ledger, events: []const Memory.Event, log: u32, 
     const buf = try w.declare(words.len, .upload);
     try w.data(buf, 0, if (words.len == 0) &.{0} else words);
     try w.launch(.memory, .{ .events = if (events.len == 0) 0 else P.ref(buf, 0), .main = P.column(col), .range16 = ledger.at(Ledger.range16), .range8 = ledger.at(Ledger.range8), .pairs = ledger.at(Ledger.pairs), .selection = ledger.at(Ledger.selection), .status = ledger.at(ledger.status()), .count = @intCast(events.len), .log = log, .dword = @intFromBool(dword), .fused_pairs = @intFromBool(fused_pairs) }, col, width);
-}
-
-// bridge_witness.zig encoders (same words).
-fn pair(out: []u32, value: u64) void {
-    out[0] = @truncate(value);
-    out[1] = @truncate(value >> 32);
-}
-fn packet(out: []u32, pointer: u64, epoch: u16, tick: u24) void {
-    pair(out, pointer);
-    out[2] = epoch;
-    out[3] = tick;
-}
-fn ram(out: []u32, before: u64, after: u64, pred: Front.memory.closed_ram.types.State) void {
-    pair(out, before);
-    pair(out[2..], after);
-    pair(out[4..], pred.value);
-    out[6] = @as(u32, pred.epoch) | (@as(u32, pred.rights) << 16);
-    out[7] = pred.tick;
-}
-pub fn encodeKeccak(a: std.mem.Allocator, calls: []const K.types.Call) ![]u32 {
-    const stride = 4 + 25 * 8;
-    const out = try a.alloc(u32, try std.math.mul(usize, calls.len, stride));
-    for (calls, 0..) |call, i| {
-        const row = out[i * stride ..][0..stride];
-        packet(row, call.pointer, call.epoch, call.tick);
-        for (0..25) |j| ram(row[4 + j * 8 ..], call.before[j], call.after[j], call.predecessors[j]);
-    }
-    return out;
-}
-pub fn encodeWire(a: std.mem.Allocator, kind: W.types.Kind, calls: []const W.types.Call) ![]u32 {
-    const words = 4 * W.types.coordinates(kind);
-    const stride = 4 + words * 8;
-    const out = try a.alloc(u32, try std.math.mul(usize, calls.len, stride));
-    for (calls, 0..) |call, i| {
-        const row = out[i * stride ..][0..stride];
-        packet(row, call.pointer, call.epoch, call.tick);
-        for (0..words) |j| ram(row[4 + j * 8 ..], call.before[j], call.after[j], call.predecessors[j]);
-    }
-    return out;
-}
-
-fn upload(w: *P.Writer, comptime E: type, values: []const E) !u16 {
-    const words = words32(E, values);
-    const buf = try w.declare(words.len, .upload);
-    try w.data(buf, 0, if (words.len == 0) &.{0} else words);
-    return buf;
-}
-
-const BulkInputs = struct {
-    calls: P.Ref,
-    words: P.Ref,
-    pending: P.Ref,
-    jumps: P.Ref,
-    call_count: u32,
-    word_count: u32,
-    scans: u32,
-
-    fn begin(w: *P.Writer, ledger: Ledger, calls: P.Ref, words: P.Ref, call_count: u32, word_count: u32, scans: u32) !BulkInputs {
-        const pending = P.ref(try w.declare(scans, .zero), 0);
-        const jumps = P.ref(try w.declare(8448, .zero), 0);
-        try w.launch(.bulk_analyze, .{ .calls = calls, .words = words, .pending = pending, .jumps = jumps, .status = ledger.at(ledger.status()), .call_count = call_count, .word_count = word_count, .pending_count = scans }, 0, 0);
-        return .{ .calls = calls, .words = words, .pending = pending, .jumps = jumps, .call_count = call_count, .word_count = word_count, .scans = scans };
-    }
-
-    fn launch(self: BulkInputs, w: *P.Writer, setup: Setup, ledger: Ledger, kind: T.BulkKind, count: u32, log: u32, rows: P.Ref) !void {
-        _ = try B.types.validateGeometry(kind, count, log);
-        const col = setup.bulkOffset(kind, 1);
-        const width = B.layout.main(kind);
-        try w.launch(.bulk, .{ .calls = self.calls, .words = self.words, .rows = rows, .pending = self.pending, .main = P.column(col), .range16 = ledger.at(Ledger.range16), .jump_counts = self.jumps, .status = ledger.at(ledger.status()), .count = count, .log = log, .kind = @intFromEnum(kind), .call_count = self.call_count, .word_count = self.word_count, .pending_count = self.scans }, @intCast(col), @intCast(width));
-    }
-};
-
-fn bulkResident(w: *P.Writer, req: ResidentRequest, ledger: Ledger, buffer: u16, loan: Guest.CompactLoan.Layout) !void {
-    const counts = loan.bulk orelse Guest.Bulk.Counts.zero;
-    if (counts.calls != req.request.bulk.ecalls() or counts.scans != req.request.bulk.jump_rows) return error.InvalidGuestBulkCounts;
-    const empty = P.ref(try w.declare(1, .zero), 0);
-    const calls = if (counts.calls == 0) empty else P.ref(buffer, loan.bulkOffset(.calls));
-    const words = if (counts.words == 0) empty else P.ref(buffer, loan.bulkOffset(.words));
-    const input = try BulkInputs.begin(w, ledger, calls, words, counts.calls, counts.words, counts.scans);
-    for (T.bulk_kinds) |kind| if (req.setup.bridges.bulk.at(kind)) |log| {
-        const total = req.request.bulk.rows(kind);
-        const rows = if (kind == .jtab or total == 0)
-            empty
-        else blk: {
-            const part: Guest.Bulk.Part = @enumFromInt(@intFromEnum(kind) + @as(usize, 2));
-            if (counts.len(part) != @as(usize, total) * Guest.Bulk.row_words) return error.InvalidGuestBulkCounts;
-            break :blk P.ref(buffer, loan.bulkOffset(part));
-        };
-        try input.launch(w, req.setup, ledger, kind, total, log, rows);
-    };
-}
-
-fn bulk(a: std.mem.Allocator, w: *P.Writer, req: Stage.Request, ledger: Ledger) !void {
-    const advice = req.advice.bulk[req.ordinal];
-    const calls = try a.alloc(BulkCall, advice.calls.len);
-    defer a.free(calls);
-    const words = try a.alloc(Word, advice.words.len);
-    defer a.free(words);
-    var first_word: u32 = 0;
-    var scans: u32 = 0;
-    for (advice.calls, calls) |c, *o| {
-        if (@as(u64, first_word) + c.entries() > advice.words.len) return error.InvalidBulkMemoryWords;
-        try B.types.validateCall(c, advice.words[first_word..][0..c.entries()]);
-        o.* = .{ .pointer = c.pointer, .dst = c.dst, .word1 = c.word1, .len = c.len, .epoch = c.epoch, .tick = c.tick, .op = @intFromEnum(c.op), .examined = c.examined, .result = c.result, .first_word = first_word, .first_scan = scans, .packet = undefined };
-        for (c.packet, &o.packet) |v, *s| s.* = state(v);
-        first_word += c.entries();
-        if (c.op == .jumpdest) scans += c.bodyRows();
-    }
-    if (first_word != advice.words.len) return error.InvalidBulkMemoryWords;
-    for (advice.words, words) |v, *o| o.* = .{ .dst = state(v.dst), .src = state(v.src) };
-    const dc = try upload(w, BulkCall, calls);
-    const dw = try upload(w, Word, words);
-    const input = try BulkInputs.begin(w, ledger, P.ref(dc, 0), P.ref(dw, 0), @intCast(calls.len), @intCast(words.len), scans);
-    for (T.bulk_kinds) |kind| if (req.setup.bridges.bulk.at(kind)) |log| {
-        const total = B.source.Source.rowsFor(kind, advice.calls);
-        var rows: std.ArrayListUnmanaged(Row) = .empty;
-        defer rows.deinit(a);
-        for (advice.calls, 0..) |c, k| {
-            if (c.descriptor() == kind) try rows.append(a, .{ .call = @intCast(k), .word = calls[k].first_word, .index = 0 });
-            if (c.body() == kind) {
-                for (0..c.bodyRows()) |j| try rows.append(a, .{ .call = @intCast(k), .word = calls[k].first_word + @as(u32, @intCast(if (kind == .jscan) 0 else j)), .index = @intCast(j) });
-            }
-        }
-        const dr = try upload(w, Row, rows.items);
-        try input.launch(w, req.setup, ledger, kind, @intCast(total), log, P.ref(dr, 0));
-    };
-}
-
-fn spongeResident(w: *P.Writer, req: ResidentRequest, ledger: Ledger, input: u16, loan: Guest.CompactLoan.Layout) !void {
-    const shape = loan.services.?;
-    const requested = req.request.sponge;
-    if (shape.calls != requested.calls or shape.perms != requested.perms) return error.InvalidCombinedServiceCount;
-    const output = try w.declare(shape.partWords(.sponge_inputs), .zero);
-    if (shape.perms != 0) try w.launch(.sponge_outputs, .{
-        .inputs = P.ref(input, loan.serviceOffset(.sponge_inputs)),
-        .outputs = P.ref(output, 0),
-        .status = ledger.at(ledger.status()),
-        .count = shape.perms,
-    }, 0, 0);
-    for (T.sponge_kinds) |kind| if (req.setup.bridges.sponge.at(kind)) |log| {
-        const count = requested.rows(kind);
-        _ = try S.types.validateGeometry(kind, count, log);
-        const col = req.setup.spongeOffset(kind, 1);
-        const width = S.layout.main(kind);
-        const row_part: Guest.Service.Part = if (kind == .call) .sponge_call_rows else .sponge_perm_rows;
-        try w.launch(.sponge, .{
-            .calls = if (shape.calls != 0) P.ref(input, loan.serviceOffset(.sponge_calls)) else P.ref(output, 0),
-            .words = if (shape.words != 0) P.ref(input, loan.serviceOffset(.sponge_words)) else P.ref(output, 0),
-            .outputs = P.ref(output, 0),
-            .rows = if (count != 0) P.ref(input, loan.serviceOffset(row_part)) else P.ref(output, 0),
-            .main = P.column(col),
-            .range16 = ledger.at(Ledger.range16),
-            .range8 = ledger.at(Ledger.range8),
-            .and_counts = ledger.at(Ledger.and_),
-            .status = ledger.at(ledger.status()),
-            .count = count,
-            .log = log,
-            .kind = @intFromEnum(kind),
-            .first_id = requested.first_id,
-            .call_count = shape.calls,
-            .word_count = shape.words,
-            .permutation_count = shape.perms,
-        }, @intCast(col), @intCast(width));
-    };
-}
-
-fn sponge(a: std.mem.Allocator, w: *P.Writer, req: Stage.Request, ledger: Ledger) !void {
-    const advice = req.advice.sponge[req.ordinal];
-    const calls = try a.alloc(SpongeCall, advice.calls.len);
-    defer a.free(calls);
-    const words = try a.alloc(State, advice.words.len);
-    defer a.free(words);
-    var nw: usize = 0;
-    var np: usize = 0;
-    for (advice.calls, calls) |c, *o| {
-        if (c.first_word != nw or c.first_perm != np or nw + c.words() > advice.words.len) return error.InvalidKeccakSpongeCallOrder;
-        try S.types.validateCall(c, advice.words[nw..][0..c.words()]);
-        o.* = .{ .pointer = c.pointer, .epoch = c.epoch, .tick = c.tick, .first_word = c.first_word, .first_perm = c.first_perm, .packet = undefined, .state = undefined };
-        for (c.packet, &o.packet) |v, *s| s.* = state(v);
-        for (c.state, &o.state) |v, *s| s.* = state(v);
-        nw += c.words();
-        np += c.permutations();
-    }
-    if (nw != advice.words.len or np != advice.inputs.len) return error.InvalidKeccakSpongeWords;
-    for (advice.words, words) |v, *s| s.* = state(v);
-    const dc = try upload(w, SpongeCall, calls);
-    const dw = try upload(w, State, words);
-    const di = try upload(w, [25]u64, advice.inputs);
-    const dout = try w.declare(np * 50, .zero);
-    if (np != 0) try w.launch(.sponge_outputs, .{ .inputs = P.ref(di, 0), .outputs = P.ref(dout, 0), .status = ledger.at(ledger.status()), .count = @intCast(np) }, 0, 0);
-    // Row -> call map (S.source.Plan.row_call), host only.
-    const row_call = try a.alloc(u32, np);
-    defer a.free(row_call);
-    for (advice.calls, 0..) |c, k| @memset(row_call[c.first_perm..][0..c.permutations()], @intCast(k));
-    for (T.sponge_kinds) |kind| if (req.setup.bridges.sponge.at(kind)) |log| {
-        const count: usize = if (kind == .call) advice.calls.len else np;
-        _ = try S.types.validateGeometry(kind, @intCast(count), log);
-        const rows = try a.alloc(Row, count);
-        defer a.free(rows);
-        if (kind == .call) {
-            for (rows, 0..) |*r, k| r.* = .{ .call = @intCast(k), .word = 0, .index = 0 };
-        } else for (rows, 0..) |*r, k| {
-            const ci = row_call[k];
-            r.* = .{ .call = ci, .word = 0, .index = @intCast(k - advice.calls[ci].first_perm) };
-        }
-        const dr = try upload(w, Row, rows);
-        const col = req.setup.spongeOffset(kind, 1);
-        const width = S.layout.main(kind);
-        try w.launch(.sponge, .{ .calls = P.ref(dc, 0), .words = P.ref(dw, 0), .outputs = P.ref(dout, 0), .rows = P.ref(dr, 0), .main = P.column(col), .range16 = ledger.at(Ledger.range16), .range8 = ledger.at(Ledger.range8), .and_counts = ledger.at(Ledger.and_), .status = ledger.at(ledger.status()), .count = @intCast(count), .log = log, .kind = @intFromEnum(kind), .first_id = req.request.sponge.first_id, .call_count = @intCast(calls.len), .word_count = @intCast(words.len), .permutation_count = @intCast(np) }, @intCast(col), @intCast(width));
-    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1224,7 +811,7 @@ test "compact ring packing retains complete 256-row units and a half-unit tail" 
     };
     var sink = Sink{};
     var w = P.Writer.init(.{ .ctx = &sink, .buffer = Sink.buffer, .emit = Sink.emit });
-    const id = try compactInput(a, &w, &source);
+    const id = try w.compactInput(a, &source);
     var expected = try Ingress.Compact.fromCapture(a, &source);
     defer expected.deinit();
     const records = words32(Ingress.CompactRecord, expected.records);

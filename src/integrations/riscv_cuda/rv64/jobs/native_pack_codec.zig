@@ -19,6 +19,48 @@ pub const Writer = struct {
     retained_words: u64 = 0,
     uncounted_words: [Schema.max_buffers]u64 = @splat(0),
 
+    pub fn compactInput(w: *Writer, a: std.mem.Allocator, src: *const @import("stwo_riscv_cpu_integration").rv64_cpu_source.Source) !u16 {
+        const Ingress = @import("../cpu_witness.zig");
+        const Work = @import("stwo_prover_engine").work_pool;
+        const rows = src.metadata.len;
+        const chunk = Ingress.compact_chunk_rows;
+        const count = std.math.divCeil(usize, rows, chunk) catch unreachable;
+        const record_words = @sizeOf(Ingress.CompactRecord) / 4;
+        const seed_words = @sizeOf(Ingress.CompactSeed) / 4;
+        const input = try w.declare(rows * record_words + count * seed_words, .upload);
+        // Keep packet boundaries identical at install and replay, with or
+        // without an available worker lease. Small fixture rings retain the
+        // ordinary split-record writer.
+        if (w.supportsUnit(chunk * record_words)) {
+            var lease: ?Work.WorkLease = null;
+            if (Work.currentScopedPool()) |pool| {
+                const budget = try Work.WorkerBudget.init(@min(4, pool.workerCount()));
+                lease = pool.acquire(budget) catch null;
+            }
+            defer if (lease) |*owned| owned.deinit();
+            const workers = if (lease) |*owned| owned else null;
+            const seeds = try a.alloc(Ingress.CompactSeed, count);
+            defer a.free(seeds);
+            var first: usize = 0;
+            while (first < rows) {
+                const unit_rows: usize = @min(chunk, rows - first);
+                const words = try w.reserveUnits(input, first * record_words, (rows - first) / unit_rows, unit_rows * record_words);
+                const records = std.mem.bytesAsSlice(Ingress.CompactRecord, std.mem.sliceAsBytes(words));
+                const seed = first / chunk;
+                const span = records.len / unit_rows;
+                try Ingress.Compact.fillWindow(src, first, records, seeds[seed..][0..span], workers);
+                first += records.len;
+            }
+            try w.data(input, rows * record_words, Schema.words32(Ingress.CompactSeed, seeds));
+            return input;
+        }
+        var compact = try Ingress.Compact.fromCapture(a, src);
+        defer compact.deinit();
+        try w.data(input, 0, Schema.words32(Ingress.CompactRecord, compact.records));
+        try w.data(input, rows * record_words, Schema.words32(Ingress.CompactSeed, compact.seeds));
+        return input;
+    }
+
     pub fn init(out: G.ChunkWriter) Writer {
         return .{ .out = out };
     }

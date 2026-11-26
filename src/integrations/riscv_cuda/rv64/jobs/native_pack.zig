@@ -68,6 +68,28 @@ pub fn isV2(words: []const u32) bool {
     return words.len >= chunk_header_words and words[0] == magic;
 }
 
+/// Core ledger layout (core_witness.zig BuildJob sizes).
+pub const Ledger = struct {
+    id: u16,
+    rom_count: usize,
+    pub const range16: usize = 0;
+    pub const range8: usize = 65536;
+    pub const pairs: usize = range8 + 256;
+    pub const and_: usize = pairs + 65536;
+    pub const shift: usize = and_ + 65536;
+    pub const selection: usize = shift + 16 * 65536;
+    pub const rom: usize = selection + 2 * 65536;
+    pub fn status(self: Ledger) usize {
+        return rom + self.rom_count;
+    }
+    pub fn words(self: Ledger) usize {
+        return self.status() + 1;
+    }
+    pub fn at(self: Ledger, off: usize) Ref {
+        return ref(self.id, off);
+    }
+};
+
 pub const Ref = u64;
 pub fn ref(buffer: u16, offset: usize) Ref {
     std.debug.assert(offset < (@as(u64, 1) << 48));
@@ -661,4 +683,8 @@ test "gn-pack v2: a retained unpack replaces only its two compact inputs" {
 
 test {
     _ = @import("native_pack_test.zig");
+}
+
+pub fn words32(comptime E: type, values: []const E) []const u32 {
+    return @alignCast(std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(values)));
 }

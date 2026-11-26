@@ -314,3 +314,48 @@ test "first-pass CPU records remap to byte-identical compact capture without hos
     trace.clocks[1] ^= 1;
     try std.testing.expectError(error.InvalidMinimalCpuBoundary, Compact.fromFirstPass(allocator, &program, public, 10, &trace));
 }
+
+/// The compact flag and execution profile distinguish physical decodes of the same program.
+pub fn romKey(program: anytype) [8]u32 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    h.update("stwo/rv64/cuda/immutable-cpu-rom/v2\x00");
+    h.update(&program.identity);
+    var log_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &log_bytes, program.log_size, .little);
+    h.update(&log_bytes);
+    h.update(&.{@intFromBool(program.compact)});
+    std.mem.writeInt(u32, &log_bytes, @intFromEnum(program.profile), .little);
+    h.update(&log_bytes);
+    const digest = h.finalResult();
+    var identity: [8]u32 = undefined;
+    for (&identity, 0..) |*word, i| word.* = std.mem.readInt(u32, digest[4 * i ..][0..4], .little);
+    return identity;
+}
+
+/// Materialize the same column-major ROM whether or not fixed columns remain resident.
+pub fn romWords(a: std.mem.Allocator, program: anytype) ![]u32 {
+    const rows = program.size();
+    const count = X.layout.rom.FIXED * rows;
+    if (!program.fixed_retired) {
+        const words = std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(program.fixed));
+        if (words.len != count) return error.InvalidCpuRomGeometry;
+        return a.dupe(u32, words);
+    }
+    return reconstructRom(a, program);
+}
+
+/// Rebuild physical rows from the authenticated instruction tuples.
+pub fn reconstructRom(allocator: std.mem.Allocator, program: anytype) ![]u32 {
+    const rows = program.size();
+    const data = try allocator.alloc(u32, X.layout.rom.FIXED * rows);
+    errdefer allocator.free(data);
+    @memset(data, 0);
+    for (0..rows) |logical| {
+        const tuple = try program.tupleAt(logical);
+        const physical = X.layout.physical(logical, program.log_size);
+        for (tuple, 0..) |value, column| data[column * rows + physical] = value.v;
+    }
+    data[X.layout.rom.FIRST * rows + X.layout.physical(0, program.log_size)] = 1;
+    data[X.layout.rom.LAST * rows + X.layout.physical(rows - 1, program.log_size)] = 1;
+    return data;
+}

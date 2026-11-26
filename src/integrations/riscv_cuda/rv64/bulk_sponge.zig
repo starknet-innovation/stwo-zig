@@ -12,11 +12,12 @@ const Core = @import("core_witness.zig");
 const Service = @import("pcs_native.zig");
 const Native = @import("pcs_native_abi.zig");
 const SC = @import("session_context.zig");
-pub const State = extern struct { value: u64, tick: u32, epoch: u16, rights: u8, reserved: u8 = 0 };
-pub const BulkCall = extern struct { pointer: u64, dst: u64, word1: u64, len: u64, epoch: u32, tick: u32, op: u32, examined: u32, result: i32, first_word: u32, first_scan: u32, reserved: u32 = 0, packet: [4]State };
-pub const Word = extern struct { dst: State, src: State };
-pub const Row = extern struct { call: u32, word: u32, index: u32, reserved: u32 = 0 };
-pub const SpongeCall = extern struct { pointer: u64, epoch: u32, tick: u32, first_word: u32, first_perm: u32, packet: [4]State, state: [25]State };
+const Records = @import("guest_service_inputs.zig").Records;
+pub const State = Records.State;
+pub const BulkCall = Records.BulkCall;
+pub const Word = Records.Word;
+pub const Row = Records.Row;
+pub const SpongeCall = Records.SpongeCall;
 const BulkJob = extern struct { calls: [*]const BulkCall, words: [*]const Word, rows: [*]const Row, pending: [*]const u32, main: [*]u32, range16: [*]u32, jump_counts: [*]u32, status: [*]u32, count: u32, log: u32, kind: u32, call_count: u32, word_count: u32, pending_count: u32 };
 const SpongeJob = extern struct { calls: [*]const SpongeCall, words: [*]const State, outputs: [*]const u64, rows: [*]const Row, main: [*]u32, range16: [*]u32, range8: [*]u32, and_counts: [*]u32, status: [*]u32, count: u32, log: u32, kind: u32, first_id: u32, call_count: u32, word_count: u32, permutation_count: u32, reserved: u32 = 0 };
 const BulkFn = *const fn (*anyopaque, u32, *const BulkJob) callconv(.c) c_int;
@@ -32,9 +33,7 @@ fn check(rc: c_int) !void {
 fn sym(comptime T: type, s: *Service.Context, n: [:0]const u8) !T {
     return s.library.lookup(T, n) orelse error.MissingBulkSpongeWitnessSymbol;
 }
-fn state(v: B.types.State) State {
-    return .{ .value = v.value, .tick = v.tick, .epoch = v.epoch, .rights = v.rights };
-}
+const state = Records.state;
 pub const Context = struct {
     service: *Service.Context,
     bulk: BulkFn,

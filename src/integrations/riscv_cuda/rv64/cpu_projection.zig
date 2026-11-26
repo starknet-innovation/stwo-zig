@@ -406,27 +406,14 @@ const Job = struct {
         const b = self.backend;
         const p = self.source.program;
         if (p.log_size < 5 or p.log_size > 24) return error.InvalidCpuRomGeometry;
-        var h = std.crypto.hash.sha2.Sha256.init(.{});
-        h.update("stwo/rv64/cuda/immutable-cpu-rom/v2\x00");
-        h.update(&p.identity);
-        var log_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &log_bytes, p.log_size, .little);
-        h.update(&log_bytes);
-        // makeCompact changes the physical ROM tuple without changing the
-        // code identity; never reuse the uncompressed decode matrix for it.
-        h.update(&.{@intFromBool(p.compact)});
-        std.mem.writeInt(u32, &log_bytes, @intFromEnum(p.profile), .little);
-        h.update(&log_bytes);
-        const digest = h.finalResult();
-        var identity: [8]u32 = undefined;
-        for (&identity, 0..) |*word, i| word.* = std.mem.readInt(u32, digest[4 * i ..][0..4], .little);
+        const identity = Ingress.romKey(p);
         const scope = @import("pcs_scope.zig").identity(self.scope);
         const count = X.layout.rom.FIXED * p.size();
         if (try b.service.immutableLookup(scope, identity, count)) |lease| {
             self.rom_cache_hit = true;
             return lease;
         }
-        const rebuilt = if (p.fixed_retired) try reconstructRom(b.host_allocator, p) else null;
+        const rebuilt = if (p.fixed_retired) try Ingress.reconstructRom(b.host_allocator, p) else null;
         defer if (rebuilt) |words| b.host_allocator.free(words);
         const words: []const u32 = if (rebuilt) |data| data else std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(p.fixed));
         if (words.len != count) return error.InvalidCpuRomGeometry;
@@ -521,32 +508,17 @@ fn ledger(lease: Native.Lease, offset: usize, count: usize) D.DeviceCoefficients
     return .{ .words = lease.words.? + offset, .count = count, .context_token = lease.context_token, .generation = lease.generation };
 }
 
-fn reconstructRom(allocator: std.mem.Allocator, program: anytype) ![]u32 {
-    const rows = program.size();
-    const data = try allocator.alloc(u32, X.layout.rom.FIXED * rows);
-    errdefer allocator.free(data);
-    @memset(data, 0);
-    for (0..rows) |logical| {
-        const tuple = try program.tupleAt(logical);
-        const physical = X.layout.physical(logical, program.log_size);
-        for (tuple, 0..) |value, column| data[column * rows + physical] = value.v;
-    }
-    data[X.layout.rom.FIRST * rows + X.layout.physical(0, program.log_size)] = 1;
-    data[X.layout.rom.LAST * rows + X.layout.physical(rows - 1, program.log_size)] = 1;
-    return data;
-}
-
 test "resident CPU ROM cache reconstructs exact independently derived compact setup" {
     const allocator = std.testing.allocator;
     const Program = std.meta.Child(@TypeOf(@as(CPU.Source, undefined).program));
     var program = try Program.init(allocator, .{ .base = 4096, .words = &.{ 0x00004033, 0xfe000ee3 } });
     defer program.deinit();
     try program.makeCompact();
-    const rebuilt = try reconstructRom(allocator, &program);
+    const rebuilt = try Ingress.reconstructRom(allocator, &program);
     defer allocator.free(rebuilt);
     try std.testing.expectEqualSlices(u32, std.mem.bytesAsSlice(u32, std.mem.sliceAsBytes(program.fixed)), rebuilt);
     try program.releaseFixedWitness();
-    const retired = try reconstructRom(allocator, &program);
+    const retired = try Ingress.reconstructRom(allocator, &program);
     defer allocator.free(retired);
     try std.testing.expectEqualSlices(u32, rebuilt, retired);
 }

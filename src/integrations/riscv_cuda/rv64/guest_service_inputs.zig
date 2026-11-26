@@ -375,3 +375,57 @@ test "service truth keccak IDs join plain and sponge inputs without reusing brid
     try testing.expectEqual(@as(usize, 3 * sponge_input_words), crossing.buffer.words);
     try testing.expectError(error.DeviceBufferOutOfRange, truth.span(0, 6, 3));
 }
+
+pub const Records = struct {
+    pub const State = extern struct { value: u64, tick: u32, epoch: u16, rights: u8, reserved: u8 = 0 };
+    pub const BulkCall = extern struct { pointer: u64, dst: u64, word1: u64, len: u64, epoch: u32, tick: u32, op: u32, examined: u32, result: i32, first_word: u32, first_scan: u32, reserved: u32 = 0, packet: [4]Records.State };
+    pub const Word = extern struct { dst: Records.State, src: Records.State };
+    pub const Row = extern struct { call: u32, word: u32, index: u32, reserved: u32 = 0 };
+    pub const SpongeCall = extern struct { pointer: u64, epoch: u32, tick: u32, first_word: u32, first_perm: u32, packet: [4]Records.State, state: [25]Records.State };
+    pub fn state(v: @import("stwo_riscv_frontend").rv64_air.crypto.bulk_memory.types.State) Records.State {
+        return .{ .value = v.value, .tick = v.tick, .epoch = v.epoch, .rights = v.rights };
+    }
+};
+
+pub const Bridge = struct {
+    const Front = @import("stwo_riscv_frontend").rv64_air;
+    const K = Front.crypto.keccak.word16_bridge;
+    const W = Front.crypto.secp256k1.word16_bridge;
+    fn pair(out: []u32, value: u64) void {
+        out[0] = @truncate(value);
+        out[1] = @truncate(value >> 32);
+    }
+    fn packet(out: []u32, pointer: u64, epoch: u16, tick: u24) void {
+        pair(out, pointer);
+        out[2] = epoch;
+        out[3] = tick;
+    }
+    fn ram(out: []u32, before: u64, after: u64, pred: Front.memory.closed_ram.types.State) void {
+        pair(out, before);
+        pair(out[2..], after);
+        pair(out[4..], pred.value);
+        out[6] = @as(u32, pred.epoch) | (@as(u32, pred.rights) << 16);
+        out[7] = pred.tick;
+    }
+    pub fn encodeKeccak(a: std.mem.Allocator, calls: []const K.types.Call) ![]u32 {
+        const stride = 4 + 25 * 8;
+        const out = try a.alloc(u32, try std.math.mul(usize, calls.len, stride));
+        for (calls, 0..) |call, i| {
+            const row = out[i * stride ..][0..stride];
+            packet(row, call.pointer, call.epoch, call.tick);
+            for (0..25) |j| ram(row[4 + j * 8 ..], call.before[j], call.after[j], call.predecessors[j]);
+        }
+        return out;
+    }
+    pub fn encodeWire(a: std.mem.Allocator, kind: W.types.Kind, calls: []const W.types.Call) ![]u32 {
+        const words = 4 * W.types.coordinates(kind);
+        const stride = 4 + words * 8;
+        const out = try a.alloc(u32, try std.math.mul(usize, calls.len, stride));
+        for (calls, 0..) |call, i| {
+            const row = out[i * stride ..][0..stride];
+            packet(row, call.pointer, call.epoch, call.tick);
+            for (0..words) |j| ram(row[4 + j * 8 ..], call.before[j], call.after[j], call.predecessors[j]);
+        }
+        return out;
+    }
+};
