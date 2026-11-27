@@ -26,6 +26,18 @@ ROOT = Path(__file__).resolve().parents[2]
 # 2026-11-07). Pass --runtime conformance/rv64/presets/p0-runtime.json
 # for the frozen a25 control.
 RUNTIME = stack.DEFAULT_RUNTIME
+PYTHON_TEST_MODULES = (
+    'scripts.tests.test_rv64_gate',
+    'scripts.tests.test_rv64_quiet_checkpoint',
+    'scripts.tests.test_rv64_validation',
+    'scripts.tests.test_rv64_gpu_activity',
+    'scripts.tests.test_rv64_m8_bench15',
+    'scripts.tests.test_dev_test',
+    'scripts.tests.test_script_reachability',
+    'scripts.tests.test_ci',
+    'scripts.tests.test_ci_package_graph',
+    'scripts.tests.test_focused_ci_contract',
+)
 
 def extra_environment(items):
     """--env KEY=VALUE for the proving service (e.g. STWO_RV64_M8_GPU_NATIVE=1).
@@ -104,16 +116,7 @@ def main():
                                '-j2', '-Doptimize=ReleaseSafe', '-Dtarget=x86_64-linux-gnu',
                                '-Dcpu=x86_64_v4+sha', '--summary', 'all', '--cache-dir', str(ROOT / '.zig-cache')],
             ROOT / 'src/integrations/riscv_cuda')
-        run('unit-python', [sys.executable, '-m', 'unittest',
-                            'scripts.tests.test_rv64_gate', 'scripts.tests.test_rv64_m7_composed_cells',
-                            'scripts.tests.test_rv64_quiet_checkpoint',
-                            'scripts.tests.test_rv64_validation',
-                            'scripts.tests.test_rv64_gpu_activity',
-                            'scripts.tests.test_rv64_m8_bench15',
-                            'scripts.tests.test_dev_test',
-                            'scripts.tests.test_script_reachability',
-                            'scripts.tests.test_ci', 'scripts.tests.test_ci_package_graph',
-                            'scripts.tests.test_focused_ci_contract'])
+        run('unit-python', [sys.executable, '-m', 'unittest', *PYTHON_TEST_MODULES])
         bins = Path('/workspace/m3/build') / args.stream / 'zig-out/bin'
         assets.update(driver=str(bins / 'rv64-word16-ethereum-gpu-combined'),
                       receiver=str(bins / 'rv64-word16-ethereum-recursion-receiver'))

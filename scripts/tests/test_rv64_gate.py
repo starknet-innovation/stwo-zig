@@ -224,6 +224,15 @@ class GateTests(unittest.TestCase):
             unpinned = {'jobs_env': libraries}
             with self.assertRaises(RuntimeError): gate.jobs_environment(unpinned, {primary: '1'})
 
+    def test_gate_python_modules_load_tests(self):
+        self.assertTrue(gate.PYTHON_TEST_MODULES)
+        for module in gate.PYTHON_TEST_MODULES:
+            with self.subTest(module=module):
+                loader = unittest.TestLoader()
+                tests = loader.loadTestsFromName(module)
+                self.assertEqual(loader.errors, [])
+                self.assertGreater(tests.countTestCases(), 0)
+
     def test_gate_corpus_cases_have_executable_mutations(self):
         known = {c['id'] for c in corpus.CASES if 'mutate' in c}
         self.assertLessEqual(set(gate.CASES), known)
